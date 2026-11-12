@@ -6,6 +6,50 @@ use rusqlite::OptionalExtension;
 
 // Match alacritty's read budget while bounding a single terminal-lock hold.
 const MAX_OUTPUT_BURST: usize = 1024 * 1024;
+const EARLY_RESUME_EXIT: Duration = Duration::from_secs(3);
+
+/// Reports whether a resumed conversation still exists, as the runtime's
+/// conversation probe sees it; `None` when the runtime cannot tell.
+pub(super) type ConversationCheck = Box<dyn FnOnce() -> Option<bool> + Send>;
+
+/// A Claude account chat keeps its transcript in the account's origin
+/// folder; every other chat asks its runtime adapter.
+pub(super) fn conversation_exists(
+    adapter: &dyn crate::runtimes::RuntimeAdapter,
+    account_folder: Option<&str>,
+    cwd: Option<&str>,
+    env: &HashMap<String, String>,
+    key: &str,
+) -> Option<bool> {
+    match account_folder {
+        Some(folder) => {
+            crate::claude_accounts::transcript(folder, cwd, key).map(|path| path.is_file())
+        }
+        None => {
+            adapter.conversation_exists(key, &crate::runtimes::ProbeContext { cwd, role_env: env })
+        }
+    }
+}
+
+// `log::set_logger` is once per process and a remote test owns it.
+#[cfg(test)]
+thread_local! {
+    pub(super) static MISSING_CONVERSATION_WARNINGS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A Resume starting fresh otherwise looks like a success in `runnerd.log`.
+pub(super) fn warn_missing_conversation(session_id: &str, key: &str, folder: Option<&Path>) {
+    let folder = folder.map_or_else(
+        || "the runtime's default folder".to_owned(),
+        |folder| folder.display().to_string(),
+    );
+    let message =
+        format!("session {session_id} starts fresh: conversation {key} was not found in {folder}");
+    log::warn!("{message}");
+    #[cfg(test)]
+    MISSING_CONVERSATION_WARNINGS.with_borrow_mut(|warnings| warnings.push(message));
+}
 
 pub(crate) fn classify_local_input(bytes: &[u8]) -> Option<LocalInputClass> {
     if bytes.is_empty() {
@@ -49,6 +93,28 @@ pub(super) fn update_local_input_state(
 }
 
 impl SessionManager {
+    /// The environment a runtime's conversation probe reads, matching the
+    /// one its agent was spawned with.
+    pub(super) fn probe_env(
+        &self,
+        adapter: &dyn crate::runtimes::RuntimeAdapter,
+        role_env: &HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        if !adapter.probe_uses_shell_env() {
+            return role_env.clone();
+        }
+        let mut env: HashMap<String, String> = self
+            .shell_env
+            .read()
+            .expect("runtime shell environment lock poisoned")
+            .vars
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        env.extend(role_env.clone());
+        env
+    }
+
     /// Forwarder thread shared by `spawn`, `spawn_direct`, and `resume`.
     /// Drains the runtime's `OutputStream` into the terminal sink,
     /// then on channel close queries the runtime for the
@@ -74,7 +140,7 @@ impl SessionManager {
         pool: Arc<DbPool>,
         events: Arc<dyn SessionEvents>,
         role: Role,
-        resuming: bool,
+        resume_check: Option<ConversationCheck>,
         emit_activity: bool,
         emit_ctx: Option<ForwarderEmitCtx>,
         app_data_dir: PathBuf,
@@ -101,12 +167,15 @@ impl SessionManager {
             let mut drop_streak: u64 = 0;
             let mut drop_total: u64 = 0;
             let mut pending = None;
+            let mut startup_tail = Vec::new();
+            let mut turn_started = false;
             #[cfg(windows)]
             let mut first_turn_pending = true;
             loop {
                 if stop.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
+                manager_t.expire_submit_busy(&session_id, &stop, events.as_ref());
                 #[cfg(windows)]
                 // recv_timeout also drives the first-turn deadline when output is silent.
                 if first_turn_pending {
@@ -161,6 +230,12 @@ impl SessionManager {
                                 Err(_) => break,
                             }
                         }
+                        if started_at.elapsed() < Duration::from_secs(10) {
+                            startup_tail.extend_from_slice(&bytes);
+                            if startup_tail.len() > 8192 {
+                                startup_tail.drain(..startup_tail.len() - 8192);
+                            }
+                        }
                         manager_t.startup_output(
                             &session_id,
                             &stop,
@@ -184,6 +259,7 @@ impl SessionManager {
                         event,
                         feedback: reply,
                     }) => {
+                        turn_started |= has_started_turn(&event);
                         let feedback = manager_t.publish_model_event_for_launch(
                             &session_id,
                             SessionEvent::Agent { event, live: true },
@@ -325,16 +401,34 @@ impl SessionManager {
 
             let was_killed = manager_t.take_killed(&session_id);
             crate::session::system_prompt::remove(&app_data_dir, &session_id);
-            // Resume failure heuristic: prior conversation rejected
-            // and the agent died fast.
-            let resume_failed = resuming
-                && !success
-                && !was_killed
-                && started_at.elapsed() < std::time::Duration::from_secs(3);
+            let elapsed = started_at.elapsed();
+            let early_resume_exit =
+                resume_check.is_some() && !success && !was_killed && elapsed < EARLY_RESUME_EXIT;
             #[cfg(windows)]
             let mut session_end = manager_t.session_end.exit();
             #[cfg(windows)]
-            let resume_failed = resume_failed && !session_end.preserve_key();
+            let early_resume_exit = early_resume_exit && !session_end.preserve_key();
+            // An early exit alone does not prove the runtime rejected the
+            // conversation, so only a probe that finds it gone drops the key.
+            let conversation = if early_resume_exit {
+                resume_check.and_then(|check| check())
+            } else {
+                None
+            };
+            let resume_failed = early_resume_exit && conversation == Some(false);
+            if early_resume_exit {
+                log::warn!(
+                    "resume of {session_id} ({}) exited after {} ms with exit code {}; conversation {}",
+                    role.runtime,
+                    elapsed.as_millis(),
+                    exit_code.map_or_else(|| "unavailable".to_owned(), |code| code.to_string()),
+                    match conversation {
+                        Some(false) => "missing, clearing its key",
+                        Some(true) => "present, keeping its key",
+                        None => "unverified, keeping its key",
+                    },
+                );
+            }
             let final_status = if success || was_killed {
                 crate::model::SessionStatus::Stopped
             } else {
@@ -412,6 +506,16 @@ impl SessionManager {
                         role.runtime
                     ),
                 });
+            } else if early_resume_exit {
+                events.warning(&WarningEvent {
+                    session_id: session_id.clone(),
+                    mission_id: mission_id.clone(),
+                    kind: "resume_exited".into(),
+                    message: format!(
+                        "The {} agent exited while resuming its conversation; Resume will try it again.",
+                        role.runtime
+                    ),
+                });
             }
             if emit_activity {
                 emit_role_activity(&pool, &role, events.as_ref());
@@ -421,6 +525,23 @@ impl SessionManager {
                 exit_code,
                 final_status == crate::model::SessionStatus::Crashed,
             );
+            if exit_code.is_some_and(|code| code != 0)
+                && !was_killed
+                && elapsed < Duration::from_secs(10)
+                && !turn_started
+            {
+                let output = String::from_utf8_lossy(&startup_tail);
+                if let Some(error) =
+                    crate::runtimes::for_key(&role.runtime).classify_startup_error(&output)
+                {
+                    if let Some(state) = manager_t.session_state(&session_id) {
+                        state.lock().unwrap().model.apply(
+                            SessionEvent::StartupError(error),
+                            super::super::clock::state_now(),
+                        );
+                    }
+                }
+            }
             events.exit(&ExitEvent {
                 session_id: session_id.clone(),
                 mission_id: mission_id.clone(),
@@ -521,7 +642,7 @@ impl SessionManager {
         };
         let gate = session.lock().unwrap().delivery_gate.clone();
         let delivery = gate.state.lock().unwrap();
-        let session = session.lock().unwrap();
+        let mut session = session.lock().unwrap();
         if !delivery.in_flight
             || delivery.generation != token
             || session.model.status().observation.needs_you()
@@ -535,6 +656,10 @@ impl SessionManager {
         else {
             return Ok(false);
         };
+        if bytes != b"\r" {
+            session.delivery_line = std::str::from_utf8(bytes).ok().map(str::to_owned);
+            session.delivery_prompted = false;
+        }
         let terminal = session.terminal.clone();
         drop(session);
         if let Some(terminal) = terminal {
@@ -807,7 +932,26 @@ impl SessionManager {
             .load(std::sync::atomic::Ordering::Relaxed);
         let (settle_generation, resize_result) = {
             let mut session = state.lock().unwrap();
-            if !control.apply(&mut session.controller) {
+            let previous_controller = session.controller.clone();
+            let previous_size = session
+                .terminal
+                .as_ref()
+                .map(|model| model.size())
+                .or(session.last_requested_size);
+            let applied = control.apply(&mut session.controller);
+            let size_changed = previous_size != Some((cols, rows));
+            let controller_changed = session.controller != previous_controller;
+            log::debug!(
+                "resize request: session={session_id} {} -> {cols}x{rows} \
+                 size_changed={size_changed} controller={:?} -> {:?} applied={applied}",
+                previous_size.map_or_else(|| "none".into(), |(c, r)| format!("{c}x{r}")),
+                previous_controller.wire(),
+                session.controller.wire(),
+            );
+            // ConPTY repaints on any resize, and agents reprint their whole
+            // history when it does, so a request that changes nothing must not
+            // reach the runtime or the attached mirrors.
+            if !applied || !(size_changed || controller_changed) {
                 return Ok(());
             }
             let controller = session.controller.wire();
@@ -991,12 +1135,23 @@ impl SessionManager {
     }
 
     pub fn forget_session_state(&self, session_id: &str) {
+        let _control = self.terminal_control.lock().unwrap();
         if let Some(state) = self.raw_session_state(session_id) {
             let mut state = state.lock().unwrap();
+            if state.handle.is_some() {
+                return;
+            }
+            let workers = state.release_terminal();
             state.output_seq = 0;
             state.last_requested_size = None;
             state.last_requested_size_dirty = false;
             state.pending_resize = None;
+            drop(state);
+            // Worker callbacks acquire the session lock. Finish them before a new
+            // terminal can install, even when a reader still holds the old model.
+            for worker in workers {
+                let _ = worker.join();
+            }
         }
         self.prune_empty_session_state(session_id);
     }
@@ -1034,6 +1189,9 @@ impl SessionManager {
             }
             state.output_seq += 1;
             let seq = state.output_seq;
+            state
+                .model
+                .apply(SessionEvent::Output, crate::session::clock::state_now());
             Self::push_frame(
                 &mut state,
                 runner_core::protocol::terminal::TerminalFrame::Output {
@@ -1084,5 +1242,14 @@ impl SessionManager {
             seq,
             bytes: bytes.to_vec(),
         }
+    }
+}
+
+fn has_started_turn(event: &crate::session::state::agent::AgentEvent) -> bool {
+    use crate::session::state::agent::AgentEvent;
+    match event {
+        AgentEvent::TurnStarted | AgentEvent::Working { .. } | AgentEvent::TurnEnded { .. } => true,
+        AgentEvent::Batch { events, .. } => events.iter().any(has_started_turn),
+        _ => false,
     }
 }

@@ -1,6 +1,6 @@
 use super::*;
 impl NativeRoot {
-    pub(super) fn finish_local_chat_launch(
+    pub(crate) fn finish_local_chat_launch(
         &mut self,
         spawned_id: Option<String>,
         result: runner_core::protocol::ClientResult<
@@ -20,6 +20,12 @@ impl NativeRoot {
         });
         match result {
             Ok(session_id) => {
+                self.sync_chat_panel(cx);
+                self.chat_surfaces.reset(Default::default());
+                self.reveal_started_scope(
+                    &ProjectScope::or_root(self.active_tab_project_id(cx)),
+                    cx,
+                );
                 self.start_chat_modal = None;
                 self.error = None;
                 self.remember_active_role(cx);

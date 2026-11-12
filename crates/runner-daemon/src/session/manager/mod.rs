@@ -202,6 +202,9 @@ struct SessionState {
     pending_spawn: bool,
     delivery_runtime: String,
     turn_started: u64,
+    /// The latest line the router typed, and whether the agent has reported a turn from it.
+    delivery_line: Option<String>,
+    delivery_prompted: bool,
     handle: Option<SessionHandle>,
     model: SessionModel,
     delivery_gate: Arc<DeliveryGate>,
@@ -212,7 +215,6 @@ struct SessionState {
     terminal_input: Option<std::sync::mpsc::Sender<Vec<u8>>>,
     terminal_input_worker: Option<thread::JoinHandle<()>>,
     subscribers: Vec<(u64, Arc<terminal::FrameQueue>)>,
-    next_subscriber_id: u64,
     companion_terminals: Vec<Weak<terminal::CompanionTerminal>>,
     /// Latest grid measurement, including pushes that arrive before a PTY
     /// handle exists. Spawn and resume reconcile this under the state lock.
@@ -231,6 +233,25 @@ impl SessionState {
         delivery: &DeliveryGateState,
         now: Instant,
     ) -> router::DeliveryReadiness {
+        self.readiness_for(delivery, now, false)
+    }
+
+    /// A report waits for an idle session on every runtime, so it never lands
+    /// in a turn the person started, and a draft holds it without a cap (#748).
+    fn report_readiness(
+        &self,
+        delivery: &DeliveryGateState,
+        now: Instant,
+    ) -> router::DeliveryReadiness {
+        self.readiness_for(delivery, now, true)
+    }
+
+    fn readiness_for(
+        &self,
+        delivery: &DeliveryGateState,
+        now: Instant,
+        report: bool,
+    ) -> router::DeliveryReadiness {
         use router::{DeliveryReadiness as R, DeliveryReservation as D};
         if self.pending_spawn {
             return R::Pending;
@@ -238,7 +259,11 @@ impl SessionState {
         let Some(handle) = &self.handle else {
             return R::Unavailable;
         };
-        if handle.startup.is_some() {
+        if handle
+            .startup
+            .as_ref()
+            .is_some_and(|startup| report || !startup.reports_only)
+        {
             return R::Starting;
         }
         if self.model.status().observation.needs_you() {
@@ -247,16 +272,30 @@ impl SessionState {
         if delivery.in_flight || delivery.next_ticket != delivery.next_served {
             return R::InFlight;
         }
-        if let Some(hold) = self.model.draft_hold(now) {
+        let hold = if report {
+            self.model.report_draft_hold(now)
+        } else {
+            self.model.draft_hold(now)
+        };
+        if let Some(hold) = hold {
             return match hold {
                 D::RecentlyTyping(delay) => R::RecentlyTyping(delay),
                 D::Unsent => R::Unsent,
                 _ => R::Drafting,
             };
         }
-        R::Ready {
-            idle: self.model.activity() == Some(SessionActivityState::Idle),
+        let idle = self.model.activity() == Some(SessionActivityState::Idle);
+        if !idle
+            && !report
+            && runner_core::protocol::runtime_metadata::for_key(&self.delivery_runtime)
+                .queues_input_mid_turn()
+        {
+            return R::Working;
         }
+        if self.model.unconfirmed_busy() {
+            return R::Unconfirmed;
+        }
+        R::Ready { idle }
     }
 
     fn is_empty(&self) -> bool {
@@ -265,6 +304,7 @@ impl SessionState {
             && self.model.is_empty()
             && self.terminal.is_none()
             && self.terminal_input.is_none()
+            && self.terminal_input_worker.is_none()
             && self.subscribers.is_empty()
             && self.mission_status_sink.is_none()
             && self.output_seq == 0
@@ -277,6 +317,7 @@ impl SessionState {
 }
 
 pub struct SessionManager {
+    pub(crate) runtime_updates: Mutex<crate::ops::runtime_tasks::UpdateTasks>,
     /// Per-session state. The outer map lock protects membership only;
     /// each session's hot mutable state lives behind its own mutex so
     /// PTY output for one busy session does not block lifecycle work on
@@ -318,6 +359,10 @@ pub struct SessionManager {
     resize_generation: AtomicU64,
     terminal_palette: Mutex<runner_terminal::palette::TerminalPalette>,
     terminal_control: Mutex<terminal::ControlState>,
+    #[cfg(test)]
+    wake_baseline_read: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    #[cfg(test)]
+    terminal_retention_read: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// RAII guard that releases a session state's `resuming` flag on drop. The
@@ -426,6 +471,7 @@ impl SessionManager {
         runtime: Arc<dyn SessionRuntime>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            runtime_updates: Mutex::default(),
             sessions: Mutex::new(HashMap::new()),
             delivery_listeners: Mutex::new(HashMap::new()),
             shell_env,
@@ -441,6 +487,10 @@ impl SessionManager {
             resize_generation: AtomicU64::new(0),
             terminal_palette: Mutex::new(runner_terminal::palette::RUNNER),
             terminal_control: Mutex::default(),
+            #[cfg(test)]
+            wake_baseline_read: Mutex::default(),
+            #[cfg(test)]
+            terminal_retention_read: Mutex::default(),
         })
     }
 

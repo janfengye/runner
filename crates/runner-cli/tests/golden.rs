@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -250,6 +250,8 @@ impl Fixture {
             "RUNNER_MISSION_ID",
             "RUNNER_HANDLE",
             "RUNNER_EVENT_LOG",
+            "RUNNER_SESSION_ID",
+            "RUNNER_SESSION_CLI",
         ] {
             cmd.env_remove(name);
         }
@@ -445,10 +447,9 @@ cli_cases! {
     crew_order => vec!["crew", "order", "Peer", "reviewer", "coder"],
     mission_list => vec!["mission", "list", "--crew", "Peer"],
     mission_show => vec!["mission", "show", MISSION],
-    mission_start => vec!["mission", "start", "--crew", "Peer", "--goal", "ship", "--cwd", "not-a-directory"],
+    mission_start => vec!["mission", "start", "--crew", "Peer", "--title", "ship", "--goal", "ship", "--cwd", "not-a-directory"],
     mission_start_empty => vec!["mission", "start", "--title", "Empty mission"],
-    mission_start_goal_title => vec!["mission", "start", "--goal", "Shared goal"],
-    mission_start_empty_untitled => vec!["mission", "start"],
+    mission_start_untitled => vec!["mission", "start", "--crew", "Peer", "--goal", "Shared goal"],
     mission_add_role => vec!["mission", "add-role", "mission-running", "reviewer", "--handle", "reviewer-2", "--task", "Review the change"],
     mission_remove_role => vec!["mission", "remove-role", "mission-running", "reviewer"],
     mission_add_role_stopped => vec!["mission", "add-role", MISSION, "reviewer"],
@@ -463,6 +464,11 @@ cli_cases! {
     mission_pin => vec!["mission", "pin", MISSION],
     mission_unpin => vec!["mission", "unpin", MISSION],
     mission_unfile => vec!["mission", "move", MISSION, "--unfile"],
+    mission_link => vec!["mission", "link", MISSION, "--chat", SESSION],
+    mission_link_outside_a_chat => vec!["mission", "link", MISSION],
+    mission_unlink => vec!["mission", "unlink", "mission-running"],
+    mission_show_linked => vec!["mission", "show", "mission-running"],
+    mission_list_linked_here => vec!["mission", "list", "--linked-here"],
     mission_feed => vec!["mission", "feed", MISSION, "--oldest-first"],
     mission_answer => vec!["mission", "answer", MISSION, EVENTS[1], "yes"],
     chat_start => vec!["chat", "start", "coder", "--cwd", "not-a-directory"],
@@ -522,6 +528,24 @@ cli_cases! {
         "coder"
     ],
     mission_answer_running => vec!["mission", "answer", "mission-running", EVENTS[1], "yes"],
+    mission_answer_running_note => vec![
+        "mission",
+        "answer",
+        "mission-running",
+        EVENTS[1],
+        "yes",
+        "--note",
+        "Only on Friday"
+    ],
+    mission_answer_running_blank_note => vec![
+        "mission",
+        "answer",
+        "mission-running",
+        EVENTS[1],
+        "yes",
+        "--note",
+        "  "
+    ],
     project_missing => vec!["project", "show", "missing"],
     role_missing => vec!["role", "show", "missing"],
     crew_missing => vec!["crew", "show", "missing"],
@@ -684,6 +708,8 @@ offline_goldens! {
     daemon_status => vec!["daemon", "status"],
     daemon_stop => vec!["daemon", "stop"],
     unknown_command => vec!["unknown-command"],
+    mission_list_linked_here => vec!["mission", "list", "--linked-here"],
+    mission_link_outside_a_chat => vec!["mission", "link", "mission-fixture"],
 }
 
 offline_goldens! {
@@ -749,6 +775,8 @@ offline_goldens! {
     mission_pin => vec!["mission", "pin", "--help"],
     mission_unpin => vec!["mission", "unpin", "--help"],
     mission_move => vec!["mission", "move", "--help"],
+    mission_link => vec!["mission", "link", "--help"],
+    mission_unlink => vec!["mission", "unlink", "--help"],
     mission_feed => vec!["mission", "feed", "--help"],
     mission_answer => vec!["mission", "answer", "--help"],
     chat_start => vec!["chat", "start", "--help"],
@@ -835,6 +863,16 @@ fn render_case(case: &Case) -> String {
         let conn = pool.get().unwrap();
         conn.execute("INSERT INTO sessions (id,mission_id,role_id,slot_id,status,started_at) VALUES ('session-remove','mission-running','role-reviewer','slot-reviewer','stopped',?1)", [STAMP]).unwrap();
     }
+    if !help
+        && (case.args.starts_with(&["mission", "unlink"])
+            || case
+                .args
+                .starts_with(&["mission", "show", "mission-running"]))
+    {
+        let pool = runner_daemon::db::open_fixture_pool(&fixture.data.join("runner.db")).unwrap();
+        let conn = pool.get().unwrap();
+        conn.execute("UPDATE missions SET linked_session_id = ?1, report_to_chat = 0 WHERE id = 'mission-running'", [SESSION]).unwrap();
+    }
     if case.running {
         fixture.start();
     }
@@ -903,6 +941,43 @@ fn assert_help_coverage(visible: &[Vec<String>], cases: &[Case]) {
             args.join(" ")
         );
     }
+}
+
+#[test]
+fn mission_answer_reads_its_note_from_stdin() {
+    let mut fixture = Fixture::new();
+    fixture.start();
+    let mut child = fixture
+        .command(false)
+        .args([
+            "mission",
+            "answer",
+            "mission-running",
+            EVENTS[1],
+            "yes",
+            "--note-file",
+            "-",
+            "--json",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"Only on Friday\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let event: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(event["payload"]["note"], "Only on Friday");
 }
 
 #[test]

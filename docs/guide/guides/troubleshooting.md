@@ -1,10 +1,18 @@
 # Troubleshooting
 
-Start with the failing agent or command, then check Runner's settings and diagnostics. The steps below preserve existing chats and missions while you identify the problem.
+Start with the failing agent or command, then check Runner's settings and logs. The steps below preserve existing chats and missions while you identify the problem.
 
 ## Runner does not open
 
 Runner starts its background service before showing a window. If that fails, Runner records the reason in `runner.log` and, on Windows, shows it in a **Runner could not start** dialog. The log is in `~/Library/Logs/com.wycstudios.runner` on macOS and `%APPDATA%\com.wycstudios.runner\logs` on Windows. Include the message when you [report the problem](#collect-a-useful-bug-report).
+
+If a copy of Runner from another version or build is open on the same data, a new copy does not take over the background service; it stops with a message that another Runner build is using this data. Quit the other copy, then open Runner again. If the background service changes hands while Runner is open, the same message appears in a banner: quit the other copy, then click **Try again**. Versions of Runner released before this check still take over the background service without asking.
+
+## Codex starts slowly or chat status is less detailed
+
+Codex can download its remote plugin catalog on every start. Turn **Settings → Agents → Codex → Launch → Remote plugin catalog** off to skip that download; catalog plugins will no longer load. Start a new session to apply the change.
+
+If **Status hooks** is off, Runner uses native terminal status or terminal activity. Update Codex to 0.163.0+, Claude Code to 2.1.295+ or pi to 1.1.0+ for native status, or turn hooks back on for detailed reports. Resume still uses the identity hook. Missions always use status hooks.
 
 ## An agent is missing or fails to start
 
@@ -61,12 +69,24 @@ Start a new session after changing a registration or global skill switch. These 
 
 Find the Runner version in **Runner → About Runner** on macOS, or **Settings → About** on either platform. The macOS About window shows the app icon, version and build identity, and copyright. Released builds include their commit identifier; local development builds show `dev`.
 
-Open **Settings → Diagnostics → Open log folder**. Include the Runner version, operating system, agent CLI and version, the steps that failed, and the visible error in a [GitHub issue](https://github.com/yicheng47/runner/issues/new). Share only the relevant log excerpt after removing secrets and private conversation content. Keep the original sessions and logs until you have captured the evidence; deleting application data is not a first troubleshooting step.
+Open **Settings → About → Open log folder** (**Reveal logs in Finder** on macOS). Include the Runner version, operating system, agent CLI and version, the steps that failed, and the visible error in a [GitHub issue](https://github.com/yicheng47/runner/issues/new). Share only the relevant log excerpt after removing secrets and private conversation content. Keep the original sessions and logs until you have captured the evidence; deleting application data is not a first troubleshooting step.
 
 ## Linux local builds
 
 For source builds, graphics prerequisites, packages and WSL setup see [Linux development on main](https://github.com/yicheng47/runner/blob/main/docs/arch/linux.md). If the CLI is used over SSH, start `runnerd` with `systemctl --user start runnerd` first; remote CLI calls do not auto-start it. A minimal user service resolves the account login shell for PATH discovery. Check `systemctl --user status runnerd` and the log directory inside the selected XDG data root.
 
-Linux notification permissions are managed by your desktop. Runner cannot query a universal permission status; confirm the desktop notification daemon and portal backend are available. Clipboard text is supported by GPUI; clipboard file paths are not available. For application updates, use **Settings → Updates**. System deb installation needs a desktop polkit authentication agent and `pkexec`. Authorization cancellation, a busy package manager or dependency errors are shown in Runner; retry after resolving the cause. **Settings → Diagnostics** shows the installation log. Source builds and unmanaged installations cannot replace themselves; install a managed package first. WSL systemd services do not keep an idle distro alive.
+Linux notification permissions are managed by your desktop. Runner cannot query a universal permission status; confirm the desktop notification daemon and portal backend are available. Clipboard text is supported by GPUI; clipboard file paths are not available. For application updates, use **Settings → Updates**. System deb installation needs a desktop polkit authentication agent and `pkexec`. Authorization cancellation, a busy package manager or dependency errors are shown in Runner; retry after resolving the cause. **Settings → About** shows the installation log. Source builds and unmanaged installations cannot replace themselves; install a managed package first. WSL systemd services do not keep an idle distro alive.
 
 In a normal Linux window, drag an edge or corner to resize. The middle caption button toggles maximize and restore; maximized/fullscreen windows have no resize border. New windows use the desktop's reported logical display bounds. If the compositor does not report a separate work area, panel/taskbar space may be included in those bounds. Include the desktop/session type and whether maximize, restore or edge dragging failed when reporting a window-control problem.
+
+## Codex is too old for Runner
+
+Runner requires Codex **0.149.0 or newer**. **Update needed** appears only on Codex’s agent row; role rows have no update labels or actions. Start Codex or any role using it to update Codex before launching, or choose **Update Codex** on a refused chat's card. The pane starts after a successful update. If an old version still appears, check the executable override in **Settings → Agents → Codex** and refresh detection.
+
+## Codex didn't accept Runner's launch flags
+
+If Codex rejects its startup configuration and exits before the first turn, the stopped card explains the configuration failure and offers **Update Codex**. Update, then let Runner retry the waiting chat. An ordinary stopped chat keeps its usual Resume behavior. If updating does not resolve the error, retain the displayed cause and relevant terminal output for a bug report.
+
+## An agent update needs attention
+
+**May be waiting for your input** is a guess based on a quiet installer prompt. Nothing opens automatically. Open the background task list and choose **Answer** to focus the installer terminal; **Hide**, Escape and the close button leave it running. A failed update offers **Retry** and **Show output**. If stopping an update breaks the executable, choose **Reinstall** on its retained task row.

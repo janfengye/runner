@@ -16,6 +16,11 @@ pub(crate) const PANE_HEADER_HEIGHT: f32 = 40.;
 
 pub(crate) const WINDOW_STATE_SAVE_DELAY_MS: u64 = 300;
 
+/// How long after landing on a tab a close does nothing. Terminal tabs close
+/// with no prompt and cannot be restored, so a double ⌘W must not take the tab
+/// the first press landed on.
+pub(crate) const TAB_LANDING_CLOSE_GUARD: Duration = Duration::from_millis(500);
+
 pub(crate) struct AttachedChat {
     pub(crate) terminal: Arc<TerminalMirror>,
     pub(crate) _terminal_view: TerminalView,
@@ -25,6 +30,7 @@ pub(crate) struct AttachedChat {
     pub(crate) _terminal_input_subscription: Subscription,
     pub(crate) _terminal_focus_subscription: Option<Subscription>,
     pub(crate) terminal_focus: FocusHandle,
+    pub(crate) terminal_find: Entity<crate::terminal::TerminalFind>,
 }
 
 #[derive(Clone)]
@@ -96,14 +102,6 @@ pub(crate) struct ChatTransition {
     pub(crate) generation: u64,
 }
 
-#[derive(Clone)]
-pub(crate) enum ChatRenameTarget {
-    Session {
-        session_id: String,
-        original: String,
-    },
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CloseTarget {
     ChatDrawer,
@@ -130,16 +128,6 @@ pub(crate) fn close_target(
     } else {
         CloseTarget::None
     }
-}
-
-pub(crate) struct ChatRenameModal {
-    pub(crate) target: ChatRenameTarget,
-    pub(crate) input: Entity<runner_app::ui::TextField>,
-    pub(crate) close_focus: FocusHandle,
-    pub(crate) cancel_focus: FocusHandle,
-    pub(crate) submit_focus: FocusHandle,
-    pub(crate) submitting: bool,
-    pub(crate) error: Option<String>,
 }
 
 pub(crate) struct PaneRename {
@@ -202,22 +190,6 @@ pub(crate) struct PendingPaneClose {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PendingTabClose {
     pub(crate) tab_id: String,
-}
-
-impl PendingTabClose {
-    pub(crate) fn apply(
-        &self,
-        tabs: &mut TabSet,
-        rows: &[runner_core::protocol::node::NodeRow],
-    ) -> bool {
-        if rows.iter().any(|row| row.id == self.tab_id) {
-            return false;
-        }
-        if tabs.active_tab_id() == Some(self.tab_id.as_str()) {
-            tabs.clear_active();
-        }
-        true
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -312,7 +284,6 @@ pub(crate) struct NativeRoot {
     pub(crate) launchers:
         HashMap<String, Entity<crate::surfaces::start_chat::launcher::ChatLauncher>>,
     pub(crate) start_chat_modal: Option<StartChatModal>,
-    pub(crate) start_mission_modal: Option<StartMissionModalState>,
     pub(crate) project_modal: Option<ProjectModal>,
     pub(crate) project_delete_confirm: Option<String>,
     pub(crate) project_delete_busy: bool,
@@ -330,19 +301,21 @@ pub(crate) struct NativeRoot {
     pub(crate) pane_action_menus: HashMap<String, Entity<PopoverMenu>>,
     pub(crate) split_menus: HashMap<SplitMenuKey, Entity<PopoverMenu>>,
     pub(crate) pane_bounds: HashMap<PaneKey, Size<Pixels>>,
+    /// Tab id → the pane maximized in it; view state only, never persisted.
+    pub(crate) maximized_panes: HashMap<String, String>,
     pub(crate) pane_drop: Option<(PaneKey, DropSide)>,
     pub(crate) pane_rename: Option<PaneRename>,
     pub(crate) _pane_rename_focus_subscription: Option<Subscription>,
     pub(crate) terminal_close_confirm: Option<TerminalCloseConfirm>,
     pub(crate) pending_pane_closes: HashMap<String, PendingPaneClose>,
     pub(crate) pending_tab_close: Option<PendingTabClose>,
-    #[cfg(any(windows, target_os = "linux"))]
-    pub(crate) update_dialog: Option<Entity<surfaces::update_dialog::UpdateDialog>>,
+    pub(crate) tab_landed_at: Option<Instant>,
+    pub(crate) update_popover: surfaces::update_ui::UpdatePopoverState,
     pub(crate) quit_dialog: Option<Entity<surfaces::quit_dialog::QuitDialog>>,
+    pub(crate) agent_tasks: surfaces::background_tasks::BackgroundTasks,
     pub(crate) agent_update: Option<Entity<surfaces::agent_update::AgentUpdateDialog>>,
     pub(crate) fork_confirm: Option<ForkConfirm>,
     pub(crate) forking_sessions: HashMap<String, String>,
-    pub(crate) chat_rename_modal: Option<ChatRenameModal>,
     pub(crate) last_focused_role_id: Option<String>,
     pub(crate) split_sizes_dirty: bool,
     pub(crate) drawer_resizing: bool,
@@ -355,13 +328,13 @@ pub(crate) struct NativeRoot {
     pub(crate) settings_page: SettingsState,
     pub(crate) route: AppRoute,
     pub(crate) settings_return_route: AppRoute,
-    pub(crate) account_menu: surfaces::app_shell::account_menu::AccountMenuState,
     pub(crate) usage_open: bool,
+    pub(crate) usage_refresh_task: Option<gpui::Task<()>>,
     pub(crate) claude_account_picker: Option<Entity<runner_app::ui::select::StyledSelect>>,
     pub(crate) usage_anchor: Option<Bounds<Pixels>>,
     pub(crate) usage_installed: Vec<runner_core::protocol::model::Runtime>,
-    /// Agents with a newer version on npm; enabled ones dot the usage
-    /// popover's Agent settings gear.
+    pub(crate) usage_checked: Option<Vec<runner_core::Runtime>>,
+    /// Enabled agents with an update dot the sidebar Settings gear.
     pub(crate) agent_updates: Vec<runner_core::protocol::model::Runtime>,
     pub(crate) runtime_navigation_history: Vec<RuntimeLocation>,
     pub(crate) runtime_navigation_index: Option<usize>,
@@ -370,6 +343,12 @@ pub(crate) struct NativeRoot {
     pub(crate) chat_panel_visibility: SidebarVisibilityTransition,
     pub(crate) chat_panel_prompt_session: Option<String>,
     pub(crate) chat_panel_prompt_expanded: bool,
+    pub(crate) chat_surfaces: crate::surfaces::side_panel::PanelSurfaces,
+    pub(crate) chat_panel_tab: Option<String>,
+    pub(crate) chat_panel_open: Option<bool>,
+    pub(crate) chat_panels_by_tab: HashMap<String, crate::surfaces::side_panel::SavedPanel>,
+    pub(crate) chat_files: crate::surfaces::files::FilesPanel,
+    pub(crate) panel_chat_by_tab: HashMap<String, String>,
     pub(crate) command_palette: Entity<CommandPaletteState>,
     pub(crate) sidebar_preview_open: bool,
     pub(crate) sidebar_preview_peeking: bool,
@@ -451,20 +430,49 @@ impl NativeRoot {
         Ok(())
     }
 
-    pub(crate) fn replace_tab_rows(&mut self, rows: &[runner_core::protocol::node::NodeRow]) {
-        if self
+    pub(crate) fn replace_tab_rows(
+        &mut self,
+        rows: &[runner_core::protocol::node::NodeRow],
+        cx: &App,
+    ) {
+        let had_active = self.tabs.active().is_some();
+        let closed = self
             .pending_tab_close
-            .as_ref()
-            .is_some_and(|close| close.apply(&mut self.tabs, rows))
-        {
-            self.pending_tab_close = None;
-        }
+            .take_if(|close| !rows.iter().any(|row| row.id == close.tab_id));
+        let landing =
+            closed.is_some_and(|close| self.tabs.active_tab_id() == Some(close.tab_id.as_str()));
         self.tabs.replace_rows(rows);
+        self.chat_panels_by_tab
+            .retain(|id, _| rows.iter().any(|row| &row.id == id));
+        self.panel_chat_by_tab
+            .retain(|id, _| rows.iter().any(|row| &row.id == id));
+        if landing {
+            self.land_on_recent_tab(cx);
+        }
+        if had_active
+            && self.tabs.active().is_none()
+            && self.route != AppRoute::Launcher
+            && self.remote_client.is_local()
+        {
+            self.reset_launcher_page(cx);
+        }
+    }
+
+    /// Moves off a tab that closed, or a mission that was archived, to the
+    /// last viewed tab. With no tab left, the launcher shows.
+    pub(crate) fn land_on_recent_tab(&mut self, cx: &App) {
+        match self.recently_viewed_tab_id(cx) {
+            Some(tab) => {
+                self.tabs.activate(&tab);
+                self.tab_landed_at = Some(Instant::now());
+            }
+            None => self.tabs.clear_active(),
+        }
     }
 
     pub(crate) fn apply_tab_rows(&mut self, cx: &mut Context<Self>) {
         let store = self.app_store.clone();
-        self.replace_tab_rows(&store.read(cx).nodes);
+        self.replace_tab_rows(&store.read(cx).nodes, cx);
         self.sync_active_project_from_active_tab(cx);
         self.prune_sidebar_collapse_state(cx);
     }
@@ -686,11 +694,11 @@ mod native_root_tests {
         }
     }
 
-    #[test]
-    fn tab_close_selection_survives_async_reload_for_middle_last_and_only_tabs() {
+    #[cfg(unix)]
+    fn tab_rows(ids: [&str; 3]) -> Vec<runner_core::protocol::node::NodeRow> {
         use runner_core::protocol::node::{NodeRow, NodeType};
 
-        let rows = ["first", "middle", "last"].map(|id| NodeRow {
+        ids.map(|id| NodeRow {
             id: id.into(),
             parent_id: None,
             position: 0,
@@ -702,66 +710,85 @@ mod native_root_tests {
             last_completed_at: None,
             last_viewed_at: None,
             created_at: String::new(),
-        });
-        for closing in ["first", "middle", "last"] {
-            let mut tabs = TabSet::from_rows(&rows);
-            tabs.activate(closing);
-            let pending = PendingTabClose {
-                tab_id: closing.into(),
-            };
-            assert!(!pending.apply(&mut tabs, &rows));
-            tabs.replace_rows(&rows);
-            assert_eq!(tabs.active_tab_id(), Some(closing));
-            let remaining = rows
-                .iter()
-                .filter(|row| row.id != closing)
-                .cloned()
-                .collect::<Vec<_>>();
-            assert!(pending.apply(&mut tabs, &remaining));
-            tabs.replace_rows(&remaining);
-            assert!(tabs.active().is_none());
-            tabs.replace_rows(&remaining);
-            assert!(tabs.active().is_none());
-        }
-        let mut tabs = TabSet::from_rows(&rows[..1]);
-        let pending = PendingTabClose {
-            tab_id: "first".into(),
-        };
-        assert!(pending.apply(&mut tabs, &[]));
-        tabs.replace_rows(&[]);
-        tabs.replace_rows(&rows);
-        assert!(tabs.active().is_none());
+        })
+        .to_vec()
+    }
 
-        let mut tabs = TabSet::from_rows(&rows);
-        tabs.activate("middle");
-        let pending = PendingTabClose {
-            tab_id: "last".into(),
-        };
-        assert!(pending.apply(&mut tabs, &rows[..2]));
-        tabs.replace_rows(&rows[..2]);
-        assert_eq!(tabs.active_tab_id(), Some("middle"));
+    #[cfg(unix)]
+    #[test]
+    fn closing_the_active_tab_lands_once_its_row_is_gone_and_only_an_empty_window_clears() {
+        let rows = tab_rows(["first", "middle", "last"]);
+        let temp = tempfile::tempdir().unwrap();
+        let mut cx = gpui::TestAppContext::single();
+        let store = crate::app_store::test_lifecycle_store(&mut cx, temp.path());
+        cx.add_window(|window, cx| {
+            let mut root = NativeRoot::new(
+                "close-selection".into(),
+                temp.path().join("logs"),
+                None,
+                None,
+                store.clone(),
+                window,
+                cx,
+            );
+            for closing in ["first", "middle", "last"] {
+                root.tabs = TabSet::from_rows(&rows);
+                root.tabs.activate(closing);
+                root.tab_landed_at = None;
+                root.pending_tab_close = Some(PendingTabClose {
+                    tab_id: closing.into(),
+                });
+                root.replace_tab_rows(&rows, cx);
+                assert_eq!(root.tabs.active_tab_id(), Some(closing));
+                assert!(root.pending_tab_close.is_some());
+                assert!(root.tab_landed_at.is_none());
+
+                let remaining = rows
+                    .iter()
+                    .filter(|row| row.id != closing)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                root.replace_tab_rows(&remaining, cx);
+                assert_eq!(root.tabs.active_tab_id(), Some(remaining[0].id.as_str()));
+                assert!(root.pending_tab_close.is_none());
+                assert!(root.tab_landed_at.is_some());
+                root.replace_tab_rows(&remaining, cx);
+                assert_eq!(root.tabs.active_tab_id(), Some(remaining[0].id.as_str()));
+            }
+
+            // With no tab left the launcher shows, and stays when one arrives.
+            root.tabs = TabSet::from_rows(&rows[..1]);
+            root.tab_landed_at = None;
+            root.pending_tab_close = Some(PendingTabClose {
+                tab_id: "first".into(),
+            });
+            root.replace_tab_rows(&[], cx);
+            assert!(root.tabs.active().is_none());
+            assert!(root.tab_landed_at.is_none());
+            root.replace_tab_rows(&rows, cx);
+            assert!(root.tabs.active().is_none());
+
+            // Closing a tab that is not on screen changes nothing.
+            root.tabs = TabSet::from_rows(&rows);
+            root.tabs.activate("middle");
+            root.pending_tab_close = Some(PendingTabClose {
+                tab_id: "last".into(),
+            });
+            root.replace_tab_rows(&rows[..2], cx);
+            assert_eq!(root.tabs.active_tab_id(), Some("middle"));
+            assert!(root.tab_landed_at.is_none());
+            root
+        });
     }
 
     #[cfg(unix)]
     #[test]
     fn sidebar_node_results_and_store_reload_share_the_pending_close_rule() {
         use gpui::TestAppContext;
-        use runner_core::protocol::node::{NodeRow, NodeType};
 
         let _theme = crate::theme_snapshot::ThemeGuard::new();
-        let rows = ["first", "closing"].map(|id| NodeRow {
-            id: id.into(),
-            parent_id: None,
-            position: 0,
-            node_type: NodeType::Tab,
-            name: None,
-            ref_id: None,
-            layout: Some(PaneLayout::single(None, &[]).serialize().unwrap()),
-            pinned_position: None,
-            last_completed_at: None,
-            last_viewed_at: None,
-            created_at: String::new(),
-        });
+        let rows = tab_rows(["first", "second", "closing"]);
+        let remaining = &rows[..2];
         for node_result_first in [false, true] {
             for activate_another in [false, true] {
                 let temp = tempfile::tempdir().unwrap();
@@ -782,26 +809,21 @@ mod native_root_tests {
                     root.prepare_tab_close(&[], cx);
                     assert!(root.pending_tab_close.is_some());
                     if activate_another {
-                        root.tabs.activate("first");
+                        root.tabs.activate("second");
                     }
                     if node_result_first {
-                        root.replace_tab_rows(&rows[..1]);
+                        root.replace_tab_rows(remaining, cx);
                     }
-                    store.update(cx, |store, cx| store.replace_nodes(rows[..1].to_vec(), cx));
+                    store.update(cx, |store, cx| store.replace_nodes(remaining.to_vec(), cx));
                     root.apply_tab_rows(cx);
                     if !node_result_first {
-                        root.replace_tab_rows(&rows[..1]);
+                        root.replace_tab_rows(remaining, cx);
                     }
                     assert!(root.pending_tab_close.is_none());
-                    assert_eq!(
-                        root.tabs.active_tab_id(),
-                        activate_another.then_some("first")
-                    );
+                    let expected = if activate_another { "second" } else { "first" };
+                    assert_eq!(root.tabs.active_tab_id(), Some(expected));
                     root.apply_tab_rows(cx);
-                    assert_eq!(
-                        root.tabs.active_tab_id(),
-                        activate_another.then_some("first")
-                    );
+                    assert_eq!(root.tabs.active_tab_id(), Some(expected));
                     root
                 });
             }

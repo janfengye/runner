@@ -213,6 +213,10 @@ impl RemoteClient {
         self.workspace.as_ref()?.active.as_ref()
     }
 
+    pub(crate) fn landed_at(&self) -> Option<std::time::Instant> {
+        self.workspace.as_ref()?.landed_at
+    }
+
     pub(crate) fn mission_workspace(&self) -> Option<Entity<MissionWorkspace>> {
         self.workspace
             .as_ref()
@@ -225,6 +229,15 @@ impl RemoteClient {
 
     pub(crate) fn tab_layout(&self, id: &str) -> Option<&PaneLayout> {
         self.workspace.as_ref()?.layouts.get(id)
+    }
+
+    pub(crate) fn recently_viewed_tab_layout(&self) -> Option<&PaneLayout> {
+        let remote = self.workspace.as_ref()?;
+        remote
+            .viewed_tabs
+            .iter()
+            .rev()
+            .find_map(|id| remote.layouts.get(id))
     }
 
     pub(crate) fn session_pending(&self, id: &str) -> bool {
@@ -265,6 +278,23 @@ impl RemoteClient {
                 && remote.navigation_generation == navigation
                 && remote.form_generation == form
         })
+    }
+
+    pub(crate) fn startup_error(
+        &self,
+        id: &str,
+        cx: &App,
+    ) -> Option<runner_core::protocol::StartupError> {
+        let remote = self.workspace.as_ref()?;
+        let state = self.app_store.read(cx).remote_clients.read(cx);
+        state
+            .overviews
+            .get(&remote.computer.id)?
+            .sessions
+            .get(id)?
+            .status
+            .startup_error
+            .clone()
     }
 
     pub(crate) fn status(

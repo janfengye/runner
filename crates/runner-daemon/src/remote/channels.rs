@@ -23,10 +23,13 @@ use tokio::{
 };
 use tokio_tungstenite::tungstenite::Message;
 
+pub(super) const MAX_CHANNELS: usize = 16;
+
 pub(super) enum Event {
     Authenticated {
         channel: u32,
         instance: u64,
+        kind: remote::DeviceKind,
     },
     Handshake {
         channel: u32,
@@ -84,6 +87,7 @@ pub(super) struct Channels {
     rx: mpsc::Receiver<Event>,
     pub writes: Arc<TrustWrites>,
     companion: Arc<std::sync::OnceLock<Arc<dyn crate::companion::core::Core>>>,
+    pub(super) features: Vec<&'static str>,
 }
 
 pub(super) struct TrustWrites {
@@ -285,13 +289,14 @@ impl Channels {
             rx,
             writes,
             companion,
+            features: crate::companion::FEATURES.to_vec(),
         }
     }
     pub fn open(&mut self, id: u32, machine: &Machine) -> Result<(), Reject> {
         if id == 0 || self.entries.contains_key(&id) {
             return Err(Reject::BadHandshake);
         }
-        if self.entries.len() == 16 {
+        if self.entries.len() == MAX_CHANNELS {
             return Err(Reject::Busy);
         }
         let (input, rx) = mpsc::unbounded_channel();
@@ -308,10 +313,7 @@ impl Channels {
                 .unwrap_or_else(|| machine.host.hostname.clone()),
             runner_version: machine.host.runner_version.clone(),
             platform: machine.host.platform.clone(),
-            features: crate::companion::FEATURES
-                .iter()
-                .map(|name| (*name).into())
-                .collect(),
+            features: self.features.iter().map(|name| (*name).into()).collect(),
         };
         let companion = self.companion.clone();
         let task = tokio::spawn(async move {
@@ -419,7 +421,11 @@ impl Channels {
         events: &crate::events::EventChannel,
     ) -> Option<Message> {
         match event {
-            Event::Authenticated { channel, instance } => {
+            Event::Authenticated {
+                channel,
+                instance,
+                kind,
+            } => {
                 let entry = self
                     .entries
                     .get_mut(&channel)
@@ -432,6 +438,7 @@ impl Channels {
                     .find(|device| &device.fingerprint == fingerprint)?;
                 entry.ready = true;
                 device.last_seen_at = clock.now();
+                device.kind = kind;
                 if let Ok(permit) = self.writes.slots.clone().try_acquire_owned() {
                     let job = self.writes.job(machine.trust.clone(), root.to_path_buf());
                     tokio::spawn(async move {
@@ -746,7 +753,12 @@ async fn serve(
                 queued -= Vec::<u8>::len(&message);
                 Some(message)
             } else if let Some(adapter) = &mut adapter {
-                crate::companion::Adapter::next(adapter, records.send_credit() > 0).await?
+                crate::companion::Adapter::next_paced(
+                    adapter,
+                    records.send_credit() > 0,
+                    records.output_paced(Instant::now().into_std()),
+                )
+                .await?
             } else {
                 None
             };
@@ -754,7 +766,10 @@ async fn serve(
                 records.queue(message).map_err(|_| "message too large")?;
             }
         }
-        if let Some(frame) = records.next_frame().map_err(|_| "invalid record")? {
+        if let Some(frame) = records
+            .next_frame_at(Instant::now().into_std())
+            .map_err(|_| "invalid record")?
+        {
             send(tx, id, instance, frame).await?;
             continue;
         }
@@ -788,6 +803,7 @@ async fn serve(
                         tx.send(Event::Authenticated {
                             channel: id,
                             instance,
+                            kind: remote::DeviceKind::from_client(&greeting.client),
                         })
                         .await
                         .map_err(|_| "route closed")?;

@@ -243,6 +243,7 @@ impl RenderOnce for Modal {
                             .child(footer)
                     })),
             )
+            .map(crate::platform_ui::window_scrim)
     }
 }
 
@@ -354,6 +355,13 @@ impl RenderOnce for Drawer {
                     .bg(theme::panel())
                     .shadow_2xl()
                     .debug_selector(|| "DRAWER_PANEL".into())
+                    .map(|panel| {
+                        #[cfg(any(target_os = "linux", test))]
+                        let panel = crate::platform_ui::round_window_corners(panel, window)
+                            .rounded_tl(px(0.))
+                            .rounded_bl(px(0.));
+                        panel
+                    })
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
                         div()
@@ -396,11 +404,21 @@ impl RenderOnce for Drawer {
                             .border_t_1()
                             .border_color(theme::border())
                             .bg(theme::with_alpha(theme::bg(), 0.4))
+                            .map(|footer| {
+                                #[cfg(any(target_os = "linux", test))]
+                                let footer =
+                                    crate::platform_ui::round_window_corners(footer, window)
+                                        .rounded_tl(px(0.))
+                                        .rounded_tr(px(0.))
+                                        .rounded_bl(px(0.));
+                                footer
+                            })
                             .px(rems(24. / 16.))
                             .py(rems(1.))
                             .child(footer)
                     })),
             )
+            .map(crate::platform_ui::window_scrim)
     }
 }
 
@@ -408,6 +426,8 @@ impl RenderOnce for Drawer {
 pub struct ConfirmDialog {
     title: SharedString,
     body: SharedString,
+    note: Option<AnyElement>,
+    detail: Option<SharedString>,
     icon: SharedString,
     variant: ButtonVariant,
     confirm_label: SharedString,
@@ -475,6 +495,8 @@ impl ConfirmDialog {
         Self {
             title: title.into(),
             body: body.into(),
+            note: None,
+            detail: None,
             icon: "trash.svg".into(),
             variant: ButtonVariant::Danger,
             confirm_label: confirm_label.into(),
@@ -488,6 +510,16 @@ impl ConfirmDialog {
 
     pub fn icon(mut self, icon: impl Into<SharedString>) -> Self {
         self.icon = icon.into();
+        self
+    }
+
+    pub fn note(mut self, note: impl IntoElement) -> Self {
+        self.note = Some(note.into_any_element());
+        self
+    }
+
+    pub fn detail(mut self, detail: impl Into<SharedString>) -> Self {
+        self.detail = Some(detail.into());
         self
     }
 
@@ -612,6 +644,17 @@ impl RenderOnce for ConfirmDialog {
                             .debug_selector(|| "CONFIRM_DIALOG_BODY".into())
                             .child(self.body)
                     }))
+                    .children(self.note)
+                    .children(self.detail.map(|detail| {
+                        div()
+                            .w(rems((420. - 2. * 22.) / 16.))
+                            .whitespace_normal()
+                            .text_size(theme::text_ui())
+                            .line_height(rems(20. / 16.))
+                            .text_color(theme::faint())
+                            .debug_selector(|| "CONFIRM_DIALOG_DETAIL".into())
+                            .child(detail)
+                    }))
                     .child(
                         div()
                             .flex()
@@ -639,6 +682,7 @@ impl RenderOnce for ConfirmDialog {
                             )),
                     ),
             )
+            .map(crate::platform_ui::window_scrim)
     }
 }
 

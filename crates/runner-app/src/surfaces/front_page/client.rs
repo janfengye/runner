@@ -61,6 +61,17 @@ impl RemoteAccess {
                 .is_some_and(|known| features.iter().all(|feature| known.contains(*feature)))
     }
 
+    /// Whether this host is known not to serve `feature`, unlike `supports`, which also says no
+    /// before the features are discovered.
+    pub(crate) fn lacks(&self, feature: &str) -> bool {
+        let state = self.state.read().unwrap();
+        state.valid
+            && state
+                .features
+                .as_ref()
+                .is_some_and(|known| !known.contains(feature))
+    }
+
     pub(crate) fn valid(&self) -> bool {
         self.state.read().unwrap().valid
     }
@@ -141,6 +152,73 @@ impl FrontPageClient {
         }
         serde_json::from_value(result.result)
             .map_err(|_| ClientError::msg("The computer returned an invalid action result."))
+    }
+
+    pub(crate) fn usage(&self, popover: bool) -> ClientResult<runner_core::companion::Usage> {
+        self.action("usage", ActionRequest::Usage { id: 0, popover })
+    }
+
+    pub(crate) fn start_runtime_task(
+        &self,
+        runtime: runner_core::protocol::Runtime,
+    ) -> ClientResult<runner_core::protocol::RuntimeUpdateTask> {
+        if !self.is_remote() {
+            return self.daemon.runtime_task_start(runtime);
+        }
+        self.action(
+            "runtimeTaskStart",
+            ActionRequest::RuntimeTaskStart {
+                id: 0,
+                runtime: runtime.key().into(),
+            },
+        )
+    }
+
+    pub(crate) fn runtime_task(
+        &self,
+        runtime: runner_core::protocol::Runtime,
+    ) -> ClientResult<Option<runner_core::protocol::RuntimeUpdateTask>> {
+        if !self.is_remote() {
+            return self
+                .daemon
+                .runtime_task_list()
+                .map(|tasks| tasks.into_iter().find(|task| task.runtime == runtime));
+        }
+        self.action(
+            "runtimeTask",
+            ActionRequest::RuntimeTask {
+                id: 0,
+                runtime: runtime.key().into(),
+            },
+        )
+    }
+
+    pub(crate) fn task_terminal(
+        &self,
+        id: &str,
+    ) -> Option<(
+        String,
+        DaemonClient,
+        crate::surfaces::remote_client::transport::AttachmentLifetime,
+    )> {
+        let FrontPageTarget::Remote { computer, .. } = &self.target else {
+            return None;
+        };
+        let config = runner_core::remote::RemoteTerminal {
+            computer: computer.clone(),
+            session: id.into(),
+            cols: 80,
+            rows: 24,
+            take_control: true,
+        };
+        let address = config.address();
+        let (client, lifetime) = crate::surfaces::remote_client::transport::RemoteTransport::client(
+            self.daemon.clone(),
+            config,
+            "Agent update".into(),
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        );
+        Some((address, client, lifetime))
     }
 
     pub(crate) fn catalog(&self) -> ClientResult<Catalog> {
@@ -679,6 +757,35 @@ impl FrontPageClient {
         .map(|()| None)
     }
 
+    /// Link a mission to a direct agent chat, or move its link (#748). The
+    /// chat hears about it: the app is not the chat's own agent.
+    pub(crate) fn link_mission(
+        &self,
+        mission: String,
+        session: String,
+    ) -> ClientResult<runner_core::protocol::model::Mission> {
+        if self.is_remote() {
+            return Err(ClientError::msg("Linking is available on the host."));
+        }
+        self.daemon
+            .mission_link(runner_core::protocol::MissionLinkInput {
+                mission_id: mission,
+                session_id: session,
+                no_report: false,
+                caller_session_id: None,
+            })
+    }
+
+    pub(crate) fn unlink_mission(
+        &self,
+        mission: String,
+    ) -> ClientResult<runner_core::protocol::model::Mission> {
+        if self.is_remote() {
+            return Err(ClientError::msg("Linking is available on the host."));
+        }
+        self.daemon.mission_unlink(&mission)
+    }
+
     pub(crate) fn archive_mission_state(
         &self,
         mission: String,
@@ -833,6 +940,8 @@ impl FrontPageClient {
                         title,
                         goal_override: goal,
                         cwd,
+                        started_by_session_id: None,
+                        no_report: false,
                     },
                     Some(size),
                 )

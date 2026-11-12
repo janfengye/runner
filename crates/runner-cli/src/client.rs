@@ -176,7 +176,7 @@ impl SocketClient {
         .map_err(|error| match error {
             ConnectError::NotRunning => ClientError::NotRunning,
             ConnectError::Blocked => connect_failure(std::io::ErrorKind::PermissionDenied, exists),
-            ConnectError::Mismatch(_) | ConnectError::Protocol(_) => {
+            ConnectError::Mismatch(_) | ConnectError::InUse(_) | ConnectError::Protocol(_) => {
                 ClientError::Protocol(VERSION_SKEW_MESSAGE.into())
             }
         })?;
@@ -325,6 +325,13 @@ pub fn call_daemon(
         "mission_list_summary" => {
             response(client.mission_list_summary_impl(argument(&args, "crew_id")?))
         }
+        "mission_list_linked" => {
+            response(client.mission_list_linked(&argument::<String>(&args, "session_id")?))
+        }
+        "mission_link" => response(client.mission_link(parse(args)?)),
+        "mission_unlink" => {
+            response(client.mission_unlink(&argument::<String>(&args, "mission_id")?))
+        }
         "mission_feed" => response(client.mission_feed(parse(args)?)),
         "mission_status" => response(client.mission_status(&argument::<String>(&args, "id")?)),
         "mission_get" => response(client.mission_get(&argument::<String>(&args, "id")?)),
@@ -424,6 +431,7 @@ mod skew_tests {
                     exe_sha256: "old".into(),
                     pid: 1,
                     started_at: "now".into(),
+                    app_clients: 0,
                 },
             )
             .unwrap()
@@ -487,6 +495,7 @@ mod cursor_tests {
                     exe_sha256: "existing".into(),
                     pid: 1,
                     started_at: "now".into(),
+                    app_clients: 0,
                 },
             )
             .unwrap()

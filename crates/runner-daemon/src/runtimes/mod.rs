@@ -41,6 +41,33 @@ pub fn catalogs() -> Vec<RuntimeCatalog> {
         .collect()
 }
 
+pub(crate) const STATUS_HOOKS_ENV: &str = "RUNNER_STATUS_HOOKS";
+pub(crate) const REMOTE_PLUGIN_ENV: &str = "RUNNER_CODEX_REMOTE_PLUGIN";
+
+pub(crate) fn status_hooks_enabled(env: &std::collections::BTreeMap<String, String>) -> bool {
+    env.get(STATUS_HOOKS_ENV)
+        .is_none_or(|value| value != "false")
+}
+
+pub(crate) fn apply_launch_options(
+    role: &crate::model::Role,
+    mission: bool,
+    options: runner_core::protocol::runtime::RuntimeLaunchOptions,
+) -> crate::model::Role {
+    let mut role = role.clone();
+    let permissions = for_key(&role.runtime).permissions();
+    if !mission
+        && options.bypass
+        && matches!(
+            Runtime::parse(&role.runtime),
+            Some(Runtime::Codex | Runtime::ClaudeCode)
+        )
+    {
+        role.args = permissions.apply_mission(&role.args);
+    }
+    role
+}
+
 pub struct LaunchContext<'a> {
     pub default_model: Option<&'a str>,
     pub env: &'a std::collections::BTreeMap<String, String>,
@@ -281,6 +308,13 @@ pub fn unbatched_status_semantics() -> StatusSemantics {
 }
 
 pub trait RuntimeAdapter: Send + Sync {
+    fn classify_startup_error(
+        &self,
+        _output: &str,
+    ) -> Option<runner_core::protocol::status::StartupError> {
+        None
+    }
+
     fn status_semantics(&self) -> StatusSemantics {
         StatusSemantics::default()
     }
@@ -409,6 +443,7 @@ pub trait RuntimeAdapter: Send + Sync {
         _session_id: &str,
         _cwd: Option<&Path>,
         _copilot_home: Option<&str>,
+        _claude_config_dir: Option<&str>,
     ) -> crate::error::Result<()> {
         Ok(())
     }
@@ -442,6 +477,22 @@ pub trait RuntimeAdapter: Send + Sync {
     fn startup_delivery_uses_hooks(&self, _pending_turn: bool) -> bool {
         false
     }
+    /// Whether a resumed or forked conversation sends its startup hook, so a report's
+    /// gate can wait for it (#748).
+    fn startup_hook_on_reopen(&self) -> bool {
+        true
+    }
+    /// Whether a fresh start with `args` in `cwd` opens with no folder-trust screen, as
+    /// its config already records the decision, so a report's gate need not wait for a
+    /// hook the runtime sends only with the first turn (#748).
+    fn starts_trusted(
+        &self,
+        _cwd: Option<&Path>,
+        _args: &[String],
+        _env: &std::collections::BTreeMap<String, String>,
+    ) -> bool {
+        false
+    }
     fn mission_dir_args(&self, _dir: Option<&Path>) -> Vec<String> {
         Vec::new()
     }
@@ -459,6 +510,20 @@ pub trait RuntimeAdapter: Send + Sync {
         ))
     }
     fn conversation_exists(&self, _key: &str, _ctx: &ProbeContext<'_>) -> Option<bool> {
+        None
+    }
+    /// Where `conversation_exists` looks, for logs; `None` when the runtime does not say.
+    fn conversation_folder(&self, _ctx: &ProbeContext<'_>) -> Option<PathBuf> {
+        None
+    }
+    /// The conversation a row should resume instead of `missing_key`, when
+    /// the runtime can prove which one the row owns.
+    fn recover_conversation(
+        &self,
+        _session_id: &str,
+        _missing_key: &str,
+        _ctx: &ProbeContext<'_>,
+    ) -> Option<String> {
         None
     }
     fn missing_conversation(&self) -> MissingConversation {

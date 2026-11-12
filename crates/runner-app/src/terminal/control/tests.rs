@@ -115,15 +115,26 @@ pub(crate) fn mirror_named(
     mpsc::Sender<TerminalFrame>,
     mpsc::Receiver<()>,
 ) {
+    mirror_waking(id, controller, Arc::new(|| {}))
+}
+
+pub(crate) fn mirror_waking(
+    id: &str,
+    controller: TerminalController,
+    waker: Arc<dyn Fn() + Send + Sync>,
+) -> (
+    Arc<RecordingHost>,
+    Arc<TerminalMirror>,
+    mpsc::Sender<TerminalFrame>,
+    mpsc::Receiver<()>,
+) {
     let (tx, rx) = mpsc::channel();
     let host = Arc::new(RecordingHost {
         controller: Mutex::new(controller),
         stream: Mutex::new(Some((tx.clone(), rx))),
         ..Default::default()
     });
-    let mirror =
-        TerminalMirror::attach(DaemonClient::new(host.clone()), id.into(), Arc::new(|| {}))
-            .unwrap();
+    let mirror = TerminalMirror::attach(DaemonClient::new(host.clone()), id.into(), waker).unwrap();
     let (ack, received) = mpsc::channel();
     *host.processed.lock().unwrap() = Some(ack);
     (host, mirror, tx, received)
@@ -253,14 +264,16 @@ struct ControlView {
     chats: Vec<AttachedChat>,
 }
 impl Render for ControlView {
-    fn render(&mut self, _: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let style = super::super::element::TerminalStyle {
             palette: runner_terminal::palette::RUNNER,
             font: crate::app_settings::AppSettings::default()
                 .terminal_font_family
-                .font(),
+                .font(cx),
             font_size: 14.,
             app_zoom: 1.,
+            line_height_factor: crate::app_settings::TERMINAL_LINE_HEIGHT_DEFAULT,
+            copy_on_select: false,
         };
         let panes = self
             .chats
@@ -302,6 +315,8 @@ pub(crate) fn attached<T: 'static>(
         interaction.pane_size = Some(runner_app::terminal_resize::TerminalGridSize { cols, rows })
     });
     let input = cx.new(|_| TerminalInput::new(terminal.clone()));
+    let focus = cx.focus_handle();
+    let find = cx.new(|cx| super::super::TerminalFind::new(terminal.clone(), focus.clone(), cx));
     AttachedChat {
         _terminal_view: terminal.view(),
         terminal_scrollbar: cx.new(|_| Scrollbar::terminal(terminal.clone())),
@@ -310,7 +325,8 @@ pub(crate) fn attached<T: 'static>(
         _terminal_input_subscription: cx.observe(&input, |_, _, _| {}),
         _terminal_focus_subscription: Some(cx.observe(&input, |_, _, _| {})),
         terminal_input: input,
-        terminal_focus: cx.focus_handle(),
+        terminal_focus: focus,
+        terminal_find: find,
     }
 }
 
@@ -422,14 +438,16 @@ fn hidden_mission_slots_use_the_slot_pane_and_closed_drawers_keep_the_grid() {
         chats: Vec<AttachedChat>,
     }
     impl Render for HiddenMission {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let style = super::super::element::TerminalStyle {
                 palette: runner_terminal::palette::RUNNER,
                 font: crate::app_settings::AppSettings::default()
                     .terminal_font_family
-                    .font(),
+                    .font(cx),
                 font_size: 14.,
                 app_zoom: 1.,
+                line_height_factor: crate::app_settings::TERMINAL_LINE_HEIGHT_DEFAULT,
+                copy_on_select: false,
             };
             let chats = self.chats.iter().collect::<Vec<_>>();
             let body = measure_panes(div().relative().flex_1().min_h(gpui::px(0.)), &chats, style);
@@ -452,6 +470,9 @@ fn hidden_mission_slots_use_the_slot_pane_and_closed_drawers_keep_the_grid() {
     let window = cx.add_window(|_, cx| {
         let interaction = cx.new(|_| super::super::TerminalInteraction::new(terminal.clone()));
         let input = cx.new(|_| TerminalInput::new(terminal.clone()));
+        let focus = cx.focus_handle();
+        let find =
+            cx.new(|cx| super::super::TerminalFind::new(terminal.clone(), focus.clone(), cx));
         HiddenMission {
             chats: vec![AttachedChat {
                 _terminal_view: terminal.view(),
@@ -461,7 +482,8 @@ fn hidden_mission_slots_use_the_slot_pane_and_closed_drawers_keep_the_grid() {
                 _terminal_input_subscription: cx.observe(&input, |_, _, _| {}),
                 _terminal_focus_subscription: Some(cx.observe(&input, |_, _, _| {})),
                 terminal_input: input,
-                terminal_focus: cx.focus_handle(),
+                terminal_focus: focus,
+                terminal_find: find,
             }],
         }
     });

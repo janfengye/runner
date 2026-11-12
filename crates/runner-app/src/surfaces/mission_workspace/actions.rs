@@ -5,8 +5,10 @@ use gpui::prelude::*;
 use gpui::{AnyElement, KeyDownEvent, Window};
 use runner_app::ui::{MenuItem as UiMenuItem, SessionControlKind, TextField};
 use runner_core::protocol::model::SessionStatus;
+use runner_core::protocol::NodeType;
 
 use super::*;
+use crate::surfaces::front_page::model::WorkspaceMission;
 use crate::*;
 
 impl MissionWorkspace {
@@ -15,7 +17,8 @@ impl MissionWorkspace {
             return;
         };
         let busy = self.lifecycle_busy() || self.secondary;
-        let pinned = mission.pinned;
+        let pinned = self.mission_pinned(&mission, cx);
+        self.menu_pinned = pinned;
         let mut actions = Vec::new();
         let mut items = Vec::new();
         for (feature, action, label, icon, destructive) in [
@@ -75,10 +78,51 @@ impl MissionWorkspace {
         }
     }
 
+    /// A linked mission's pin is its group's: the pin of the tab holding its
+    /// chat (#748). The daemon pins that tab when the mission is pinned.
+    pub(super) fn mission_pinned(&self, mission: &WorkspaceMission, cx: &App) -> bool {
+        let Some(chat) = mission.linked_chat.as_ref().filter(|chat| !chat.archived) else {
+            return mission.pinned;
+        };
+        if self.presentation.is_remote() {
+            return self
+                .presentation
+                .chat_tab_pinned(&chat.session_id)
+                .unwrap_or(mission.pinned);
+        }
+        self.app_store
+            .read(cx)
+            .nodes
+            .iter()
+            .find(|node| {
+                node.node_type == NodeType::Tab
+                    && PaneLayout::from_node_row(node)
+                        .is_ok_and(|layout| layout.contains_session(&chat.session_id))
+            })
+            .map_or(mission.pinned, |tab| tab.pinned_position.is_some())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn toggle_pin_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.configure_mission_action_menu(cx);
+        let index = self
+            .menu_actions
+            .iter()
+            .position(|action| matches!(action, MissionMenuAction::Pin))
+            .expect("the header offers Pin");
+        self.handle_mission_menu_action(index, window, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn menu_pinned_for_test(&self) -> bool {
+        self.menu_pinned
+    }
+
     fn toggle_mission_pin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(mission) = self.mission_view() else {
             return;
         };
+        let pinned = self.mission_pinned(&mission, cx);
         let mission_id = mission.id.clone();
         let Some(operation) = self.prepare_mission_action("pin", "pin".into()) else {
             return;
@@ -86,7 +130,7 @@ impl MissionWorkspace {
         let client = self.client.clone();
         let task = cx.background_spawn(async move {
             client
-                .pin_mission_state(mission.id, !mission.pinned)
+                .pin_mission_state(mission.id, !pinned)
                 .map_err(|error| error.to_string())
         });
         cx.spawn_in(window, async move |weak, cx| {
@@ -373,13 +417,39 @@ impl MissionWorkspace {
                 }
                 _ => unreachable!(),
             };
-            result.map_err(|error| error.to_string())
+            let gate = result
+                .as_ref()
+                .err()
+                .and_then(|error| error.version_gate.clone());
+            (result.map_err(|error| error.to_string()), gate)
         });
         cx.spawn_in(window, async move |weak, cx| {
-            let result = task.await;
+            let (result, gate) = task.await;
             let _ = weak.update_in(cx, |this, window, cx| {
-                let Some(result) = this.complete_mission_action(operation, result, |ids| ids, cx)
-                else {
+                let Some(result) = this.complete_mission_action_observed(
+                    operation,
+                    result,
+                    |ids| ids,
+                    |workspace, succeeded, cx| {
+                        let target = target.clone();
+                        let host = workspace.client.target.clone();
+                        let _ = workspace.shell.update(cx, |root, cx| {
+                            root.record_session_gate(
+                                &host,
+                                &target,
+                                gate,
+                                if action == SessionControlKind::Restart {
+                                    crate::surfaces::agent_recovery::RecoveryAction::Restart
+                                } else {
+                                    crate::surfaces::agent_recovery::RecoveryAction::Resume
+                                },
+                                succeeded,
+                            );
+                            cx.notify();
+                        });
+                    },
+                    cx,
+                ) else {
                     return;
                 };
                 if !this.is_current(&mission_id, generation) {
@@ -544,7 +614,7 @@ impl MissionWorkspace {
             return;
         }
         let stopped = self
-            .sessions
+            .members()
             .iter()
             .filter(|session| session.session.status != SessionStatus::Running)
             .map(|session| session.session.id.clone())
@@ -558,7 +628,7 @@ impl MissionWorkspace {
             return;
         };
         self.resuming = true;
-        for session_id in &stopped {
+        for session_id in stopped.iter().filter(|_| !remote) {
             self.begin_mission_transition(
                 session_id,
                 MissionTransitionKind::Resuming,
@@ -574,16 +644,48 @@ impl MissionWorkspace {
         let client = self.client.clone();
         let resume_id = mission_id.clone();
         let task = cx.background_spawn(async move {
-            client
-                .resume_mission_state(resume_id, size)
-                .map_err(|error| error.to_string())
+            let result = client.resume_mission_state(resume_id, size);
+            let gate = result
+                .as_ref()
+                .err()
+                .and_then(|error| error.version_gate.clone());
+            (result.map_err(|error| error.to_string()), gate)
         });
         cx.spawn_in(window, async move |weak, cx| {
-            let result = task.await;
+            let (result, gate) = task.await;
             let _ = weak.update_in(cx, |this, window, cx| {
-                let Some(result) =
-                    this.complete_mission_action(operation, result, |output| output.sessions, cx)
-                else {
+                let Some(result) = this.complete_mission_action_observed(
+                    operation,
+                    result,
+                    |output| output.sessions,
+                    |workspace, succeeded, cx| {
+                        let host = workspace.client.target.clone();
+                        let sessions = workspace
+                            .members()
+                            .iter()
+                            .filter(|session| {
+                                stopped.contains(&session.session.id)
+                                    && gate
+                                        .as_ref()
+                                        .is_none_or(|gate| session.runtime == gate.runtime.key())
+                            })
+                            .map(|session| session.session.id.clone())
+                            .collect::<Vec<_>>();
+                        let _ = workspace.shell.update(cx, |root, cx| {
+                            for session in sessions {
+                                root.record_session_gate(
+                                    &host,
+                                    &session,
+                                    gate.clone(),
+                                    crate::surfaces::agent_recovery::RecoveryAction::Resume,
+                                    succeeded,
+                                );
+                            }
+                            cx.notify();
+                        });
+                    },
+                    cx,
+                ) else {
                     return;
                 };
                 if this.mission_id.as_deref() != Some(mission_id.as_str()) {

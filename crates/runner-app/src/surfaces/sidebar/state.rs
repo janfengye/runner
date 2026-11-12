@@ -1,5 +1,3 @@
-use super::menus::sidebar_create_menu_entries;
-
 use super::*;
 use crate::*;
 use gpui::WeakEntity;
@@ -14,36 +12,13 @@ impl Sidebar {
         let scroll = ScrollHandle::new();
         let scroll_owner = cx.entity_id();
         let scrollbar = cx.new(|_| Scrollbar::app(scroll.clone(), scroll_owner));
-        let root = cx.entity();
-        let menu_store = app_store.clone();
-        let create_menu = cx.new(move |menu_cx| {
-            let action_root = root.clone();
-            let entries =
-                sidebar_create_menu_entries(&menu_store.read(menu_cx).settings.keymap_overrides);
-            PopoverMenu::new(
-                "sidebar-create",
-                menu_cx.focus_handle(),
-                entries.into_iter().map(|(item, _)| item).collect(),
-                Rc::new(move |index, window, cx| {
-                    action_root.update(cx, |this, cx| {
-                        if let Some(action) = this.create_actions.get(index).cloned() {
-                            this.handle_sidebar_menu_action(action, window, cx);
-                        }
-                    });
-                }),
-                menu_cx,
-            )
-            .min_width(px(220.))
-            .trigger_size(IconButtonSize::Sm)
-            .trigger_icon("plus.svg")
-            .without_trigger_tooltip()
-        });
         let store_revisions = app_store.read(cx).revisions;
         Self {
             front_page: crate::surfaces::front_page::FrontPageClient::local(
                 app_store.read(cx).client.clone(),
             ),
             remote_settings: None,
+            remote_sidebar_seed_pending: false,
             remote_layouts: HashMap::new(),
             remote_sessions: HashMap::new(),
             remote_selection: None,
@@ -52,13 +27,6 @@ impl Sidebar {
             store_revisions,
             scroll,
             scrollbar,
-            create_menu,
-            create_actions: sidebar_create_menu_entries(
-                &app_store.read(cx).settings.keymap_overrides,
-            )
-            .into_iter()
-            .map(|(_, action)| action)
-            .collect(),
             context_menu: None,
             rename: None,
             live_titles: HashMap::new(),
@@ -70,6 +38,9 @@ impl Sidebar {
             dragged_id: None,
             drop_target: None,
             drop_marker: None,
+            link_drop: None,
+            drop_hint: None,
+            link_picker: None,
             hovered_row: None,
             cmd_held_since: None,
             shortcut_key_pressed: false,
@@ -78,7 +49,6 @@ impl Sidebar {
             tab_index_by_node: HashMap::new(),
             _rename_focus_subscription: None,
             _store_subscription: cx.observe(&app_store, |this, _, cx| {
-                this.refresh_create_menu(cx);
                 this.handle_store_update(cx);
             }),
         }
@@ -99,6 +69,28 @@ impl Sidebar {
         if let Some(settings) = self.remote_settings.as_mut() {
             let changed = update(settings);
             if changed {
+                if persist && !self.remote_sidebar_seed_pending {
+                    let view = crate::app_settings::RemoteSidebarSettings::from_settings(settings);
+                    if let crate::surfaces::front_page::FrontPageTarget::Remote {
+                        computer, ..
+                    } = &self.front_page.target
+                    {
+                        let computer = computer.clone();
+                        self.app_store.update(cx, |store, cx| {
+                            store.update_settings(
+                                |settings| {
+                                    if settings.remote_sidebars.get(&computer) == Some(&view) {
+                                        return false;
+                                    }
+                                    settings.remote_sidebars.insert(computer, view);
+                                    true
+                                },
+                                true,
+                                cx,
+                            );
+                        });
+                    }
+                }
                 cx.notify();
             }
             return changed;

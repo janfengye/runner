@@ -15,13 +15,47 @@ pub(super) fn mission_arg(command: &MissionCommand) -> Option<&Option<String>> {
     }
 }
 
+/// Commands that act for the calling chat need one. Checked before Runner
+/// is reached, so the hint shows even while it is not running.
+pub(super) fn require_chat(
+    command: &MissionCommand,
+    session: Option<&str>,
+) -> Result<(), CliError> {
+    if session.is_some() {
+        return Ok(());
+    }
+    match command {
+        MissionCommand::List {
+            linked_here: true, ..
+        } => Err(CliError::usage(
+            "runner mission list --linked-here is for a Runner chat; outside one, use runner mission list",
+        )),
+        MissionCommand::Link { chat: None, .. } => Err(CliError::usage(
+            "runner mission link without --chat is for a Runner chat; outside one, pass --chat <session>",
+        )),
+        _ => Ok(()),
+    }
+}
+
 pub(super) async fn run_mission(
     client: &impl Caller,
     command: &MissionCommand,
     context: &BusContext,
+    session: Option<&str>,
 ) -> Result<ToolResponse, CliError> {
+    require_chat(command, session)?;
     match command {
-        MissionCommand::List { crew } => {
+        MissionCommand::List {
+            linked_here: true, ..
+        } => {
+            call(
+                client,
+                "mission_list_linked",
+                json!({"session_id": session}),
+            )
+            .await
+        }
+        MissionCommand::List { crew, .. } => {
             let crew_id = match crew {
                 Some(crew) => Some(resolve_named(client, "crew", "crew_list", crew).await?.id),
                 None => None,
@@ -39,26 +73,13 @@ pub(super) async fn run_mission(
             title,
             project,
             cwd,
+            no_report,
         } => {
             let crew = match crew {
                 Some(crew) => Some(resolve_named(client, "crew", "crew_list", crew).await?),
                 None => None,
             };
             let goal = read_text(goal.as_deref(), goal_file.as_deref(), "goal")?;
-            let title = title
-                .clone()
-                .or_else(|| {
-                    goal.as_deref()
-                        .and_then(|goal| goal.lines().find(|line| !line.trim().is_empty()))
-                        .map(str::trim)
-                        .map(str::to_owned)
-                })
-                .or_else(|| {
-                    crew.as_ref().map(|crew| {
-                        format!("{} {}", crew.name, chrono::Local::now().format("%Y-%m-%d"))
-                    })
-                })
-                .ok_or_else(|| CliError::usage("an empty mission needs --title or --goal"))?;
             let project_id = match project {
                 Some(project) => Some(
                     resolve_named(client, "project", "project_list", project)
@@ -81,6 +102,8 @@ pub(super) async fn run_mission(
                     "title": title,
                     "goal_override": goal,
                     "cwd": cwd,
+                    "started_by_session_id": session,
+                    "no_report": no_report,
                 }),
             )
             .await
@@ -176,6 +199,33 @@ pub(super) async fn run_mission(
             )
             .await
         }
+        MissionCommand::Link {
+            mission,
+            chat,
+            no_report,
+        } => {
+            let mission_id = resolve_mission(client, mission).await?;
+            let chat = match (chat, session) {
+                (Some(chat), _) => resolve_session(client, chat).await?,
+                (None, Some(session)) => session.to_owned(),
+                (None, None) => unreachable!("require_chat refuses a link with no chat"),
+            };
+            call(
+                client,
+                "mission_link",
+                json!({
+                    "mission_id": mission_id,
+                    "session_id": chat,
+                    "no_report": no_report,
+                    "caller_session_id": session,
+                }),
+            )
+            .await
+        }
+        MissionCommand::Unlink { mission } => {
+            let mission_id = resolve_mission(client, mission).await?;
+            call(client, "mission_unlink", json!({"mission_id": mission_id})).await
+        }
         MissionCommand::Feed {
             mission,
             follow: _,
@@ -203,21 +253,34 @@ pub(super) async fn run_mission(
             mission,
             question_id,
             choice,
+            note,
+            note_file,
         } => {
+            let note = answer_note(note.as_deref(), note_file.as_deref())?;
             let mission_id = resolve_mission(client, mission).await?;
+            let mut payload = json!({"question_id": question_id, "choice": choice});
+            insert_string(&mut payload, "note", note.as_deref());
             call(
                 client,
                 "mission_signal",
-                mission_signal_args(
-                    &mission_id,
-                    "human_response",
-                    json!({"question_id": question_id, "choice": choice}),
-                    None,
-                ),
+                mission_signal_args(&mission_id, "human_response", payload, None),
             )
             .await
         }
     }
+}
+
+fn answer_note(inline: Option<&str>, file: Option<&Path>) -> Result<Option<String>, CliError> {
+    let Some(note) = read_text(inline, file, "note")? else {
+        return Ok(None);
+    };
+    let note = note.trim();
+    if note.is_empty() {
+        return Err(CliError::usage(
+            "runner mission answer: the note is blank; give it text or leave out the note flag",
+        ));
+    }
+    Ok(Some(note.to_owned()))
 }
 
 pub(super) async fn mission_lifecycle(

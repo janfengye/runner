@@ -4,16 +4,17 @@ use gpui::{App, KeyBinding, Keystroke};
 use serde::{Deserialize, Deserializer, Serialize};
 
 #[cfg(target_os = "macos")]
-use crate::{Hide, HideOthers, Quit, QuitAndStopSessions};
+use crate::{Hide, HideOthers, Minimize, Quit, QuitAndStopSessions};
 
+use crate::{CloseFileTab, FindInFile, NextFileTab, PreviousFileTab};
 use crate::{
-    CloseTab, CloseWindow, CommandPalette, ConfirmStartChat, ConfirmStartMission, Copy,
-    FocusNextPane, FocusPreviousPane, Minimize, MissionTabNext, MissionTabPrevious,
-    NavigateNextPage, NavigatePreviousPage, NewMission, NewTab, NewTerminal, NewWindow,
-    OpenSettings, Paste, ResumeFocusedSession, SelectTab1, SelectTab2, SelectTab3, SelectTab4,
-    SelectTab5, SelectTab6, SelectTab7, SelectTab8, SelectTab9, SplitPaneDown, SplitPaneRight,
-    StopFocusedSession, ToggleFullscreen, ToggleSidebar, ToggleTerminalDrawer, ZoomIn, ZoomOut,
-    ZoomReset,
+    CloseTab, CloseWindow, CommandPalette, ConfirmStartChat, Copy, FindInTerminal, FocusNextPane,
+    FocusPreviousPane, MissionTabNext, MissionTabPrevious, NavigateNextPage, NavigatePreviousPage,
+    NewMission, NewTab, NewTerminal, NewWindow, OpenSettings, Paste, ResumeFocusedSession,
+    SearchFiles, SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6,
+    SelectTab7, SelectTab8, SelectTab9, SplitPaneDown, SplitPaneRight, StopFocusedSession,
+    SwitchSidebarView, ToggleFullscreen, ToggleMaximizePane, ToggleSidebar, ToggleTerminalDrawer,
+    ZoomIn, ZoomOut, ZoomReset,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,6 +36,29 @@ impl KeymapScope {
             Self::ChatSplit => Some("ChatSplit"),
             Self::Mission => Some("Mission"),
             Self::Terminal => Some("Terminal"),
+        }
+    }
+}
+
+/// Whether Runner's shortcuts or a focused terminal get bare Ctrl chords.
+/// Only Windows and Linux offer the choice; macOS shortcuts use ⌘.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum TerminalCtrlKeys {
+    TerminalFirst,
+    #[default]
+    #[serde(other)]
+    RunnerFirst,
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+impl TerminalCtrlKeys {
+    pub(crate) const ALL: [Self; 2] = [Self::RunnerFirst, Self::TerminalFirst];
+
+    pub(crate) fn label_key(self) -> &'static str {
+        match self {
+            Self::RunnerFirst => "keymap.terminal-ctrl-keys.runner-first",
+            Self::TerminalFirst => "keymap.terminal-ctrl-keys.terminal-first",
         }
     }
 }
@@ -111,8 +135,15 @@ pub(crate) fn platform_default(macos: &str) -> String {
 fn windows_default(macos: &str) -> String {
     match macos {
         "ctrl-cmd-f" => "f11".into(),
+        // Ctrl+F still reaches the shell.
+        "cmd-f" => "ctrl-shift-f".into(),
         "cmd-w" => "ctrl-shift-w".into(),
         "cmd-t" => "ctrl-shift-t".into(),
+        // Ctrl+D, Ctrl+K and Ctrl+S are terminal editing keys.
+        "cmd-d" => "ctrl-shift-d".into(),
+        "shift-cmd-d" => "alt-shift-d".into(),
+        "cmd-k" => "ctrl-shift-p".into(),
+        "cmd-s" => "ctrl-b".into(),
         "shift-cmd-w" => "alt-f4".into(),
         _ => macos.replace("cmd-", "ctrl-"),
     }
@@ -181,6 +212,14 @@ pub(crate) fn entries() -> &'static [KeymapEntry] {
                 fixed: false,
             },
             KeymapEntry {
+                id: "search-files",
+                title_key: "keymap.search-files.title",
+                description_key: "keymap.search-files.description",
+                scope: KeymapScope::Global,
+                default: default_combo("shift-cmd-o", None, false),
+                fixed: false,
+            },
+            KeymapEntry {
                 id: "toggle-sidebar",
                 title_key: "keymap.toggle-sidebar.title",
                 description_key: "keymap.toggle-sidebar.description",
@@ -189,11 +228,27 @@ pub(crate) fn entries() -> &'static [KeymapEntry] {
                 fixed: false,
             },
             KeymapEntry {
+                id: "switch-sidebar-view",
+                title_key: "keymap.switch-sidebar-view.title",
+                description_key: "keymap.switch-sidebar-view.description",
+                scope: KeymapScope::Global,
+                default: default_combo("cmd-.", None, false),
+                fixed: false,
+            },
+            KeymapEntry {
                 id: "toggle-terminal-drawer",
                 title_key: "keymap.toggle-terminal-drawer.title",
                 description_key: "keymap.toggle-terminal-drawer.description",
                 scope: KeymapScope::Mission,
                 default: default_combo("alt-f12", None, false),
+                fixed: false,
+            },
+            KeymapEntry {
+                id: "find-in-terminal",
+                title_key: "keymap.find-in-terminal.title",
+                description_key: "keymap.find-in-terminal.description",
+                scope: KeymapScope::Terminal,
+                default: default_combo("cmd-f", None, false),
                 fixed: false,
             },
             KeymapEntry {
@@ -349,6 +404,14 @@ pub(crate) fn entries() -> &'static [KeymapEntry] {
                 fixed: false,
             },
             KeymapEntry {
+                id: "toggle-maximize-pane",
+                title_key: "keymap.toggle-maximize-pane.title",
+                description_key: "keymap.toggle-maximize-pane.description",
+                scope: KeymapScope::Global,
+                default: default_combo("shift-cmd-enter", None, false),
+                fixed: false,
+            },
+            KeymapEntry {
                 id: "close-pane",
                 title_key: "keymap.close-pane.title",
                 description_key: "keymap.close-pane.description",
@@ -454,6 +517,8 @@ fn reserved_entries() -> &'static [KeymapEntry] {
                 default: default_combo("alt-cmd-h", None, false),
                 fixed: true,
             },
+            // Ctrl+M is Return in a terminal, so only macOS binds Minimize.
+            #[cfg(target_os = "macos")]
             KeymapEntry {
                 id: "system-minimize",
                 title_key: "keymap.system-minimize.title",
@@ -473,7 +538,11 @@ fn reserved_entries() -> &'static [KeymapEntry] {
             KeymapEntry {
                 id: "copy",
                 title_key: "keymap.copy.title",
-                description_key: "keymap.copy.description",
+                description_key: if cfg!(any(windows, target_os = "linux")) {
+                    "keymap.copy.description-ctrl"
+                } else {
+                    "keymap.copy.description"
+                },
                 scope: KeymapScope::Terminal,
                 default: default_combo("cmd-c", None, false),
                 fixed: true,
@@ -488,6 +557,13 @@ fn reserved_entries() -> &'static [KeymapEntry] {
             },
         ]
     })
+}
+
+/// System-owned keys the shortcuts page lists without letting them change.
+pub(crate) fn display_only_entries() -> impl Iterator<Item = &'static KeymapEntry> {
+    ["copy", "system-paste", "system-toggle-fullscreen"]
+        .into_iter()
+        .filter_map(|id| reserved_entries().iter().find(|entry| entry.id == id))
 }
 
 pub(crate) type KeymapOverrides = BTreeMap<String, Option<KeyCombo>>;
@@ -805,12 +881,12 @@ pub(crate) fn format_combo(combo: &KeyCombo) -> String {
     format!(
         "{}{}{}{}{}",
         if combo.ctrl { "Ctrl+" } else { "" },
+        if combo.alt { "Alt+" } else { "" },
         if combo.shift && !combo.shift_optional {
             "Shift+"
         } else {
             ""
         },
-        if combo.alt { "Alt+" } else { "" },
         if combo.meta {
             if cfg!(target_os = "linux") {
                 "Super+"
@@ -908,7 +984,7 @@ fn shifted_printable_key(code: &str) -> Option<&'static str> {
     })
 }
 
-fn binding_strings(combo: &KeyCombo) -> Vec<String> {
+pub(crate) fn binding_strings(combo: &KeyCombo) -> Vec<String> {
     let key = if combo
         .code
         .strip_prefix("Key")
@@ -954,25 +1030,108 @@ fn binding_strings(combo: &KeyCombo) -> Vec<String> {
     }
 }
 
+/// Terminal first leaves a chord of Ctrl plus one key to a focused terminal;
+/// zoom keeps working there in both modes.
+pub(crate) fn frees_for_terminal(entry: &KeymapEntry, combo: &KeyCombo) -> bool {
+    combo.ctrl
+        && !combo.shift
+        && !combo.alt
+        && !combo.meta
+        && !matches!(entry.id, "zoom-in" | "zoom-out" | "zoom-reset")
+}
+
+fn installed_context(
+    entry: &KeymapEntry,
+    combo: &KeyCombo,
+    terminal_ctrl_keys: TerminalCtrlKeys,
+) -> Option<String> {
+    let context = binding_context(entry, combo);
+    if terminal_ctrl_keys == TerminalCtrlKeys::RunnerFirst || !frees_for_terminal(entry, combo) {
+        return context.map(str::to_owned);
+    }
+    Some(match context {
+        Some(context) => format!("({context}) && !Terminal"),
+        None => "!Terminal".to_owned(),
+    })
+}
+
 fn binding_context(entry: &KeymapEntry, combo: &KeyCombo) -> Option<&'static str> {
+    // On Windows and Linux, Ctrl keys inside terminals follow the Ctrl keys
+    // in terminals setting rather than staying out of terminals here.
+    let modified = combo.meta || (cfg!(any(windows, target_os = "linux")) && combo.ctrl);
     match entry.id {
-        "new-chat" | "command-palette" | "page-previous" | "page-next"
-            if combo.meta
-                || (cfg!(any(windows, target_os = "linux")) && combo == &entry.default) =>
-        {
-            Some("!TextInput && !Settings")
+        // The launcher's search is focused on every Start page.
+        "new-chat" | "command-palette" if modified => {
+            Some("!(TextInput && !LauncherSearch) && !Settings")
         }
+        "page-previous" | "page-next" if modified => Some("!TextInput && !Settings"),
         "new-chat" | "command-palette" | "page-previous" | "page-next" => {
             Some("!TextInput && !Settings && !Terminal")
         }
-        "toggle-sidebar" => Some("!TextInput && !Settings"),
+        "toggle-sidebar" | "switch-sidebar-view" => Some("!TextInput && !Settings"),
+        // The open find bar sits beside the terminal, outside its context.
+        "find-in-terminal" => Some("Terminal || TerminalFind"),
         _ => entry.scope.context(),
+    }
+}
+
+/// The file viewer's keys, while focus is in a side panel's Files view:
+/// ⌘W there closes the file tab, and with none open falls through to the
+/// pane. A binding without a context counts as matching the deepest one, so
+/// these go after the pane's ⌘W to win the tie, and ⌘W gets a second binding
+/// for the view's text fields.
+pub(crate) fn install_file_viewer_bindings(cx: &mut App) {
+    let context = Some("FileViewer");
+    cx.bind_keys([
+        KeyBinding::new(&platform_default("cmd-w"), CloseFileTab, context),
+        KeyBinding::new(
+            &platform_default("cmd-w"),
+            CloseFileTab,
+            Some("FileViewer > TextInput"),
+        ),
+        KeyBinding::new("ctrl-tab", NextFileTab, context),
+        KeyBinding::new("ctrl-shift-tab", PreviousFileTab, context),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-f", FindInFile, context),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-c", Copy, context),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-a", crate::SelectAll, context),
+        #[cfg(any(windows, target_os = "linux"))]
+        KeyBinding::new("ctrl-f", FindInFile, context),
+        #[cfg(any(windows, target_os = "linux"))]
+        KeyBinding::new("ctrl-c", Copy, context),
+        #[cfg(any(windows, target_os = "linux"))]
+        KeyBinding::new("ctrl-a", crate::SelectAll, context),
+    ]);
+}
+
+/// Zoom in and out, as bound or rebound, step the file viewer's text while it
+/// has focus instead of the app (Jason, 2026-11-05); from the tree the Files
+/// view hands them on to the app's zoom. Zoom reset stays the app's everywhere
+/// (Jason, 2026-11-07). Installed after app zoom's bindings, since the later of
+/// two equally deep bindings wins.
+pub(crate) fn install_file_zoom_bindings(cx: &mut App, overrides: &KeymapOverrides) {
+    let combos = |id| {
+        effective_binding(id, overrides)
+            .map(|combo| binding_strings(&combo))
+            .unwrap_or_default()
+    };
+    // The find field is a text input inside the viewer.
+    for context in [Some("FileViewer"), Some("FileViewer > TextInput")] {
+        for binding in combos("zoom-in") {
+            cx.bind_keys([KeyBinding::new(&binding, crate::ZoomFileIn, context)]);
+        }
+        for binding in combos("zoom-out") {
+            cx.bind_keys([KeyBinding::new(&binding, crate::ZoomFileOut, context)]);
+        }
     }
 }
 
 pub(crate) fn install_bindings(
     cx: &mut App,
     overrides: &KeymapOverrides,
+    terminal_ctrl_keys: TerminalCtrlKeys,
     shortcuts_suspended: bool,
 ) {
     cx.clear_key_bindings();
@@ -997,7 +1156,8 @@ pub(crate) fn install_bindings(
         KeyBinding::new(&platform_default("cmd-h"), Hide, None),
         #[cfg(target_os = "macos")]
         KeyBinding::new(&platform_default("cmd-alt-h"), HideOthers, None),
-        KeyBinding::new(&platform_default("cmd-m"), Minimize, None),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-m", Minimize, None),
         KeyBinding::new(&platform_default("ctrl-cmd-f"), ToggleFullscreen, None),
     ]);
     if let Some(combo) = effective_binding("close-pane", overrides) {
@@ -1005,6 +1165,7 @@ pub(crate) fn install_bindings(
             cx.bind_keys([KeyBinding::new(&binding, CloseTab, None)]);
         }
     }
+    install_file_viewer_bindings(cx);
     if let Some(combo) = effective_binding("system-close-window", overrides) {
         for binding in binding_strings(&combo) {
             cx.bind_keys([KeyBinding::new(&binding, CloseWindow, None)]);
@@ -1024,17 +1185,21 @@ pub(crate) fn install_bindings(
         let Some(combo) = effective_binding(entry.id, overrides) else {
             continue;
         };
+        let context = installed_context(entry, &combo, terminal_ctrl_keys);
+        let context = context.as_deref();
         for binding in binding_strings(&combo) {
-            let context = binding_context(entry, &combo);
             let key_binding = match entry.id {
                 "new-chat" => KeyBinding::new(&binding, NewTab, context),
                 "new-terminal" => KeyBinding::new(&binding, NewTerminal, context),
                 "new-mission" => KeyBinding::new(&binding, NewMission, context),
                 "command-palette" => KeyBinding::new(&binding, CommandPalette, context),
+                "search-files" => KeyBinding::new(&binding, SearchFiles, context),
                 "toggle-sidebar" => KeyBinding::new(&binding, ToggleSidebar, context),
+                "switch-sidebar-view" => KeyBinding::new(&binding, SwitchSidebarView, context),
                 "toggle-terminal-drawer" => {
                     KeyBinding::new(&binding, ToggleTerminalDrawer, context)
                 }
+                "find-in-terminal" => KeyBinding::new(&binding, FindInTerminal, context),
                 "open-settings" => KeyBinding::new(&binding, OpenSettings, context),
                 "page-previous" => KeyBinding::new(&binding, NavigatePreviousPage, context),
                 "page-next" => KeyBinding::new(&binding, NavigateNextPage, context),
@@ -1054,6 +1219,7 @@ pub(crate) fn install_bindings(
                 "pane-next" => KeyBinding::new(&binding, FocusNextPane, context),
                 "split-pane-right" => KeyBinding::new(&binding, SplitPaneRight, context),
                 "split-pane-down" => KeyBinding::new(&binding, SplitPaneDown, context),
+                "toggle-maximize-pane" => KeyBinding::new(&binding, ToggleMaximizePane, context),
                 "stop-session" => KeyBinding::new(&binding, StopFocusedSession, context),
                 "resume-session" => KeyBinding::new(&binding, ResumeFocusedSession, context),
                 "mission-tab-previous" => KeyBinding::new(&binding, MissionTabPrevious, context),
@@ -1063,922 +1229,19 @@ pub(crate) fn install_bindings(
             cx.bind_keys([key_binding]);
         }
     }
+    // After app zoom's own bindings, which a later binding outranks.
+    install_file_zoom_bindings(cx, overrides);
     install_modal_bindings(cx);
 }
 
 fn install_modal_bindings(cx: &mut App) {
     // Double negation checks the whole context stack at the focused control's depth; loading last wins ties with user bindings.
-    cx.bind_keys([
-        KeyBinding::new(
-            &platform_default("cmd-enter"),
-            ConfirmStartChat,
-            Some("!(!StartChat)"),
-        ),
-        KeyBinding::new(
-            &platform_default("cmd-enter"),
-            ConfirmStartMission,
-            Some("!(!StartMission)"),
-        ),
-    ]);
+    cx.bind_keys([KeyBinding::new(
+        &platform_default("cmd-enter"),
+        ConfirmStartChat,
+        Some("!(!StartChat)"),
+    )]);
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn combo_for(code: &str, shift: bool) -> KeyCombo {
-        key_combo(code, true, false, false, shift, None, false)
-    }
-
-    #[test]
-    fn terminal_drawer_binding_is_only_available_in_missions() {
-        let entry = entry("toggle-terminal-drawer").unwrap();
-        assert_eq!(binding_context(entry, &entry.default), Some("Mission"));
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn registry_matches_the_shipped_defaults_and_fixed_entries() {
-        assert_eq!(entries().len(), 32);
-        assert_eq!(entries().iter().filter(|entry| entry.fixed).count(), 12);
-        assert!(entry("new-window").unwrap().fixed);
-        assert!(entry("close-pane").unwrap().fixed);
-        assert!(entry("system-close-window").unwrap().fixed);
-        assert_eq!(format_combo(&entry("close-pane").unwrap().default), "⌘W");
-        assert_eq!(
-            format_combo(&entry("system-close-window").unwrap().default),
-            "⇧⌘W"
-        );
-        assert!(entry("copy").is_none());
-        assert_eq!(format_combo(&entry("new-window").unwrap().default), "⇧⌘N");
-        assert_eq!(
-            format_combo(&entry("page-previous").unwrap().default),
-            "⇧⌘["
-        );
-        assert_eq!(format_combo(&entry("zoom-in").unwrap().default), "⌘+");
-        assert_eq!(format_combo(&entry("stop-session").unwrap().default), "⇧⌘X");
-        assert_eq!(
-            format_combo(&entry("resume-session").unwrap().default),
-            "⇧⌘R"
-        );
-        assert_eq!(
-            format_combo(&entry("split-pane-right").unwrap().default),
-            "⌘D"
-        );
-        assert_eq!(
-            format_combo(&entry("split-pane-down").unwrap().default),
-            "⇧⌘D"
-        );
-        assert_eq!(format_combo(&entry("new-terminal").unwrap().default), "⌘T");
-        assert_eq!(
-            entry("pane-previous").unwrap().default,
-            entry("mission-tab-previous").unwrap().default
-        );
-    }
-
-    #[test]
-    fn tab_shortcuts_are_global_fixed_and_ignore_overrides() {
-        let ids = (1..=9)
-            .map(|index| format!("select-tab-{index}"))
-            .collect::<Vec<_>>();
-        let tab_entries = tab_selection_entries().collect::<Vec<_>>();
-        assert_eq!(
-            tab_entries.iter().map(|entry| entry.id).collect::<Vec<_>>(),
-            ids.iter().map(String::as_str).collect::<Vec<_>>()
-        );
-        for (index, entry) in (1..=9).zip(tab_entries) {
-            assert_eq!(entry.title(), format!("Go to tab {index}"));
-            assert_eq!(entry.scope, KeymapScope::Global);
-            assert!(entry.fixed);
-            assert_eq!(
-                binding_strings(&entry.default),
-                [platform_default(&format!("cmd-{index}"))]
-            );
-            assert_eq!(binding_context(entry, &entry.default), None);
-            let overrides =
-                KeymapOverrides::from([(entry.id.to_owned(), Some(combo_for("KeyP", false)))]);
-            assert_eq!(
-                effective_binding(entry.id, &overrides),
-                Some(entry.default.clone())
-            );
-        }
-    }
-
-    #[test]
-    fn fixed_shortcuts_turn_off_but_stay_reserved() {
-        let mut overrides = KeymapOverrides::from([
-            ("close-pane".to_owned(), None),
-            ("new-window".to_owned(), Some(combo_for("KeyP", false))),
-        ]);
-        assert_eq!(effective_binding("close-pane", &overrides), None);
-        assert!(is_overridden("close-pane", &overrides));
-        assert_eq!(
-            effective_binding("new-window", &overrides),
-            Some(entry("new-window").unwrap().default.clone())
-        );
-        assert!(!is_overridden("new-window", &overrides));
-
-        overrides.insert("select-tab-3".into(), None);
-        assert!(!tab_selection_unbound(&overrides));
-        assert!(effective_binding("select-tab-3", &overrides).is_some());
-        assert!(!is_overridden("select-tab-3", &overrides));
-        for entry in tab_selection_entries() {
-            overrides.insert(entry.id.into(), None);
-        }
-        assert!(tab_selection_unbound(&overrides));
-        assert!(
-            tab_selection_entries().all(|entry| effective_binding(entry.id, &overrides).is_none())
-        );
-        assert!(is_overridden("select-tab-1", &overrides));
-
-        let tab_one = entry("select-tab-1").unwrap().default.clone();
-        assert_eq!(
-            find_conflict(&tab_one, "new-chat", &overrides).unwrap().id,
-            "select-tab-1"
-        );
-    }
-
-    #[test]
-    fn overrides_preserve_null_and_absent_as_different_states() {
-        let mut overrides = KeymapOverrides::new();
-        assert_eq!(
-            effective_binding("command-palette", &overrides),
-            Some(entry("command-palette").unwrap().default.clone())
-        );
-        overrides.insert("command-palette".into(), None);
-        assert_eq!(effective_binding("command-palette", &overrides), None);
-        overrides.insert("new-window".into(), Some(combo_for("KeyP", false)));
-        assert_eq!(
-            effective_binding("new-window", &overrides),
-            Some(entry("new-window").unwrap().default.clone())
-        );
-    }
-
-    #[test]
-    fn normalization_drops_unknown_and_malformed_values() {
-        let values =
-            serde_json::from_value::<BTreeMap<String, serde_json::Value>>(serde_json::json!({
-                "command-palette": null,
-                "toggle-sidebar": {
-                    "meta": true, "ctrl": false, "alt": false, "shift": false, "code": "KeyP"
-                },
-                "zoom-in": { "meta": "yes", "code": "Equal" },
-                "zoom-out": {
-                    "meta": true, "ctrl": false, "alt": false, "shift": false, "code": "a-b"
-                },
-                "unknown": {
-                    "meta": true, "ctrl": false, "alt": false, "shift": false, "code": "KeyU"
-                }
-            }))
-            .unwrap();
-        let normalized = normalize_override_values(values);
-        assert_eq!(normalized.len(), 2);
-        assert!(normalized.contains_key("command-palette"));
-        assert!(normalized["command-palette"].is_none());
-        assert_eq!(normalized["toggle-sidebar"].as_ref().unwrap().code, "KeyP");
-        assert!(!normalized.contains_key("zoom-out"));
-    }
-
-    #[test]
-    fn conflicts_follow_scope_overlap_and_refuse_conflicting_restore() {
-        let mut overrides = KeymapOverrides::new();
-        overrides.insert("pane-previous".into(), Some(combo_for("KeyJ", false)));
-        overrides.insert(
-            "mission-tab-next".into(),
-            Some(entry("pane-previous").unwrap().default.clone()),
-        );
-        assert!(find_conflict(
-            &entry("pane-previous").unwrap().default,
-            "pane-previous",
-            &overrides
-        )
-        .is_none());
-
-        overrides.insert(
-            "toggle-sidebar".into(),
-            Some(entry("pane-previous").unwrap().default.clone()),
-        );
-        let conflict = clear_override("pane-previous", &mut overrides).unwrap_err();
-        assert_eq!(conflict.id, "toggle-sidebar");
-        assert!(overrides.contains_key("pane-previous"));
-    }
-
-    #[test]
-    fn conflicts_include_system_owned_shortcuts_and_distinct_close_keys() {
-        let overrides = KeymapOverrides::new();
-        let reserved = reserved_entries()
-            .iter()
-            .find(|entry| entry.id == "system-minimize")
-            .unwrap();
-        let conflict = find_conflict(&reserved.default, "new-chat", &overrides).unwrap();
-        assert_eq!(conflict.id, "system-minimize");
-        let copy = reserved_entries()
-            .iter()
-            .find(|entry| entry.id == "copy")
-            .unwrap();
-        assert_eq!(
-            find_conflict(&copy.default, "new-chat", &overrides)
-                .unwrap()
-                .id,
-            "copy"
-        );
-        for id in ["close-pane", "system-close-window"] {
-            let close = entry(id).unwrap();
-            assert!(find_conflict(&close.default, id, &overrides).is_none());
-            assert_eq!(
-                find_conflict(&close.default, "new-chat", &overrides)
-                    .unwrap()
-                    .id,
-                id
-            );
-        }
-    }
-
-    #[test]
-    fn fixed_modal_confirm_wins_user_global_overrides_at_every_control_depth() {
-        let cx = gpui::TestAppContext::single();
-        cx.update(|cx| {
-            let key = Keystroke::parse(&platform_default("cmd-enter")).unwrap();
-            for (id, global_action) in [
-                ("new-terminal", &NewTerminal as &dyn gpui::Action),
-                ("new-mission", &NewMission),
-                ("zoom-reset", &ZoomReset),
-            ] {
-                let overrides = KeymapOverrides::from([(
-                    id.into(),
-                    Some(default_combo("cmd-enter", None, false)),
-                )]);
-                install_bindings(cx, &overrides, false);
-                for (context, action) in [
-                    ("StartChat", &ConfirmStartChat as &dyn gpui::Action),
-                    ("StartMission", &ConfirmStartMission),
-                ] {
-                    for nested in [false, true] {
-                        let mut contexts = vec![
-                            gpui::KeyContext::parse("Root").unwrap(),
-                            gpui::KeyContext::parse(context).unwrap(),
-                        ];
-                        if nested {
-                            contexts.push(gpui::KeyContext::parse("TextInput").unwrap());
-                        }
-                        let bindings = cx.key_bindings();
-                        let bindings = bindings.borrow();
-                        assert!(bindings
-                            .bindings_for_input(std::slice::from_ref(&key), &contexts)
-                            .0[0]
-                            .action()
-                            .partial_eq(action));
-                    }
-                }
-                let bindings = cx.key_bindings();
-                let bindings = bindings.borrow();
-                assert!(bindings
-                    .bindings_for_input(
-                        std::slice::from_ref(&key),
-                        &[gpui::KeyContext::parse("Root").unwrap()]
-                    )
-                    .0[0]
-                    .action()
-                    .partial_eq(global_action));
-            }
-        });
-    }
-
-    #[test]
-    fn create_bindings_are_global_rebindable_and_modal_keys_stay_out_of_settings() {
-        let cx = gpui::TestAppContext::single();
-        cx.update(|cx| {
-            for (id, action) in [
-                ("new-terminal", &NewTerminal as &dyn gpui::Action),
-                ("new-mission", &NewMission as &dyn gpui::Action),
-            ] {
-                assert_eq!(entry(id).unwrap().scope, KeymapScope::Global);
-                assert!(!entry(id).unwrap().fixed);
-                for combo in [
-                    Some(entry(id).unwrap().default.clone()),
-                    Some(combo_for("KeyP", true)),
-                    None,
-                ] {
-                    let overrides = KeymapOverrides::from([(id.into(), combo.clone())]);
-                    install_bindings(cx, &overrides, false);
-                    let keymap = cx.key_bindings();
-                    let keymap = keymap.borrow();
-                    let bindings = keymap.bindings_for_action(action).collect::<Vec<_>>();
-                    assert_eq!(bindings.len(), usize::from(combo.is_some()));
-                    if let Some(combo) = combo {
-                        assert!(bindings[0].predicate().is_none());
-                        assert_eq!(
-                            bindings[0]
-                                .match_keystrokes(&[
-                                    Keystroke::parse(&binding_strings(&combo)[0]).unwrap()
-                                ]),
-                            Some(false)
-                        );
-                    }
-                }
-            }
-            install_bindings(cx, &KeymapOverrides::new(), true);
-            let bindings = cx.key_bindings();
-            let bindings = bindings.borrow();
-            for action in [&ConfirmStartChat as &dyn gpui::Action, &ConfirmStartMission] {
-                assert_eq!(bindings.bindings_for_action(action).count(), 1);
-            }
-            assert!(entries()
-                .iter()
-                .all(|entry| !entry.id.starts_with("confirm-")
-                    && !entry.id.starts_with("start-chat-")));
-        });
-        assert_eq!(
-            fixed_shortcut("cmd-enter"),
-            format_combo(&default_combo("cmd-enter", None, false))
-        );
-    }
-
-    #[test]
-    fn installed_close_keys_match_fixed_defaults_without_a_focus_context() {
-        let cx = gpui::TestAppContext::single();
-        cx.update(|cx| {
-            install_bindings(cx, &KeymapOverrides::new(), false);
-            let keymap = cx.key_bindings();
-            let keymap = keymap.borrow();
-            for (id, action) in [
-                ("close-pane", &CloseTab as &dyn gpui::Action),
-                ("system-close-window", &CloseWindow as &dyn gpui::Action),
-            ] {
-                let bindings = keymap.bindings_for_action(action).collect::<Vec<_>>();
-                assert_eq!(bindings.len(), 1);
-                assert!(bindings[0].predicate().is_none());
-                let key =
-                    Keystroke::parse(&binding_strings(&entry(id).unwrap().default)[0]).unwrap();
-                assert_eq!(bindings[0].match_keystrokes(&[key]), Some(false));
-            }
-            #[cfg(any(windows, target_os = "linux"))]
-            assert!(keymap
-                .all_bindings_for_input(&[Keystroke::parse("ctrl-w").unwrap()])
-                .is_empty());
-        });
-    }
-
-    #[test]
-    fn stop_and_resume_defaults_have_no_conflicts() {
-        let overrides = KeymapOverrides::new();
-        for id in ["stop-session", "resume-session"] {
-            let entry = entry(id).unwrap();
-            assert!(
-                find_conflict(&entry.default, id, &overrides).is_none(),
-                "{id}"
-            );
-        }
-    }
-
-    #[test]
-    fn capture_validity_and_formatting_match_the_react_contract() {
-        let bare = KeyEventLike {
-            meta: false,
-            ctrl: false,
-            alt: false,
-            shift: false,
-            code: "KeyK".into(),
-            key: "k".into(),
-        };
-        assert!(combo_from_event(&bare).is_none());
-        let function = KeyEventLike {
-            code: "F12".into(),
-            key: "f12".into(),
-            ..bare.clone()
-        };
-        assert_eq!(format_combo(&combo_from_event(&function).unwrap()), "F12");
-        assert!(combo_from_keystroke(&Keystroke::parse("cmd-f24").unwrap()).is_some());
-        assert!(combo_from_keystroke(&Keystroke::parse("cmd-f25").unwrap()).is_none());
-        let plus = KeyEventLike {
-            meta: true,
-            shift: true,
-            code: "Equal".into(),
-            key: "+".into(),
-            ..bare
-        };
-        assert_eq!(
-            format_combo(&combo_from_event(&plus).unwrap()),
-            if cfg!(target_os = "linux") {
-                "Shift+Super++"
-            } else if cfg!(windows) {
-                "Shift+Win++"
-            } else {
-                "⇧⌘+"
-            }
-        );
-    }
-
-    #[test]
-    fn shift_optional_matches_both_zoom_in_forms_only() {
-        let combo = entry("zoom-in").unwrap().default.clone();
-        #[cfg(target_os = "macos")]
-        assert_eq!((combo.meta, combo.ctrl, combo.alt), (true, false, false));
-        for shift in [false, true] {
-            assert!(combo_matches_event(
-                &combo,
-                &KeyEventLike {
-                    meta: combo.meta,
-                    ctrl: combo.ctrl,
-                    alt: combo.alt,
-                    shift,
-                    code: "Equal".into(),
-                    key: if shift { "+" } else { "=" }.into(),
-                }
-            ));
-        }
-        let ordinary = combo_for("Equal", false);
-        assert!(!combo_matches_event(
-            &ordinary,
-            &KeyEventLike {
-                meta: true,
-                ctrl: false,
-                alt: false,
-                shift: true,
-                code: "Equal".into(),
-                key: "+".into(),
-            }
-        ));
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn registry_defaults_compile_to_gpui_runtime_keystrokes() {
-        type ExpectedBinding<'a> = (&'a str, &'a str, bool, bool, bool, bool);
-        type ExpectedEntry<'a> = (&'a str, &'a [ExpectedBinding<'a>]);
-        let expected: [ExpectedEntry<'_>; 30] = [
-            (
-                "new-window",
-                &[("shift-cmd-n", "n", true, false, false, true)],
-            ),
-            ("new-chat", &[("cmd-n", "n", true, false, false, false)]),
-            (
-                "command-palette",
-                &[("cmd-k", "k", true, false, false, false)],
-            ),
-            (
-                "toggle-sidebar",
-                &[("cmd-s", "s", true, false, false, false)],
-            ),
-            (
-                "toggle-terminal-drawer",
-                &[("alt-f12", "f12", false, false, true, false)],
-            ),
-            (
-                "open-settings",
-                &[("cmd-,", ",", true, false, false, false)],
-            ),
-            (
-                "page-previous",
-                &[("cmd-{", "{", true, false, false, false)],
-            ),
-            ("page-next", &[("cmd-}", "}", true, false, false, false)]),
-            (
-                "zoom-in",
-                &[
-                    ("cmd-=", "=", true, false, false, false),
-                    ("cmd-+", "+", true, false, false, false),
-                ],
-            ),
-            ("zoom-out", &[("cmd--", "-", true, false, false, false)]),
-            ("zoom-reset", &[("cmd-0", "0", true, false, false, false)]),
-            ("select-tab-1", &[("cmd-1", "1", true, false, false, false)]),
-            ("select-tab-2", &[("cmd-2", "2", true, false, false, false)]),
-            ("select-tab-3", &[("cmd-3", "3", true, false, false, false)]),
-            ("select-tab-4", &[("cmd-4", "4", true, false, false, false)]),
-            ("select-tab-5", &[("cmd-5", "5", true, false, false, false)]),
-            ("select-tab-6", &[("cmd-6", "6", true, false, false, false)]),
-            ("select-tab-7", &[("cmd-7", "7", true, false, false, false)]),
-            ("select-tab-8", &[("cmd-8", "8", true, false, false, false)]),
-            ("select-tab-9", &[("cmd-9", "9", true, false, false, false)]),
-            (
-                "pane-previous",
-                &[("cmd-[", "[", true, false, false, false)],
-            ),
-            ("pane-next", &[("cmd-]", "]", true, false, false, false)]),
-            (
-                "split-pane-right",
-                &[("cmd-d", "d", true, false, false, false)],
-            ),
-            (
-                "split-pane-down",
-                &[("shift-cmd-d", "d", true, false, false, true)],
-            ),
-            ("close-pane", &[("cmd-w", "w", true, false, false, false)]),
-            (
-                "system-close-window",
-                &[("shift-cmd-w", "w", true, false, false, true)],
-            ),
-            (
-                "stop-session",
-                &[("shift-cmd-x", "x", true, false, false, true)],
-            ),
-            (
-                "resume-session",
-                &[("shift-cmd-r", "r", true, false, false, true)],
-            ),
-            (
-                "mission-tab-previous",
-                &[("cmd-[", "[", true, false, false, false)],
-            ),
-            (
-                "mission-tab-next",
-                &[("cmd-]", "]", true, false, false, false)],
-            ),
-        ];
-
-        for (id, bindings) in expected {
-            assert_eq!(
-                binding_strings(&entry(id).unwrap().default),
-                bindings
-                    .iter()
-                    .map(|(binding, ..)| (*binding).to_owned())
-                    .collect::<Vec<_>>(),
-                "{id}"
-            );
-            for (binding, key, platform, ctrl, alt, shift) in bindings {
-                assert_eq!(
-                    Keystroke::parse(binding).unwrap(),
-                    Keystroke {
-                        modifiers: gpui::Modifiers {
-                            platform: *platform,
-                            control: *ctrl,
-                            alt: *alt,
-                            shift: *shift,
-                            ..Default::default()
-                        },
-                        key: (*key).to_owned(),
-                        key_char: None,
-                    },
-                    "{id}: {binding}"
-                );
-            }
-        }
-
-        let recorded_bracket = combo_for("BracketLeft", true);
-        assert_eq!(binding_strings(&recorded_bracket), ["cmd-{"]);
-        assert_eq!(
-            Keystroke::parse(&binding_strings(&recorded_bracket)[0]).unwrap(),
-            Keystroke {
-                modifiers: gpui::Modifiers {
-                    platform: true,
-                    ..Default::default()
-                },
-                key: "{".into(),
-                key_char: None,
-            }
-        );
-
-        let recorded_letter = combo_for("KeyK", true);
-        assert_eq!(binding_strings(&recorded_letter), ["shift-cmd-k"]);
-        assert!(
-            Keystroke::parse(&binding_strings(&recorded_letter)[0])
-                .unwrap()
-                .modifiers
-                .shift
-        );
-    }
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn macos_registry_defaults_match_expected_combos() {
-        let expected = [
-            (
-                "new-window",
-                key_combo("KeyN", true, false, false, true, None, false),
-            ),
-            (
-                "new-chat",
-                key_combo("KeyN", true, false, false, false, None, false),
-            ),
-            (
-                "new-terminal",
-                key_combo("KeyT", true, false, false, false, None, false),
-            ),
-            (
-                "new-mission",
-                key_combo("KeyM", true, false, false, true, None, false),
-            ),
-            (
-                "command-palette",
-                key_combo("KeyK", true, false, false, false, None, false),
-            ),
-            (
-                "toggle-sidebar",
-                key_combo("KeyS", true, false, false, false, None, false),
-            ),
-            (
-                "toggle-terminal-drawer",
-                key_combo("F12", false, false, true, false, None, false),
-            ),
-            (
-                "open-settings",
-                key_combo("Comma", true, false, false, false, None, false),
-            ),
-            (
-                "page-previous",
-                key_combo("BracketLeft", true, false, false, true, None, false),
-            ),
-            (
-                "page-next",
-                key_combo("BracketRight", true, false, false, true, None, false),
-            ),
-            (
-                "zoom-in",
-                key_combo("Equal", true, false, false, false, Some("+"), true),
-            ),
-            (
-                "zoom-out",
-                key_combo("Minus", true, false, false, false, None, false),
-            ),
-            (
-                "zoom-reset",
-                key_combo("Digit0", true, false, false, false, None, false),
-            ),
-            (
-                "select-tab-1",
-                key_combo("Digit1", true, false, false, false, None, false),
-            ),
-            (
-                "select-tab-2",
-                key_combo("Digit2", true, false, false, false, None, false),
-            ),
-            (
-                "select-tab-3",
-                key_combo("Digit3", true, false, false, false, None, false),
-            ),
-            (
-                "select-tab-4",
-                key_combo("Digit4", true, false, false, false, None, false),
-            ),
-            (
-                "select-tab-5",
-                key_combo("Digit5", true, false, false, false, None, false),
-            ),
-            (
-                "select-tab-6",
-                key_combo("Digit6", true, false, false, false, None, false),
-            ),
-            (
-                "select-tab-7",
-                key_combo("Digit7", true, false, false, false, None, false),
-            ),
-            (
-                "select-tab-8",
-                key_combo("Digit8", true, false, false, false, None, false),
-            ),
-            (
-                "select-tab-9",
-                key_combo("Digit9", true, false, false, false, None, false),
-            ),
-            (
-                "pane-previous",
-                key_combo("BracketLeft", true, false, false, false, None, false),
-            ),
-            (
-                "pane-next",
-                key_combo("BracketRight", true, false, false, false, None, false),
-            ),
-            (
-                "split-pane-right",
-                key_combo("KeyD", true, false, false, false, None, false),
-            ),
-            (
-                "split-pane-down",
-                key_combo("KeyD", true, false, false, true, None, false),
-            ),
-            (
-                "close-pane",
-                key_combo("KeyW", true, false, false, false, None, false),
-            ),
-            (
-                "system-close-window",
-                key_combo("KeyW", true, false, false, true, None, false),
-            ),
-            (
-                "stop-session",
-                key_combo("KeyX", true, false, false, true, None, false),
-            ),
-            (
-                "resume-session",
-                key_combo("KeyR", true, false, false, true, None, false),
-            ),
-            (
-                "mission-tab-previous",
-                key_combo("BracketLeft", true, false, false, false, None, false),
-            ),
-            (
-                "mission-tab-next",
-                key_combo("BracketRight", true, false, false, false, None, false),
-            ),
-            (
-                "system-quit",
-                key_combo("KeyQ", true, false, false, false, None, false),
-            ),
-            (
-                "system-quit-stop",
-                key_combo("KeyQ", true, false, true, false, None, false),
-            ),
-            (
-                "system-hide",
-                key_combo("KeyH", true, false, false, false, None, false),
-            ),
-            (
-                "system-hide-others",
-                key_combo("KeyH", true, false, true, false, None, false),
-            ),
-            (
-                "system-minimize",
-                key_combo("KeyM", true, false, false, false, None, false),
-            ),
-            (
-                "system-toggle-fullscreen",
-                key_combo("KeyF", true, true, false, false, None, false),
-            ),
-            (
-                "copy",
-                key_combo("KeyC", true, false, false, false, None, false),
-            ),
-            (
-                "system-paste",
-                key_combo("KeyV", true, false, false, false, None, false),
-            ),
-        ];
-        let actual = entries()
-            .iter()
-            .chain(reserved_entries())
-            .map(|entry| (entry.id, &entry.default))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            serde_json::to_vec(&actual).unwrap(),
-            serde_json::to_vec(expected.as_slice()).unwrap()
-        );
-    }
-
-    #[test]
-    fn windows_defaults_replace_command_with_control() {
-        for (macos, windows) in [
-            ("cmd-n", "ctrl-n"),
-            ("cmd-w", "ctrl-shift-w"),
-            ("cmd-t", "ctrl-shift-t"),
-            ("shift-cmd-m", "shift-ctrl-m"),
-            ("cmd-enter", "ctrl-enter"),
-            ("shift-cmd-w", "alt-f4"),
-            ("shift-cmd-n", "shift-ctrl-n"),
-            ("cmd-d", "ctrl-d"),
-            ("shift-cmd-d", "shift-ctrl-d"),
-            ("cmd-k", "ctrl-k"),
-            ("shift-cmd-k", "shift-ctrl-k"),
-            ("shift-cmd-r", "shift-ctrl-r"),
-            ("shift-cmd-x", "shift-ctrl-x"),
-            ("shift-cmd-z", "shift-ctrl-z"),
-            ("cmd-c", "ctrl-c"),
-            ("cmd-v", "ctrl-v"),
-            ("cmd-h", "ctrl-h"),
-            ("cmd-alt-h", "ctrl-alt-h"),
-            ("cmd-,", "ctrl-,"),
-            ("cmd--", "ctrl--"),
-            ("cmd-1", "ctrl-1"),
-            ("cmd-[", "ctrl-["),
-            ("shift-cmd-[", "shift-ctrl-["),
-            ("cmd-]", "ctrl-]"),
-            ("shift-cmd-]", "shift-ctrl-]"),
-            ("cmd-{", "ctrl-{"),
-            ("cmd-}", "ctrl-}"),
-            ("cmd-left", "ctrl-left"),
-            ("ctrl-cmd-f", "f11"),
-            ("alt-f12", "alt-f12"),
-        ] {
-            let actual = windows_default(macos);
-            assert_eq!(actual, windows, "{macos}");
-            let keystroke = Keystroke::parse(&actual).unwrap();
-            assert!(!keystroke.modifiers.platform);
-            assert!(code_from_gpui_key(&keystroke.key).is_some(), "{macos}");
-            #[cfg(target_os = "macos")]
-            assert_eq!(platform_default(macos).as_bytes(), macos.as_bytes());
-        }
-        for entry in entries().iter().chain(reserved_entries()) {
-            for binding in binding_strings(&entry.default) {
-                assert_ne!(windows_default(&binding), "ctrl-w", "{}", entry.id);
-                let windows = Keystroke::parse(&windows_default(&binding)).unwrap();
-                assert!(!windows.modifiers.platform, "{}", entry.id);
-                assert!(code_from_gpui_key(&windows.key).is_some(), "{}", entry.id);
-                if windows.key.len() == 1 && windows.key.as_bytes()[0].is_ascii_alphabetic() {
-                    assert!(windows.modifiers.control, "{}", entry.id);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn windows_defaults_have_no_unexpected_scope_collisions() {
-        let defaults = entries()
-            .iter()
-            .chain(reserved_entries())
-            .filter(|entry| {
-                !matches!(
-                    entry.id,
-                    "system-quit" | "system-quit-stop" | "system-hide" | "system-hide-others"
-                )
-            })
-            .map(|entry| {
-                let binding = windows_default(&binding_strings(&entry.default)[0]);
-                let keystroke = Keystroke::parse(&binding).unwrap();
-                let mut combo = combo_from_keystroke(&keystroke).unwrap();
-                combo.shift_optional = entry.default.shift_optional;
-                (entry, combo)
-            })
-            .collect::<Vec<_>>();
-        for (index, (left, left_combo)) in defaults.iter().enumerate() {
-            for (right, right_combo) in &defaults[index + 1..] {
-                assert!(
-                    !left.scope.overlaps(right.scope) || !combos_collide(left_combo, right_combo),
-                    "{} collides with {}",
-                    left.id,
-                    right.id
-                );
-            }
-        }
-        let fullscreen = Keystroke::parse(&windows_default("ctrl-cmd-f")).unwrap();
-        assert_eq!(
-            code_from_gpui_key(&fullscreen.key),
-            Some(("F11".into(), false))
-        );
-    }
-
-    #[test]
-    fn default_navigation_reaches_terminals_and_user_overrides_keep_their_modifiers() {
-        for id in ["new-chat", "command-palette", "page-previous", "page-next"] {
-            let entry = entry(id).unwrap();
-            assert_eq!(
-                binding_context(entry, &entry.default),
-                Some("!TextInput && !Settings")
-            );
-            let user_combo = key_combo("KeyP", false, true, false, false, None, false);
-            let overrides = KeymapOverrides::from([(id.into(), Some(user_combo.clone()))]);
-            assert_eq!(effective_binding(id, &overrides), Some(user_combo.clone()));
-            assert_eq!(binding_strings(&user_combo), ["ctrl-p"]);
-            assert_eq!(
-                binding_context(entry, &user_combo),
-                Some("!TextInput && !Settings && !Terminal")
-            );
-        }
-    }
-
-    #[test]
-    #[cfg(any(windows, target_os = "linux"))]
-    fn windows_table_has_no_command_modifier_or_quit_binding() {
-        for entry in entries().iter().chain(reserved_entries()) {
-            assert!(!entry.default.meta, "{}", entry.id);
-            assert!(!matches!(
-                entry.id,
-                "system-quit" | "system-quit-stop" | "system-hide" | "system-hide-others"
-            ));
-            for binding in binding_strings(&entry.default) {
-                assert!(!binding.contains("cmd-"), "{}: {binding}", entry.id);
-                assert!(!Keystroke::parse(&binding).unwrap().modifiers.platform);
-            }
-            if entries().iter().any(|candidate| candidate.id == entry.id) {
-                assert!(
-                    find_conflict(&entry.default, entry.id, &KeymapOverrides::new()).is_none(),
-                    "{}",
-                    entry.id
-                );
-            }
-        }
-        for (id, hint) in [
-            ("new-chat", "Ctrl+N"),
-            ("new-terminal", "Ctrl+Shift+T"),
-            ("new-mission", "Ctrl+Shift+M"),
-            ("new-window", "Ctrl+Shift+N"),
-            ("command-palette", "Ctrl+K"),
-            ("toggle-sidebar", "Ctrl+S"),
-            ("split-pane-right", "Ctrl+D"),
-            ("split-pane-down", "Ctrl+Shift+D"),
-            ("close-pane", "Ctrl+Shift+W"),
-            ("system-close-window", "Alt+F4"),
-            ("stop-session", "Ctrl+Shift+X"),
-            ("resume-session", "Ctrl+Shift+R"),
-            ("pane-previous", "Ctrl+["),
-            ("pane-next", "Ctrl+]"),
-            ("mission-tab-previous", "Ctrl+["),
-            ("mission-tab-next", "Ctrl+]"),
-            ("page-previous", "Ctrl+Shift+["),
-            ("page-next", "Ctrl+Shift+]"),
-            ("open-settings", "Ctrl+,"),
-            ("zoom-in", "Ctrl++"),
-        ] {
-            assert_eq!(format_combo(&entry(id).unwrap().default), hint);
-        }
-        let copy = reserved_entries()
-            .iter()
-            .find(|entry| entry.id == "copy")
-            .unwrap();
-        assert_eq!(format_combo(&copy.default), "Ctrl+C");
-        assert!(find_conflict(
-            &key_combo("KeyQ", false, true, false, true, None, false),
-            "new-chat",
-            &KeymapOverrides::new()
-        )
-        .is_none());
-    }
-}
+mod tests;

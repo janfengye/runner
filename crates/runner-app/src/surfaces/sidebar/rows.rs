@@ -1,5 +1,5 @@
 use super::*;
-use crate::surfaces::sidebar_logic::AttentionState;
+use crate::surfaces::sidebar::logic::AttentionState;
 use crate::*;
 use runner_app::ui::TextField;
 use runner_core::protocol::model::Runtime;
@@ -7,8 +7,6 @@ use runner_core::protocol::node::NodeType;
 
 impl Sidebar {
     pub(super) fn dismiss_transients(&mut self, cx: &mut Context<Self>) {
-        self.create_menu
-            .update(cx, |menu, menu_cx| menu.close(menu_cx));
         let had_context_menu = self.context_menu.take().is_some();
         self.rename = None;
         self._rename_focus_subscription = None;
@@ -28,7 +26,7 @@ impl Sidebar {
         self.set_active_project(project_id, cx);
     }
 
-    pub(super) fn set_active_project(
+    pub(crate) fn set_active_project(
         &mut self,
         project_id: Option<String>,
         cx: &mut Context<Self>,
@@ -165,8 +163,8 @@ impl Sidebar {
                 }
                 NodeType::Mission => {
                     let summary = missions.get(node.ref_id.as_deref()?)?;
-                    let rollup = self.mission_status_rollup(*summary);
-                    let attention = status_attention(rollup.priority_value()).max(
+                    let display: MissionSummary = (*summary).clone().into();
+                    let attention = self.mission_attention(&display).max(
                         if self.archiving_missions.contains(&summary.mission.id) {
                             AttentionState::Working
                         } else {

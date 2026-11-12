@@ -54,6 +54,13 @@ impl NativeRoot {
             .cloned()
             .chain(ended_ids)
             .collect::<HashSet<_>>();
+        // Leaving a tab closes find in its terminals, including the ended
+        // sessions kept attached below.
+        for (session_id, chat) in &self.attached {
+            if !active_ids.contains(session_id) {
+                chat.terminal_find.update(cx, |find, cx| find.leave(cx));
+            }
+        }
         self.attached
             .retain(|session_id, _| owned_ids.contains(session_id));
         for session_id in active_ids {
@@ -148,7 +155,7 @@ impl NativeRoot {
         } else {
             self.front_page_sidebar_width(cx) * self.settings(cx).app_zoom
         };
-        let chat_panel_width = if self.settings(cx).chat_panel_open {
+        let chat_panel_width = if self.settings(cx).chat_panel_shown() {
             self.settings(cx).chat_panel_width * self.settings(cx).app_zoom
         } else {
             0.
@@ -160,7 +167,8 @@ impl NativeRoot {
             - (PANE_HEADER_HEIGHT + 8.) * self.settings(cx).app_zoom;
         let font_size = self.settings(cx).terminal_font_size as f32 * self.settings(cx).app_zoom;
         let cell_width = font_size * 0.6;
-        let line_height = (font_size * crate::terminal::element::LINE_HEIGHT_FACTOR).round();
+        let line_height =
+            crate::terminal::element::row_height(font_size, self.settings(cx).terminal_line_height);
         (
             (pane_width / cell_width).floor().max(2.) as u16,
             (pane_height / line_height).floor().max(2.) as u16,
@@ -179,7 +187,7 @@ impl NativeRoot {
         } else {
             self.front_page_sidebar_width(cx) * self.settings(cx).app_zoom
         };
-        let chat_panel_width = if self.settings(cx).chat_panel_open {
+        let chat_panel_width = if self.settings(cx).chat_panel_shown() {
             self.settings(cx).chat_panel_width * self.settings(cx).app_zoom
         } else {
             0.
@@ -189,7 +197,8 @@ impl NativeRoot {
             (layout.drawer_height() - (32. + 5. + 24.)).max(80.) * self.settings(cx).app_zoom;
         let font_size = self.settings(cx).terminal_font_size as f32 * self.settings(cx).app_zoom;
         let cell_width = font_size * 0.6;
-        let line_height = (font_size * crate::terminal::element::LINE_HEIGHT_FACTOR).round();
+        let line_height =
+            crate::terminal::element::row_height(font_size, self.settings(cx).terminal_line_height);
         (
             (width / cell_width).floor().max(2.) as u16,
             (height / line_height).floor().max(2.) as u16,
@@ -689,20 +698,33 @@ impl NativeRoot {
         let target = session_id.to_owned();
         let resume_target = target.clone();
         let resume = cx.background_spawn(async move {
-            core.resume(&resume_target, size)
-                .map_err(|error| error.to_string())
+            let result = core.resume(&resume_target, size);
+            let gate = result
+                .as_ref()
+                .err()
+                .and_then(|error| error.version_gate.clone());
+            (result.map_err(|error| error.to_string()), gate)
         });
         let origin_epoch = self.remote_client.ui.epoch;
         cx.spawn_in(window, async move |weak, cx| {
-            let result = resume.await;
+            let (result, gate) = resume.await;
             let _ = weak.update_in(cx, |this, window, cx| {
-                let Some(result) = WorkspaceAction::complete(
+                let Some(result) = WorkspaceAction::complete_observed(
                     this,
                     operation,
                     result,
                     |session| crate::surfaces::front_page::actions::Completion {
                         session: Some(session),
                         ..Default::default()
+                    },
+                    |root, client, succeeded, _| {
+                        root.record_session_gate(
+                            &client.target,
+                            &target,
+                            gate,
+                            crate::surfaces::agent_recovery::RecoveryAction::Resume,
+                            succeeded,
+                        );
                     },
                     cx,
                 ) else {

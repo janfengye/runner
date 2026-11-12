@@ -2,21 +2,15 @@ pub(crate) mod about;
 pub(crate) mod agents;
 pub(crate) mod archived;
 pub(crate) mod claude_accounts;
-pub(crate) mod diagnostics;
+mod integration_account;
 pub(crate) mod mcp;
 pub(crate) mod notifications;
 pub(crate) mod page;
 pub(crate) mod remote;
 pub(crate) mod skills;
 pub(crate) mod theme_preview;
-#[cfg(target_os = "macos")]
 pub(crate) mod updates;
-#[cfg(windows)]
-#[path = "updates_windows.rs"]
-pub(crate) mod updates;
-#[cfg(target_os = "linux")]
-#[path = "updates_linux.rs"]
-pub(crate) mod updates;
+pub(crate) mod usage;
 
 /// Raised by a settings editor's Save, success or failure, so the app shell
 /// can show it as a toast.
@@ -28,6 +22,7 @@ pub(crate) struct SaveNotice {
 fn app_identity_card(
     details: impl IntoIterator<Item = gpui::AnyElement>,
     action: Option<gpui::AnyElement>,
+    below: Option<gpui::AnyElement>,
 ) -> gpui::Div {
     use crate::theme;
     use gpui::prelude::*;
@@ -39,12 +34,15 @@ fn app_identity_card(
         .border_1()
         .border_color(theme::border())
         .bg(theme::panel())
+        .flex()
+        .flex_col()
+        .gap(rems(14. / 16.))
+        .p_5()
         .child(
             div()
                 .flex()
                 .items_center()
                 .gap_4()
-                .p_5()
                 .child(
                     img(crate::assets::app_icon_source())
                         .size(rems(56. / 16.))
@@ -86,4 +84,5 @@ fn app_identity_card(
                 )
                 .children(action),
         )
+        .children(below)
 }

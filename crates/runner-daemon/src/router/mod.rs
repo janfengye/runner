@@ -3,6 +3,7 @@
 pub(crate) mod dispatch;
 mod handlers;
 pub mod prompt;
+pub(crate) mod report;
 pub mod runtime;
 
 use std::collections::{HashMap, HashSet};
@@ -27,9 +28,15 @@ pub struct DeliverySnapshot {
     pub generation: u64,
     pub input_revision: (u64, u64),
     pub turn_started: u64,
+    /// The agent reported a turn whose prompt is the router's latest typed line: the one proof
+    /// of that line's delivery that no other input or turn can produce (#1225).
+    pub prompted: bool,
     pub runtime: String,
     /// The composer still holds the router's own notice, whatever other gate masks readiness.
     pub unsent: bool,
+    /// The input tracker held the router's latest line as its own after its Enter, even if it
+    /// has let go of it since.
+    pub held: bool,
 }
 
 /// Session-manager port for readiness, reservations and notification attempts.
@@ -51,11 +58,26 @@ pub trait StdinInjector: Send + Sync + 'static {
 
     fn synthesize_wake_busy(&self, session_id: &str, draft: EventDraft) -> Result<()>;
 
+    /// The notice was submitted, so the session stops holding it as its own unsent text unless
+    /// input reached it after `snapshot`.
+    fn confirm_delivery(&self, session_id: &str, snapshot: &DeliverySnapshot);
+
+    /// Re-check an idle session's unsent notice or draft against its composer.
+    fn recheck_composer(&self, session_id: &str);
+
     fn register_delivery_listener(
         &self,
         session_id: &str,
         listener: Weak<dyn SessionDeliveryListener>,
     );
+
+    /// Readiness for a report to a linked chat: idle only, and a draft holds it without a cap.
+    fn report_readiness(&self, session_id: &str) -> DeliveryReadiness;
+
+    /// The input gate for a report, or `None` unless the session is idle and free.
+    fn reserve_report(&self, session_id: &str) -> Result<Option<u64>>;
+
+    fn synthesize_report_busy(&self, session_id: &str);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -113,12 +135,32 @@ impl StdinInjector for SessionManager {
         SessionManager::synthesize_wake_busy(self, session_id, draft)
     }
 
+    fn confirm_delivery(&self, session_id: &str, snapshot: &DeliverySnapshot) {
+        SessionManager::confirm_delivery(self, session_id, snapshot)
+    }
+
+    fn recheck_composer(&self, session_id: &str) {
+        SessionManager::recheck_composer(self, session_id)
+    }
+
     fn register_delivery_listener(
         &self,
         session_id: &str,
         listener: Weak<dyn SessionDeliveryListener>,
     ) {
         SessionManager::register_delivery_listener(self, session_id, listener)
+    }
+
+    fn report_readiness(&self, session_id: &str) -> DeliveryReadiness {
+        SessionManager::report_readiness(self, session_id)
+    }
+
+    fn reserve_report(&self, session_id: &str) -> Result<Option<u64>> {
+        SessionManager::reserve_report(self, session_id)
+    }
+
+    fn synthesize_report_busy(&self, session_id: &str) {
+        SessionManager::synthesize_report_busy(self, session_id)
     }
 }
 
@@ -127,6 +169,12 @@ pub enum DeliveryReadiness {
     Ready {
         idle: bool,
     },
+    /// Busy, on a runtime whose composer queues input typed during a turn. A new message may be
+    /// typed now; redelivery of an old backlog still waits for idle.
+    Working,
+    /// Busy on a submit or delivery alone: its agent has reported no turn. The session manager
+    /// withdraws such a busy within seconds, so one that lasts is stuck.
+    Unconfirmed,
     Pending,
     Starting,
     Drafting,
@@ -187,6 +235,7 @@ const SUBMIT_DELAY: Duration = Duration::from_millis(if cfg!(windows) { 300 } el
 struct RouterState {
     session_by_handle: HashMap<String, String>,
     pending_asks: HashMap<String, PendingAsk>,
+    interrupted: Interruptions,
     cursor: u64,
     unread_by_handle: HashMap<String, usize>,
     projecting_unread: HashMap<String, usize>,
@@ -198,6 +247,84 @@ struct RouterState {
 pub(crate) struct PendingAsk {
     pub asker: Option<String>,
     pub prompt: String,
+}
+
+/// The signal the daemon appends for a member that was mid-turn when runnerd
+/// stopped (#1187).
+pub(crate) const SESSION_INTERRUPTED: &str = "session_interrupted";
+
+/// The mission's interrupted members, by handle, with when runnerd stopped. A
+/// member is interrupted from its `session_interrupted` signal until its next
+/// turn, its restart, its removal or its session's stop (#1187).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Interruptions(HashMap<String, chrono::DateTime<chrono::Utc>>);
+
+impl Interruptions {
+    pub(crate) fn from_entries(entries: &[LogEntry]) -> Self {
+        let mut interruptions = Self::default();
+        for entry in entries {
+            interruptions.apply(&entry.event);
+        }
+        interruptions
+    }
+
+    pub(crate) fn apply(&mut self, event: &Event) {
+        if event.kind != EventKind::Signal {
+            return;
+        }
+        let Some(signal) = event.signal_type.as_ref() else {
+            return;
+        };
+        if signal.as_str() == SESSION_INTERRUPTED {
+            let at = event.payload["at"]
+                .as_str()
+                .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+                .map_or(event.ts, |at| at.with_timezone(&chrono::Utc));
+            self.0.insert(event.from.clone(), at);
+        } else if signal.is_session_status() {
+            let stopped = event.payload["state"].as_str() == Some("idle")
+                && event.payload["source"].as_str() == Some(STOPPED_SOURCE);
+            if stopped || starts_turn(event) {
+                self.0.remove(&event.from);
+            }
+        } else if matches!(signal.as_str(), "slot_restarted" | "role_removed") {
+            if let Some(handle) = event.payload["handle"].as_str() {
+                self.0.remove(handle);
+            }
+        }
+    }
+
+    pub(crate) fn get(&self, handle: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.0.get(handle).copied()
+    }
+}
+
+/// The `session_status` source of the idle row a person's stop of an
+/// interrupted member appends, which clears its mark.
+pub(crate) const STOPPED_SOURCE: &str = "stopped";
+
+/// A `session_status` payload that shows the member working. Waiting for
+/// approval or an answer is published as busy too, but no turn is running;
+/// a row without the recorded status counts as working.
+pub(crate) fn working(payload: &serde_json::Value) -> bool {
+    payload["state"].as_str() == Some("busy")
+        && payload["status"]["observation"]["interactions"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+}
+
+/// A member started a turn: working, other than its process starting.
+pub(crate) fn starts_turn(event: &Event) -> bool {
+    event.kind == EventKind::Signal
+        && event
+            .signal_type
+            .as_ref()
+            .is_some_and(SignalType::is_session_status)
+        && working(&event.payload)
+        && !matches!(
+            event.payload["source"].as_str(),
+            Some("spawn" | "resume" | "fork")
+        )
 }
 
 pub(crate) fn pending_asks(entries: &[LogEntry]) -> HashMap<String, PendingAsk> {
@@ -377,6 +504,7 @@ impl Router {
         }
         let mut state = self.state.lock().unwrap();
         state.pending_asks = pending_asks(&entries);
+        state.interrupted = Interruptions::from_entries(&entries);
         state.cursor = cursor;
         Ok(())
     }
@@ -396,6 +524,7 @@ impl Router {
                 return;
             }
             state.cursor = next_offset;
+            state.interrupted.apply(event);
         }
         match event.kind {
             EventKind::Message => handlers::message_nudge(self, event),
@@ -577,6 +706,46 @@ impl Router {
     /// new pending asks).
     pub fn pending_ask_count(&self) -> usize {
         self.state.lock().unwrap().pending_asks.len()
+    }
+
+    /// A person stopped members: each interrupted member whose session is in
+    /// `stopped` loses its mark.
+    pub(crate) fn clear_interruptions(&self, stopped: impl Fn(&str) -> bool) -> Result<()> {
+        let handles: Vec<String> = {
+            let state = self.state.lock().unwrap();
+            state
+                .session_by_handle
+                .iter()
+                .filter(|(handle, id)| stopped(id) && state.interrupted.get(handle).is_some())
+                .map(|(handle, _)| handle.clone())
+                .collect()
+        };
+        for handle in handles {
+            self.log.append(EventDraft::signal(
+                self.crew_id.as_deref(),
+                &self.mission_id,
+                handle,
+                SignalType::new("session_status"),
+                serde_json::json!({"state": "idle", "source": STOPPED_SOURCE}),
+            ))?;
+        }
+        Ok(())
+    }
+
+    /// The interrupted members' sessions, with when runnerd stopped, in ms.
+    fn interrupted_sessions(&self) -> Vec<(String, i64)> {
+        let state = self.state.lock().unwrap();
+        state
+            .interrupted
+            .0
+            .iter()
+            .filter_map(|(handle, at)| {
+                state
+                    .session_by_handle
+                    .get(handle)
+                    .map(|session| (session.clone(), at.timestamp_millis()))
+            })
+            .collect()
     }
 
     /// Append a `mission_warning` event when a handler hits an unexpected or
@@ -805,6 +974,24 @@ impl RouterRegistry {
 
     pub fn get(&self, mission_id: &str) -> Option<Arc<Router>> {
         self.routers.lock().unwrap().get(mission_id).cloned()
+    }
+
+    /// A person stopped `session_id`; if it is an interrupted member, its mark clears.
+    pub(crate) fn clear_interruption(&self, session_id: &str) -> Result<()> {
+        let routers: Vec<_> = self.routers.lock().unwrap().values().cloned().collect();
+        routers
+            .iter()
+            .try_for_each(|router| router.clear_interruptions(|id| id == session_id))
+    }
+
+    /// Every mounted mission's interrupted member sessions, with when runnerd
+    /// stopped, in ms (#1187).
+    pub(crate) fn interrupted_sessions(&self) -> HashMap<String, i64> {
+        let routers: Vec<_> = self.routers.lock().unwrap().values().cloned().collect();
+        routers
+            .iter()
+            .flat_map(|router| router.interrupted_sessions())
+            .collect()
     }
 }
 

@@ -1,5 +1,5 @@
 use super::*;
-use crate::surfaces::mission_composer::ComposerPost;
+use crate::surfaces::mission_workspace::composer_model::ComposerPost;
 use crate::surfaces::remote_client::{
     tests::{self as remote_test, Fake},
     RemoteItem,
@@ -161,10 +161,8 @@ fn mission_drawer_island_stacks_below_mission_with_full_height_rail() {
                     let sidebar = visual.debug_bounds("APP_SIDEBAR").unwrap();
                     let gutter = visual.debug_bounds("SIDEBAR_RESIZE_GUTTER").unwrap();
                     assert!((area.left() - sidebar.right() - px(6. * zoom)).abs() < px(0.5));
-                    assert_eq!(
-                        (gutter.left(), gutter.right()),
-                        (sidebar.right(), area.left())
-                    );
+                    assert!((gutter.center().x - area.left()).abs() < px(0.5));
+                    assert!((gutter.size.width - px(6. * zoom)).abs() < px(0.5));
                 }
                 if rail_open {
                     let rail = visual.debug_bounds("MISSION_RAIL").unwrap();
@@ -172,14 +170,8 @@ fn mission_drawer_island_stacks_below_mission_with_full_height_rail() {
                     assert!((rail.left() - mission.right() - px(6. * zoom)).abs() < px(0.5));
                     assert_eq!(rail.right(), area.right());
                     assert_eq!((rail.top(), rail.bottom()), (area.top(), area.bottom()));
-                    assert_eq!(gutter.left(), mission.right());
-                    assert_eq!(gutter.right(), rail.left());
-                    for fraction in [0.01, 0.5, 0.99] {
-                        assert!(gutter.contains(&gpui::point(
-                            gutter.left() + gutter.size.width * fraction,
-                            gutter.center().y,
-                        )));
-                    }
+                    assert!((gutter.center().x - rail.left()).abs() < px(0.5));
+                    assert!((gutter.size.width - px(6. * zoom)).abs() < px(0.5));
                 } else {
                     assert_eq!(mission.right(), area.right());
                     assert!(visual.debug_bounds("MISSION_RAIL_GUTTER").is_none());
@@ -595,7 +587,12 @@ fn lifecycle_shortcuts_ignore_a_focused_mission_drawer_shell() {
     ] {
         let (_temp, mut cx, window, _, fake) = setup();
         cx.update(|cx| {
-            crate::keymap::install_bindings(cx, &crate::keymap::KeymapOverrides::new(), false)
+            crate::keymap::install_bindings(
+                cx,
+                &crate::keymap::KeymapOverrides::new(),
+                crate::keymap::TerminalCtrlKeys::RunnerFirst,
+                false,
+            )
         });
         let workspace = workspace(window, &cx);
         let mut data = overview();
@@ -1240,11 +1237,11 @@ fn mission_dialogs_do_not_survive_navigation_or_host_removal() {
                 assert!(workspace.restart_confirm.is_none());
                 assert!(workspace.render_mission_overlays(cx).is_empty());
             });
-            let focus = window
-                .read_with(&cx, |root, _| root.root_focus.clone())
+            window
+                .update(&mut cx, |root, window, cx| {
+                    assert!(root.launcher_search_focused(window, cx))
+                })
                 .unwrap();
-            let mut visual = VisualTestContext::from_window(window.into(), &cx);
-            visual.update(|window, _| assert!(focus.is_focused(window)));
             for kind in ["rename", "stopMission", "restart"] {
                 assert_eq!(fake.request_count(kind), 0);
             }
@@ -1511,4 +1508,54 @@ fn remote_mission_panes_use_the_host_palette() {
     let palette =
         workspace(window, &cx).read_with(&cx, |workspace, cx| workspace.terminal_style(cx).palette);
     assert_eq!(palette, runner_terminal::palette::ROSE_PINE_DAWN);
+}
+
+#[test]
+fn the_remote_header_reads_and_toggles_a_linked_missions_group_pin() {
+    let _theme = crate::theme_snapshot::ThemeGuard::new();
+    let (_temp, mut cx, window, _store, fake) = setup();
+    let mut data = overview();
+    data.tabs[0].panes = runner_core::companion::Pane::Leaf {
+        session: Some("chat".into()),
+    };
+    data.tabs[0].pinned = true;
+    data.missions[0].linked_chat = Some(runner_core::companion::LinkedChat {
+        session_id: "chat".into(),
+        title: "Chat".into(),
+        archived: false,
+        reports: true,
+    });
+    let chat = data.sessions["member"].clone();
+    data.sessions.insert("chat".into(), chat);
+    fake.set_overview(data.clone());
+    cx.run_until_parked();
+    let workspace = workspace(window, &cx);
+    let pinned = |cx: &mut TestAppContext| {
+        workspace.read_with(cx, |workspace, cx| {
+            workspace.mission_pinned(&workspace.mission_view().unwrap(), cx)
+        })
+    };
+    assert!(pinned(&mut cx), "the group's tab is pinned");
+
+    window
+        .update(&mut cx, |_, window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.toggle_pin_for_test(window, cx)
+            })
+        })
+        .unwrap();
+    for _ in 0..1000 {
+        if fake.request_count("pin") == 1 {
+            break;
+        }
+        assert!(cx.executor().tick());
+    }
+    let pins = remote_test::action_trace(&fake, "pin");
+    assert_eq!(pins.len(), 1);
+    assert_eq!(pins[0]["pinned"], false, "the header offers Unpin");
+
+    data.tabs[0].pinned = false;
+    fake.set_overview(data);
+    cx.run_until_parked();
+    assert!(!pinned(&mut cx), "the header follows the host's group pin");
 }

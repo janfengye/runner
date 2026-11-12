@@ -32,6 +32,69 @@ pub fn runtime_status_list(state: &AppCore) -> Result<RuntimeStatusResponse> {
     )
 }
 
+pub fn runtime_set_launch_option(
+    state: &AppCore,
+    runtime: Runtime,
+    option: runner_core::protocol::runtime::RuntimeLaunchOption,
+    enabled: bool,
+) -> Result<RuntimeStatusResponse> {
+    if !option.supported(runtime) {
+        return Err(Error::msg("launch option is not supported by this runtime"));
+    }
+    crate::db::set_runtime_launch_option(&state.db, runtime, option, enabled)?;
+    state.events.emit("runtime/changed", &());
+    runtime_status_list(state)
+}
+
+pub fn runtime_command_preview(
+    state: &AppCore,
+    runtime: Runtime,
+    mission: bool,
+) -> Result<runner_core::protocol::runtime::RuntimeCommandPreview> {
+    let command = runtime_status_list(state)?
+        .runtimes
+        .into_iter()
+        .find(|entry| entry.name == runtime)
+        .map(|entry| entry.effective_command.unwrap_or(entry.command))
+        .ok_or_else(|| Error::msg(format!("unknown runtime: {runtime}")))?;
+    let options = crate::db::runtime_launch_options(&state.db)?
+        .get(runtime.key())
+        .copied()
+        .unwrap_or_default();
+    let env = state
+        .runtime_shell_env
+        .read()
+        .map_err(|_| Error::msg("runtime shell environment lock poisoned"))?
+        .vars
+        .clone();
+    let mut preview = state.sessions.command_preview(
+        runtime,
+        &command,
+        mission,
+        options,
+        &state.app_data_dir,
+        env,
+    );
+    if runtime == Runtime::ClaudeCode {
+        let accounts = crate::claude_accounts::load(&state.db)?;
+        if let Some(account) = accounts.accounts.iter().find(|account| {
+            accounts.accounts.len() > 1 && account.id == accounts.active_id && !account.native
+        }) {
+            preview.lines.insert(
+                0,
+                runner_core::protocol::runtime::RuntimeCommandLine {
+                    command: format!("CLAUDE_CONFIG_DIR={}", account.folder),
+                    note: runner_core::protocol::runtime::RuntimeCommandNote::ActiveAccount {
+                        name: account.name.clone(),
+                    },
+                    option: None,
+                },
+            );
+        }
+    }
+    Ok(preview)
+}
+
 pub fn runtime_set_override(
     state: &AppCore,
     runtime: Runtime,
@@ -145,7 +208,7 @@ pub fn runtime_update_start(
     state: &AppCore,
     spec: crate::session::runtime::SpawnSpec,
     events: Arc<dyn crate::session::manager::SessionEvents>,
-) -> Result<()> {
+) -> Result<std::sync::mpsc::Receiver<Option<i32>>> {
     log::info!(
         "runtime update started: session={} command={} args={:?}",
         spec.session_id,
@@ -242,21 +305,7 @@ pub fn runtime_catalog(state: &AppCore) -> Result<Vec<RuntimeCatalogEntry>> {
     let statuses: HashMap<_, _> = statuses
         .runtimes
         .into_iter()
-        .map(|runtime| {
-            let available = matches!(
-                runtime.effective_source,
-                Some(RuntimeCommandSource::Detected | RuntimeCommandSource::Override)
-            );
-            (
-                runtime.name,
-                (
-                    available,
-                    runtime.default_model,
-                    runtime.default_effort,
-                    runtime.effective_command,
-                ),
-            )
-        })
+        .map(|runtime| (runtime.name, runtime))
         .collect();
     let shell_env = state
         .runtime_shell_env
@@ -269,13 +318,22 @@ pub fn runtime_catalog(state: &AppCore) -> Result<Vec<RuntimeCatalogEntry>> {
     Ok(runtime_catalog_options()
         .into_iter()
         .map(|mut runtime| {
-            if let Some((available, default_model, default_effort, command)) =
-                statuses.get(&runtime.name)
-            {
-                runtime.available = *available;
-                runtime.default_model.clone_from(default_model);
-                runtime.default_effort.clone_from(default_effort);
-                if let Some(catalog) = command.as_deref().and_then(|command| {
+            if let Some(status) = statuses.get(&runtime.name) {
+                runtime.available = matches!(
+                    status.effective_source,
+                    Some(RuntimeCommandSource::Detected | RuntimeCommandSource::Override)
+                );
+                runtime.default_model.clone_from(&status.default_model);
+                runtime.default_effort.clone_from(&status.default_effort);
+                runtime
+                    .installed_version
+                    .clone_from(&status.installed_version);
+                runtime
+                    .available_version
+                    .clone_from(&status.available_version);
+                runtime.min_version.clone_from(&status.min_version);
+                runtime.below_minimum = status.below_minimum;
+                if let Some(catalog) = status.effective_command.as_deref().and_then(|command| {
                     discovery.models.catalog(
                         runtime.name,
                         &crate::runtime_status::models::source_with_main(
@@ -329,53 +387,6 @@ fn persistence_error(error: Error) -> OverrideValidationError {
         code: "persistence_failed".into(),
         message: error.to_string(),
     }
-}
-
-pub fn runtime_update_prepare(
-    state: &AppCore,
-    runtime: Runtime,
-    size: (u16, u16),
-) -> Result<runner_core::protocol::terminal::RuntimeUpdateCommand> {
-    let spec = runtime_update_spawn_spec(state, runtime, size)?;
-    let events: Arc<dyn crate::session::manager::SessionEvents> = Arc::new(state.session_events());
-    state
-        .sessions
-        .prepare_unlisted_terminal(&spec.session_id, size, &state.db, &events)?;
-    Ok(runner_core::protocol::terminal::RuntimeUpdateCommand {
-        session_id: spec.session_id,
-        command: spec.command,
-        args: spec.args,
-        cwd: spec.cwd,
-        env: spec.env,
-        shell_path: spec.shell_path,
-        size,
-    })
-}
-
-pub fn runtime_update_run(
-    state: &AppCore,
-    command: runner_core::protocol::terminal::RuntimeUpdateCommand,
-) -> Result<()> {
-    let spec = crate::session::runtime::SpawnSpec {
-        agent_runtime: None,
-        pending_turn: None,
-        session_id: command.session_id,
-        cwd: command.cwd,
-        command: command.command,
-        args: command.args,
-        env: command.env,
-        mission: false,
-        shim_dir: None,
-        bundled_bin_dir: None,
-        shell_path: command.shell_path,
-        initial_size: Some(command.size),
-    };
-    let id = spec.session_id.clone();
-    let result = runtime_update_start(state, spec, Arc::new(state.session_events()));
-    if result.is_err() {
-        state.sessions.discard_unlisted_terminal(&id);
-    }
-    result
 }
 
 #[cfg(test)]
@@ -607,5 +618,71 @@ mod tests {
         assert_eq!(spec.initial_size, Some((90, 28)));
 
         assert!(runtime_update_spawn_spec(&state, Runtime::Trae, (90, 28)).is_err());
+    }
+    #[test]
+    fn missing_agent_preview_uses_catalog_command_without_requiring_installation() {
+        let state = crate::test_support::test_core();
+        let root = tempfile::tempdir().unwrap();
+        state.runtime_shell_env.write().unwrap().path = Some(root.path().display().to_string());
+        state.runtime_discovery.write().unwrap().checking = false;
+        let preview = runtime_command_preview(&state, Runtime::Trae, false).unwrap();
+        assert_eq!(preview.lines[0].command, "traecli");
+        assert!(!preview.lines.is_empty());
+    }
+
+    #[test]
+    fn claude_preview_only_sets_config_dir_for_an_active_non_native_account() {
+        use runner_core::protocol::runtime::RuntimeCommandNote;
+        let state = crate::test_support::test_core();
+        let preview = runtime_command_preview(&state, Runtime::ClaudeCode, false).unwrap();
+        assert!(!preview
+            .lines
+            .iter()
+            .any(|line| line.command.starts_with("CLAUDE_CONFIG_DIR=")));
+        let mut accounts = crate::claude_accounts::load(&state.db).unwrap();
+        accounts
+            .accounts
+            .push(runner_core::protocol::ClaudeAccount {
+                id: "work".into(),
+                name: "Work".into(),
+                folder: "/tmp/runner-preview-work".into(),
+                native: false,
+            });
+        accounts.active_id = "work".into();
+        crate::db::app_state_set(
+            &state.db.get().unwrap(),
+            "claude_accounts",
+            &serde_json::to_string(&accounts).unwrap(),
+        )
+        .unwrap();
+        let preview = runtime_command_preview(&state, Runtime::ClaudeCode, false).unwrap();
+        assert_eq!(
+            preview.lines[0].command,
+            "CLAUDE_CONFIG_DIR=/tmp/runner-preview-work"
+        );
+        assert_eq!(
+            preview.lines[0].note,
+            RuntimeCommandNote::ActiveAccount {
+                name: "Work".into()
+            }
+        );
+        accounts.active_id = accounts
+            .accounts
+            .iter()
+            .find(|account| account.native)
+            .unwrap()
+            .id
+            .clone();
+        crate::db::app_state_set(
+            &state.db.get().unwrap(),
+            "claude_accounts",
+            &serde_json::to_string(&accounts).unwrap(),
+        )
+        .unwrap();
+        let preview = runtime_command_preview(&state, Runtime::ClaudeCode, false).unwrap();
+        assert!(!preview
+            .lines
+            .iter()
+            .any(|line| line.command.starts_with("CLAUDE_CONFIG_DIR=")));
     }
 }

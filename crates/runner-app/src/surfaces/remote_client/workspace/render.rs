@@ -1,47 +1,6 @@
 use super::*;
 
 impl RemoteClient {
-    pub(crate) fn render_remote_connection(&self, _cx: &mut Context<NativeRoot>) -> AnyElement {
-        let remote = self.workspace.as_ref().unwrap();
-        let (key, glyph, color) = match remote.connection {
-            Connection::Connected => ("client.connection_live", "shield-check.svg", theme::muted()),
-            Connection::Opening => (
-                "client.connection_opening",
-                "refresh-cw.svg",
-                theme::muted(),
-            ),
-            Connection::Reconnecting => (
-                "client.connection_reconnecting",
-                "refresh-cw.svg",
-                theme::warning(),
-            ),
-            Connection::Unreachable => (
-                "client.connection_unreachable",
-                "cloud-off.svg",
-                theme::warning(),
-            ),
-            Connection::Revoked => ("client.connection_revoked", "lock.svg", theme::danger()),
-            Connection::Forgotten => ("client.connection_forgotten", "unplug.svg", theme::muted()),
-        };
-        div()
-            .debug_selector(|| "REMOTE_CONNECTION_ROW".into())
-            .flex_1()
-            .min_w_0()
-            .flex()
-            .items_center()
-            .gap_2()
-            .text_size(theme::text_meta())
-            .text_color(color)
-            .child(icon(glyph, color))
-            .child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .child(label(key, &remote.computer.name)),
-            )
-            .into_any_element()
-    }
-
     pub(crate) fn mission_surface(&self, cx: &mut Context<NativeRoot>) -> Entity<MissionWorkspace> {
         let remote = self.workspace.as_ref().unwrap();
         let mut sizes = remote.sizes.clone();
@@ -100,17 +59,55 @@ impl RemoteClient {
                     }),
             )
             .children((remote.connection == Connection::Reconnecting).then(|| {
+                let pill = div()
+                    .min_w(px(0.))
+                    .max_w(rems(600. / 16.))
+                    .h(rems(32. / 16.))
+                    .pl(rems(12. / 16.))
+                    .pr(rems(14. / 16.))
+                    .flex()
+                    .items_center()
+                    .gap(rems(8. / 16.))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(theme::with_alpha(theme::warning(), 0.4))
+                    .bg(theme::panel())
+                    .shadow(vec![gpui::BoxShadow {
+                        color: theme::scrim(),
+                        offset: gpui::point(px(0.), px(8.)),
+                        blur_radius: px(24.),
+                        spread_radius: px(0.),
+                        inset: false,
+                    }])
+                    .child(
+                        gpui::svg()
+                            .flex_none()
+                            .path("refresh-cw.svg")
+                            .size(rems(14. / 16.))
+                            .text_color(theme::warning()),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(theme::text_body())
+                            .text_color(theme::text())
+                            .child(label("client.reconnecting_banner", &remote.computer.name)),
+                    );
+                #[cfg(test)]
+                let pill = crate::theme_snapshot::record_border(
+                    "REMOTE_RECONNECTING_PILL",
+                    crate::theme_snapshot::record_fill("REMOTE_RECONNECTING_PILL", pill),
+                );
                 div()
                     .absolute()
                     .top(rems(74. / 16.))
                     .left_0()
                     .right_0()
                     .px_4()
-                    .py_2()
-                    .bg(theme::with_alpha(theme::warning(), 0.12))
-                    .text_color(theme::warning())
-                    .text_size(theme::text_body())
-                    .child(label("client.reconnecting_banner", &remote.computer.name))
+                    .flex()
+                    .justify_center()
+                    .child(pill)
             }))
             .children(
                 matches!(
@@ -164,7 +161,7 @@ impl RemoteClient {
                         f32::from(bounds.size.width),
                         f32::from(bounds.size.height),
                         f32::from(cell),
-                        (style.font_size * crate::terminal::element::LINE_HEIGHT_FACTOR).round(),
+                        style.row_height(),
                     ) {
                         let owner = owner.clone();
                         let session = session.clone();
@@ -305,6 +302,8 @@ impl RemoteClient {
                         interactive,
                         resize_owner: interactive,
                         scrollable: true,
+                        find: None,
+                        file_links: None,
                     }
                     .render()
                     .id(SharedString::from(format!("remote-terminal-{id}")))

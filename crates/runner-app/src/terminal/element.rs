@@ -18,12 +18,12 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{point_to_viewport, viewport_to_point, TermMode};
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb};
 use gpui::{
-    fill, outline, point, px, relative, size, AnyTooltip, AnyView, App, Bounds, ContentMask,
-    Context, CursorStyle, DispatchPhase, Element, ElementInputHandler, Entity, FocusHandle, Font,
-    FontFallbacks, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement,
-    LayoutId, MouseButton as GpuiMouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point, ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString, Style, TextAlign, TextRun,
-    UnderlineStyle, Window,
+    fill, outline, point, px, relative, size, AnyTooltip, AnyView, App, Bounds, ClipboardItem,
+    ContentMask, Context, CursorStyle, DispatchPhase, Element, ElementInputHandler, Entity,
+    FocusHandle, Font, FontFallbacks, GlobalElementId, Hitbox, HitboxBehavior, Hsla,
+    InspectorElementId, IntoElement, LayoutId, MouseButton as GpuiMouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollWheelEvent, ShapedLine,
+    SharedString, Style, Task, TextAlign, TextRun, UnderlineStyle, Window,
 };
 
 use runner_app::terminal_ime::TerminalInput;
@@ -39,8 +39,13 @@ use runner_terminal::palette::{self, TerminalPalette};
 use runner_terminal::terminal::{LinkTarget, TerminalLink, TerminalMirror};
 
 use super::glyphs::{snapped_cell_bounds, ProceduralCell};
+use crate::file_links::FileLinkRoute;
 
-pub const LINE_HEIGHT_FACTOR: f32 = 1.4;
+/// A terminal row's height in pixels: the font size times the line-height
+/// setting, rounded so rows land on whole pixels.
+pub fn row_height(font_size: f32, line_height_factor: f32) -> f32 {
+    (font_size * line_height_factor).round()
+}
 
 #[derive(Clone, Copy)]
 struct TerminalGeometry {
@@ -93,10 +98,30 @@ struct DragState {
 /// gpui's own hover tooltips.
 const LINK_TOOLTIP_DELAY: Duration = Duration::from_millis(500);
 
+/// Half a blink cycle, as in Terminal.app and xterm.
+const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
+
+/// Only a focused terminal in the active window blinks, on one timer that
+/// stops when the terminal is no longer painted. `restart` is the output
+/// sequence, typed input and cursor position: any change shows the cursor
+/// again for a full interval.
+#[derive(Default)]
+struct CursorBlink {
+    task: Option<Task<()>>,
+    running: bool,
+    hidden: bool,
+    painted: bool,
+    next_toggle: Option<Instant>,
+    restart: Option<CursorBlinkRestart>,
+}
+
+type CursorBlinkRestart = (u64, u64, GridPoint);
+
 #[derive(Clone)]
 struct LinkTooltip {
     target: LinkTarget,
     modifier_held: bool,
+    previews: bool,
     view: AnyView,
     mouse_position: Point<Pixels>,
 }
@@ -113,6 +138,7 @@ pub(crate) struct TerminalInteraction {
     link_modifier_held: bool,
     hover_since: Option<Instant>,
     link_tooltip: Option<LinkTooltip>,
+    blink: CursorBlink,
 }
 
 impl TerminalInteraction {
@@ -129,7 +155,63 @@ impl TerminalInteraction {
             link_modifier_held: false,
             hover_since: None,
             link_tooltip: None,
+            blink: CursorBlink::default(),
         }
+    }
+
+    /// Whether this frame draws the cursor.
+    fn cursor_visible(
+        &mut self,
+        blinking: bool,
+        restart: CursorBlinkRestart,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !blinking {
+            self.blink = CursorBlink::default();
+            return true;
+        }
+        self.blink.painted = true;
+        let now = cx.background_executor().now();
+        if !self.blink.running || self.blink.restart != Some(restart) {
+            self.blink.hidden = false;
+            self.blink.restart = Some(restart);
+            self.blink.next_toggle = Some(now + CURSOR_BLINK_INTERVAL);
+        }
+        if !self.blink.running {
+            self.blink.running = true;
+            self.blink.task = Some(cx.spawn(async move |weak, cx| {
+                while let Some(wait) = weak
+                    .update(cx, |this, cx| this.blink_wait(cx))
+                    .ok()
+                    .flatten()
+                {
+                    cx.background_executor().timer(wait).await;
+                }
+            }));
+        }
+        !self.blink.hidden
+    }
+
+    /// How long the blink timer sleeps next, toggling the cursor when its
+    /// interval is up; `None` stops it.
+    fn blink_wait(&mut self, cx: &mut Context<Self>) -> Option<Duration> {
+        if !self.blink.running {
+            return None;
+        }
+        let now = cx.background_executor().now();
+        let next = self.blink.next_toggle?;
+        if now < next {
+            return Some(next - now);
+        }
+        if !std::mem::take(&mut self.blink.painted) {
+            self.blink.running = false;
+            self.blink.hidden = false;
+            return None;
+        }
+        self.blink.hidden = !self.blink.hidden;
+        self.blink.next_toggle = Some(now + CURSOR_BLINK_INTERVAL);
+        cx.notify();
+        Some(CURSOR_BLINK_INTERVAL)
     }
 
     fn link_tooltip_visible(&self) -> bool {
@@ -168,20 +250,22 @@ impl TerminalInteraction {
         &mut self,
         target: LinkTarget,
         modifier_held: bool,
+        previews: bool,
         mouse_position: Point<Pixels>,
         cx: &mut App,
     ) -> LinkTooltip {
-        if let Some(cached) = self
-            .link_tooltip
-            .as_ref()
-            .filter(|cached| cached.target == target && cached.modifier_held == modifier_held)
-        {
+        if let Some(cached) = self.link_tooltip.as_ref().filter(|cached| {
+            cached.target == target
+                && cached.modifier_held == modifier_held
+                && cached.previews == previews
+        }) {
             return cached.clone();
         }
-        let content = crate::file_links::link_tooltip_content(&target, modifier_held, cx);
+        let content = crate::file_links::link_tooltip_content(&target, modifier_held, previews, cx);
         let tooltip = LinkTooltip {
             target,
             modifier_held,
+            previews,
             view: tooltip_view(content, cx),
             mouse_position,
         };
@@ -412,6 +496,8 @@ impl TerminalInteraction {
         event: &MouseUpEvent,
         geometry: TerminalGeometry,
         interactive: bool,
+        copy_on_select: bool,
+        file_links: Option<&FileLinkRoute>,
         cx: &mut Context<Self>,
     ) {
         let Some(button) = mouse_button(event.button) else {
@@ -441,7 +527,10 @@ impl TerminalInteraction {
                     LinkTarget::Url(uri) => cx.open_url(&uri),
                     LinkTarget::File { path, line, column } => {
                         let target = crate::file_links::FileLinkTarget { path, line, column };
-                        crate::file_links::open_file_link(target, cx);
+                        match file_links.cloned() {
+                            Some(route) => cx.defer(move |cx| route.open(target, cx)),
+                            None => crate::file_links::open_file_link(target, cx),
+                        }
                     }
                 }
             }
@@ -477,7 +566,11 @@ impl TerminalInteraction {
                 self.session
                     .move_cursor_to_viewport(hit.viewport_column, hit.viewport_row);
             }
-            DragKind::Local { .. } => {}
+            DragKind::Local { .. } => {
+                if let Some(text) = self.session.selection_text().filter(|_| copy_on_select) {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+            }
         }
     }
 
@@ -599,6 +692,24 @@ fn viewport_edge_hit(
     }
 }
 
+/// Adds a find match's cell to its row's quad. Cells join by grid column
+/// and match: summed widths drift from `cell_width * col` at fractional
+/// cell widths, so comparing pixel edges would split one match into boxes.
+fn push_match_cell(
+    quads: &mut Vec<Bounds<Pixels>>,
+    end: &mut Option<(usize, usize, usize)>,
+    (found, row, col, cell_cols): (usize, usize, usize, usize),
+    cell: Bounds<Pixels>,
+) {
+    match (*end, quads.last_mut()) {
+        (Some(last_end), Some(last)) if last_end == (found, row, col) => {
+            last.size.width += cell.size.width;
+        }
+        _ => quads.push(cell),
+    }
+    *end = Some((found, row, col + cell_cols));
+}
+
 fn point_for_viewport(display_offset: usize, row: usize, column: usize) -> GridPoint {
     viewport_to_point(display_offset, GridPoint::new(row, Column(column)))
 }
@@ -694,6 +805,8 @@ pub struct TerminalElement {
     pub(super) scrollable: bool,
     pub(super) resize_owner: bool,
     pub(super) style: TerminalStyle,
+    pub(super) find: Option<Entity<super::TerminalFind>>,
+    pub(super) file_links: Option<FileLinkRoute>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -702,6 +815,14 @@ pub struct TerminalStyle {
     pub font: Font,
     pub font_size: f32,
     pub app_zoom: f32,
+    pub line_height_factor: f32,
+    pub copy_on_select: bool,
+}
+
+impl TerminalStyle {
+    pub fn row_height(&self) -> f32 {
+        row_height(self.font_size, self.line_height_factor)
+    }
 }
 
 impl TerminalElement {
@@ -723,11 +844,24 @@ impl TerminalElement {
             scrollable: false,
             resize_owner,
             style,
+            find: None,
+            file_links: None,
         }
     }
 
     pub fn scrollable(mut self, scrollable: bool) -> Self {
         self.scrollable = scrollable;
+        self
+    }
+
+    pub(crate) fn find(mut self, find: Entity<super::TerminalFind>) -> Self {
+        self.find = Some(find);
+        self
+    }
+
+    /// Opens ⌘-clicked file links through the surface's side panel.
+    pub(crate) fn file_links(mut self, route: Option<FileLinkRoute>) -> Self {
+        self.file_links = route;
         self
     }
 
@@ -814,12 +948,21 @@ impl TerminalElement {
 
         let interaction = self.interaction.clone();
         let interactive = self.interactive;
+        let copy_on_select = self.style.copy_on_select;
+        let file_links = self.file_links.clone();
         window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
             if phase != DispatchPhase::Capture || interaction.read(cx).drag.is_none() {
                 return;
             }
             interaction.update(cx, |interaction, interaction_cx| {
-                interaction.mouse_up(event, geometry, interactive, interaction_cx);
+                interaction.mouse_up(
+                    event,
+                    geometry,
+                    interactive,
+                    copy_on_select,
+                    file_links.as_ref(),
+                    interaction_cx,
+                );
             });
         });
 
@@ -846,6 +989,8 @@ impl TerminalElement {
 
 pub struct GridPrepaint {
     backgrounds: Vec<(Bounds<Pixels>, Hsla)>,
+    find_matches: Vec<Bounds<Pixels>>,
+    find_current: Vec<Bounds<Pixels>>,
     selections: Vec<Bounds<Pixels>>,
     procedural: Vec<ProceduralCell>,
     lines: Vec<(Point<Pixels>, ShapedLine)>,
@@ -918,7 +1063,7 @@ impl Element for TerminalElement {
         let cell_width = text_system
             .em_advance(font_id, font_size)
             .unwrap_or(px(self.style.font_size * 0.6));
-        let line_height = px((self.style.font_size * LINE_HEIGHT_FACTOR).round());
+        let line_height = px(self.style.row_height());
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
 
         if !self.session.control().desktop() {
@@ -964,6 +1109,8 @@ impl Element for TerminalElement {
             SizePushVerdict::SuppressedUnplaced => {
                 return GridPrepaint {
                     backgrounds: Vec::new(),
+                    find_matches: Vec::new(),
+                    find_current: Vec::new(),
                     selections: Vec::new(),
                     procedural: Vec::new(),
                     lines: Vec::new(),
@@ -1008,14 +1155,29 @@ impl Element for TerminalElement {
                 interaction.link_modifier_held,
             )
         });
-        if let Some(link) = hovered_link
+        // Until the panel knows whether the preview takes the file, the
+        // tooltip waits rather than naming the wrong destination.
+        let previews = hovered_link
             .as_ref()
             .filter(|_| self.interaction.read(cx).link_tooltip_visible())
-        {
+            .and_then(|link| match (&link.target, &self.file_links) {
+                (LinkTarget::File { path, .. }, Some(route)) => {
+                    let since = self.interaction.read(cx).hover_since?;
+                    let interaction = self.interaction.downgrade();
+                    let redraw = Rc::new(move |cx: &mut App| {
+                        let _ = interaction.update(cx, |_, cx| cx.notify());
+                    });
+                    route
+                        .previews(path, since, redraw, cx)
+                        .map(|previews| (link, previews))
+                }
+                _ => Some((link, false)),
+            });
+        if let Some((link, previews)) = previews {
             let mouse_position = window.mouse_position();
             let target = link.target.clone();
             let tooltip = self.interaction.update(cx, |interaction, cx| {
-                interaction.link_tooltip(target, link_modifier_held, mouse_position, cx)
+                interaction.link_tooltip(target, link_modifier_held, previews, mouse_position, cx)
             });
             let interaction = self.interaction.downgrade();
             window.set_tooltip(AnyTooltip {
@@ -1034,6 +1196,11 @@ impl Element for TerminalElement {
         let mut backgrounds: Vec<(Bounds<Pixels>, Hsla)> = Vec::new();
         let mut selections: Vec<Bounds<Pixels>> = Vec::new();
         let mut selection_end = None;
+        let mut find_matches: Vec<Bounds<Pixels>> = Vec::new();
+        let mut find_current: Vec<Bounds<Pixels>> = Vec::new();
+        let mut find_match_end = None;
+        let mut find_current_end = None;
+        let find_text = theme::find_highlight().text;
         let mut procedural = Vec::new();
         let mut spans: Vec<(usize, StyledSpan)> = Vec::new();
         let mut cursor = None;
@@ -1041,6 +1208,8 @@ impl Element for TerminalElement {
         let mut cursor_text = None;
         let mut cursor_cell = None;
         let mut cursor_cols = 1;
+        let mut cursor_blinks = false;
+        let mut cursor_point = GridPoint::default();
         let mode;
         let marked_foreground;
         let marked_background;
@@ -1053,6 +1222,14 @@ impl Element for TerminalElement {
             let overrides = content.colors;
             let selection = content.selection;
             let renderable_cursor = content.cursor;
+            let highlights = self
+                .find
+                .as_ref()
+                .and_then(|find| find.update(cx, |find, _| find.highlights(&term, rows as usize)));
+            let (highlighted, current_match) = highlights
+                .map(|highlights| (highlights.matches, highlights.current))
+                .unwrap_or_default();
+            let mut next_match = 0;
             marked_foreground = palette::resolve_for(
                 Color::Named(NamedColor::Foreground),
                 overrides,
@@ -1101,6 +1278,45 @@ impl Element for TerminalElement {
                         _ => selections.push(quad_bounds),
                     }
                     selection_end = Some((row, col + cell_cols));
+                }
+
+                while highlighted
+                    .get(next_match)
+                    .is_some_and(|found| *found.end() < indexed.point)
+                {
+                    next_match += 1;
+                }
+                let in_current = current_match
+                    .as_ref()
+                    .is_some_and(|found| found.contains(&indexed.point));
+                let in_match = in_current
+                    || highlighted
+                        .get(next_match)
+                        .is_some_and(|found| found.contains(&indexed.point));
+                if in_match && !cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    let quad_bounds = Bounds::new(
+                        point(
+                            bounds.left() + cell_width * col as f32,
+                            bounds.top() + line_height * row as f32,
+                        ),
+                        size(cell_width * cell_cols as f32, line_height),
+                    );
+                    let cell_at = (next_match, row, col, cell_cols);
+                    if in_current {
+                        push_match_cell(
+                            &mut find_current,
+                            &mut find_current_end,
+                            cell_at,
+                            quad_bounds,
+                        );
+                    } else {
+                        push_match_cell(
+                            &mut find_matches,
+                            &mut find_match_end,
+                            cell_at,
+                            quad_bounds,
+                        );
+                    }
                 }
 
                 if cell
@@ -1165,7 +1381,11 @@ impl Element for TerminalElement {
                             col,
                             window.scale_factor(),
                         ),
-                        to_hsla(fg, 1.),
+                        if in_current {
+                            find_text
+                        } else {
+                            to_hsla(fg, 1.)
+                        },
                         to_hsla(bg, 1.),
                         font_size,
                     ) {
@@ -1198,14 +1418,16 @@ impl Element for TerminalElement {
                 } else {
                     base_font.clone()
                 };
-                if cell.flags.contains(Flags::BOLD) {
+                if cell.flags.contains(Flags::BOLD) || in_current {
                     cell_font = cell_font.bold();
                 }
                 if cell.flags.contains(Flags::ITALIC) {
                     cell_font = cell_font.italic();
                 }
                 let link_armed = link_underlined && link_modifier_held;
-                let text_color = if link_armed {
+                let text_color = if in_current {
+                    find_text
+                } else if link_armed {
                     theme::accent()
                 } else {
                     to_hsla(fg, 1.)
@@ -1331,9 +1553,25 @@ impl Element for TerminalElement {
                     cursor_cell = Some(bounds);
                     if renderable_cursor.shape != CursorShape::Hidden {
                         cursor = Some((bounds, renderable_cursor.shape));
+                        cursor_blinks = term.cursor_style().blinking;
+                        cursor_point = renderable_cursor.point;
                     }
                 }
             }
+        }
+        let blinking = cursor_blinks
+            && cursor.is_some()
+            && self.focus_handle.is_focused(window)
+            && window.is_window_active();
+        let restart = (
+            self.session.output_activity().last_seq,
+            self.session.typed_count(),
+            cursor_point,
+        );
+        if !self.interaction.update(cx, |interaction, cx| {
+            interaction.cursor_visible(blinking, restart, cx)
+        }) {
+            cursor = None;
         }
 
         let lines = spans
@@ -1384,6 +1622,8 @@ impl Element for TerminalElement {
 
         GridPrepaint {
             backgrounds,
+            find_matches,
+            find_current,
             selections,
             procedural,
             lines,
@@ -1416,6 +1656,23 @@ impl Element for TerminalElement {
         window.paint_quad(fill(bounds, to_hsla(self.style.palette.background, 1.)));
         for (quad_bounds, color) in &prepaint.backgrounds {
             window.paint_quad(fill(*quad_bounds, *color));
+        }
+        let highlight = theme::find_highlight();
+        let radius = px(2. * self.style.app_zoom);
+        for quad_bounds in &prepaint.find_matches {
+            window.paint_quad(fill(*quad_bounds, highlight.tint).corner_radii(radius));
+        }
+        for quad_bounds in &prepaint.find_current {
+            window.paint_quad(fill(*quad_bounds, highlight.current).corner_radii(radius));
+            window.paint_quad(
+                outline(
+                    quad_bounds.dilate(px(self.style.app_zoom)),
+                    highlight.outline,
+                    Default::default(),
+                )
+                .border_widths(px(self.style.app_zoom))
+                .corner_radii(radius + px(self.style.app_zoom)),
+            );
         }
         let selection_color = to_hsla(self.style.palette.selection, 1.);
         for quad_bounds in &prepaint.selections {
@@ -1564,8 +1821,8 @@ mod tests {
 
     use super::{
         accumulate_scroll, autoscroll_amount, cell_and_side, link_modifier, point_for_viewport,
-        text_presentation_font, viewport_cell, wants_text_presentation, TerminalElement,
-        TerminalGeometry, TerminalInput, TerminalInteraction, TerminalStyle,
+        push_match_cell, text_presentation_font, viewport_cell, wants_text_presentation,
+        TerminalElement, TerminalGeometry, TerminalInput, TerminalInteraction, TerminalStyle,
     };
     use alacritty_terminal::term::TermMode;
     use runner_terminal::mappings::encode_scroll;
@@ -1660,6 +1917,7 @@ mod tests {
 
     fn spawn_terminal(
         core: &AppCore,
+        runtime: &RecordingRuntime,
         role: &runner_daemon::model::Role,
         root: &std::path::Path,
     ) -> Arc<TerminalMirror> {
@@ -1686,8 +1944,31 @@ mod tests {
             Arc::new(|| {}),
         )
         .unwrap();
-        terminal.test_feed(1, b"\x1b[?1000h\x1b[?1006h");
+        emit_output(runtime, &terminal, b"\x1b[?1000h\x1b[?1006h", |terminal| {
+            terminal.mode().contains(TermMode::SGR_MOUSE)
+        });
         terminal
+    }
+
+    // Output goes through the host so the mirror keeps the host's frame
+    // sequence and accepts its resize acknowledgments.
+    fn emit_output(
+        runtime: &RecordingRuntime,
+        terminal: &TerminalMirror,
+        bytes: &[u8],
+        arrived: impl Fn(&TerminalMirror) -> bool,
+    ) {
+        runtime.outputs.lock().unwrap()[terminal.session_id()]
+            .send(RuntimeOutput::Stream(bytes.to_vec()))
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !arrived(terminal) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "host output did not reach the mirror"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     fn wait_for_rows(terminal: &TerminalMirror, rows: u16) {
@@ -1718,17 +1999,21 @@ mod tests {
         right_scrollable: bool,
         font_size: f32,
         gap: f32,
+        line_height_factor: f32,
+        copy_on_select: bool,
     }
 
     impl Render for WheelHost {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let style = TerminalStyle {
                 palette: runner_terminal::palette::RUNNER,
                 font: crate::app_settings::AppSettings::default()
                     .terminal_font_family
-                    .font(),
+                    .font(cx),
                 font_size: self.font_size,
                 app_zoom: 1.,
+                line_height_factor: self.line_height_factor,
+                copy_on_select: self.copy_on_select,
             };
             div()
                 .size_full()
@@ -1777,6 +2062,36 @@ mod tests {
     }
 
     #[test]
+    fn a_find_match_is_one_box_per_row_at_a_fractional_cell_width() {
+        use gpui::size;
+        let (left, cell_width, line_height) = (px(6.), px(10.4), px(20.8));
+        let mut quads = Vec::new();
+        let mut end = None;
+        let mut push = |found, row: usize, cols: std::ops::Range<usize>| {
+            for col in cols {
+                let cell = Bounds::new(
+                    point(left + cell_width * col as f32, line_height * row as f32),
+                    size(cell_width, line_height),
+                );
+                push_match_cell(&mut quads, &mut end, (found, row, col, 1), cell);
+            }
+        };
+        push(0, 1, 5..14);
+        push(1, 1, 14..16);
+        push(1, 2, 0..3);
+        let spans = quads
+            .iter()
+            .map(|quad| {
+                (
+                    ((quad.left() - left) / cell_width).round() as usize,
+                    (quad.size.width / cell_width).round() as usize,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(spans, [(5, 9), (14, 2), (0, 3)]);
+    }
+
+    #[test]
     fn rendered_wheels_target_one_pane_and_follow_its_current_geometry() {
         use gpui::{size, ScrollDelta, ScrollWheelEvent};
 
@@ -1801,11 +2116,15 @@ mod tests {
             },
         )
         .unwrap();
-        let left_terminal = spawn_terminal(&core, &role, temp.path());
-        let right_terminal = spawn_terminal(&core, &role, temp.path());
+        let left_terminal = spawn_terminal(&core, &runtime, &role, temp.path());
+        let right_terminal = spawn_terminal(&core, &runtime, &role, temp.path());
         for terminal in [&left_terminal, &right_terminal] {
-            terminal.test_feed(2, &"scrollback line\r\n".repeat(40).into_bytes());
-            assert!(terminal.scroll_state().history_lines > 0);
+            emit_output(
+                &runtime,
+                terminal,
+                &"scrollback line\r\n".repeat(40).into_bytes(),
+                |terminal| terminal.scroll_state().history_lines > 0,
+            );
         }
         let right_id = right_terminal.session_id().to_owned();
         let mut cx = TestAppContext::single();
@@ -1829,14 +2148,16 @@ mod tests {
             right_scrollable: true,
             font_size: 14.,
             gap: 20.,
+            line_height_factor: crate::app_settings::TERMINAL_LINE_HEIGHT_DEFAULT,
+            copy_on_select: false,
         });
         let mut visual = VisualTestContext::from_window(window.into(), &cx);
         visual.simulate_resize(size(px(700.), px(300.)));
         let right_bounds = visual.debug_bounds("WHEEL_RIGHT").unwrap();
-        let cell_width = visual.update(|window, _| {
+        let cell_width = visual.update(|window, cx| {
             let font = crate::app_settings::AppSettings::default()
                 .terminal_font_family
-                .font();
+                .font(cx);
             let id = window.text_system().resolve_font(&font);
             window
                 .text_system()
@@ -1847,7 +2168,10 @@ mod tests {
             right_bounds.left() + px(10.) + cell_width * 7. + px(1.),
             right_bounds.top()
                 + px(10.)
-                + px(14. * super::LINE_HEIGHT_FACTOR).round() * 4.
+                + px(super::row_height(
+                    14.,
+                    crate::app_settings::TERMINAL_LINE_HEIGHT_DEFAULT,
+                )) * 4.
                 + px(1.),
         );
         let header = point(body.x, right_bounds.top() + px(11.));
@@ -1897,10 +2221,10 @@ mod tests {
         wait_for_rows(&right_terminal, 5);
         let changed_bounds = visual.debug_bounds("WHEEL_RIGHT").unwrap();
         assert_eq!(changed_bounds.left(), right_bounds.left() + px(20.));
-        let new_width = visual.update(|window, _| {
+        let new_width = visual.update(|window, cx| {
             let font = crate::app_settings::AppSettings::default()
                 .terminal_font_family
-                .font();
+                .font(cx);
             let id = window.text_system().resolve_font(&font);
             window
                 .text_system()
@@ -1911,7 +2235,10 @@ mod tests {
             changed_bounds.left() + px(10.) + new_width * 5. + px(1.),
             changed_bounds.top()
                 + px(10.)
-                + px(20. * super::LINE_HEIGHT_FACTOR).round() * 3.
+                + px(super::row_height(
+                    20.,
+                    crate::app_settings::TERMINAL_LINE_HEIGHT_DEFAULT,
+                )) * 3.
                 + px(1.),
         );
         visual.simulate_event(wheel(changed_body, 1.));
@@ -1949,6 +2276,265 @@ mod tests {
         ));
         assert_eq!(runtime.writes.lock().unwrap().len(), 4);
         assert_eq!(left_terminal.scroll_state().display_offset, 1);
+    }
+
+    fn probe_role(core: &AppCore) -> runner_daemon::model::Role {
+        runner_daemon::ops::role::create(
+            &core.db.get().unwrap(),
+            runner_daemon::ops::role::CreateRoleInput {
+                handle: "settings-probe".into(),
+                display_name: "Settings probe".into(),
+                runtime: runner_daemon::model::Runtime::Trae,
+                command: "probe".into(),
+                args: Vec::new(),
+                working_dir: None,
+                system_prompt: None,
+                env: Default::default(),
+                model: None,
+                effort: None,
+                codex_speed: None,
+                permission_mode: runner_daemon::router::runtime::PermissionMode::Auto,
+            },
+        )
+        .unwrap()
+    }
+
+    fn wheel_pane(cx: &mut TestAppContext, terminal: &Arc<TerminalMirror>) -> WheelPane {
+        WheelPane {
+            interaction: cx.new(|_| TerminalInteraction::new(Arc::clone(terminal))),
+            input: cx.new(|_| TerminalInput::new(Arc::clone(terminal))),
+            focus: cx.update(|cx| cx.focus_handle()),
+            terminal: Arc::clone(terminal),
+        }
+    }
+
+    #[test]
+    fn row_height_and_pty_rows_follow_the_line_height_setting() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(RecordingRuntime::default());
+        let core = test_core(temp.path(), Arc::clone(&runtime));
+        let role = probe_role(&core);
+        let left_terminal = spawn_terminal(&core, &runtime, &role, temp.path());
+        let right_terminal = spawn_terminal(&core, &runtime, &role, temp.path());
+        let mut cx = TestAppContext::single();
+        let (left, right) = (
+            wheel_pane(&mut cx, &left_terminal),
+            wheel_pane(&mut cx, &right_terminal),
+        );
+        let window = cx.add_window(|_, _| WheelHost {
+            left,
+            right,
+            left_interactive: true,
+            right_interactive: true,
+            right_scrollable: true,
+            font_size: 14.,
+            gap: 20.,
+            line_height_factor: 1.0,
+            copy_on_select: false,
+        });
+        let mut visual = VisualTestContext::from_window(window.into(), &cx);
+        visual.simulate_resize(gpui::size(px(700.), px(300.)));
+        let cell_width = visual.update(|window, cx| {
+            let font = crate::app_settings::AppSettings::default()
+                .terminal_font_family
+                .font(cx);
+            let id = window.text_system().resolve_font(&font);
+            f32::from(window.text_system().em_advance(id, px(14.)).unwrap())
+        });
+        let expected_rows = |factor: f32| {
+            runner_app::terminal_resize::terminal_grid_size(
+                240.,
+                160.,
+                cell_width,
+                super::row_height(14., factor),
+            )
+            .unwrap()
+            .rows
+        };
+        assert_eq!(super::row_height(14., 1.0), 14.);
+        assert_eq!(super::row_height(14., 1.6), 22.);
+        let mut seen = Vec::new();
+        for factor in [1.0, 1.6, crate::app_settings::TERMINAL_LINE_HEIGHT_DEFAULT] {
+            window
+                .update(&mut visual, |host, _, cx| {
+                    host.line_height_factor = factor;
+                    cx.notify();
+                })
+                .unwrap();
+            visual.refresh().unwrap();
+            let rows = expected_rows(factor);
+            wait_for_rows(&left_terminal, rows);
+            wait_for_rows(&right_terminal, rows);
+            seen.push(rows);
+        }
+        assert!(seen[0] > seen[2] && seen[2] > seen[1], "{seen:?}");
+    }
+
+    #[test]
+    fn copy_on_select_copies_a_finished_drag_only_when_on() {
+        use gpui::{Modifiers, MouseButton};
+
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(RecordingRuntime::default());
+        let core = test_core(temp.path(), Arc::clone(&runtime));
+        let role = probe_role(&core);
+        let left_terminal = spawn_terminal(&core, &runtime, &role, temp.path());
+        let right_terminal = spawn_terminal(&core, &runtime, &role, temp.path());
+        emit_output(
+            &runtime,
+            &left_terminal,
+            b"\x1b[?1000l\x1b[?1006lcopy me please\r\n",
+            |terminal| !terminal.cell_is_whitespace(GridPoint::new(Line(0), Column(0))),
+        );
+        let mut cx = TestAppContext::single();
+        let (left, right) = (
+            wheel_pane(&mut cx, &left_terminal),
+            wheel_pane(&mut cx, &right_terminal),
+        );
+        let window = cx.add_window(|_, _| WheelHost {
+            left,
+            right,
+            left_interactive: true,
+            right_interactive: true,
+            right_scrollable: true,
+            font_size: 14.,
+            gap: 20.,
+            line_height_factor: crate::app_settings::TERMINAL_LINE_HEIGHT_DEFAULT,
+            copy_on_select: false,
+        });
+        let mut visual = VisualTestContext::from_window(window.into(), &cx);
+        visual.simulate_resize(gpui::size(px(700.), px(300.)));
+        let bounds = visual.debug_bounds("WHEEL_LEFT").unwrap();
+        // The host acknowledges the paint's size push on the frame thread, and
+        // a change of rows drops any selection made before it lands.
+        let rows = window
+            .read_with(&visual, |host, cx| host.left.interaction.read(cx).pane_size)
+            .unwrap()
+            .unwrap()
+            .rows;
+        wait_for_rows(&left_terminal, rows);
+        let row = bounds.top() + px(10. + super::row_height(14., 1.4) / 2.);
+        let start = point(bounds.left() + px(11.), row);
+        let end = point(bounds.left() + px(60.), row);
+        let drag = |visual: &mut VisualTestContext| {
+            visual.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+            visual.simulate_mouse_move(end, MouseButton::Left, Modifiers::default());
+            visual.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+            visual.run_until_parked();
+        };
+        let clipboard = |visual: &mut VisualTestContext| {
+            visual.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()))
+        };
+
+        visual
+            .update(|_, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string("kept".into())));
+        drag(&mut visual);
+        let selected = left_terminal.selection_text().unwrap();
+        assert!(selected.starts_with("copy"), "{selected:?}");
+        assert_eq!(clipboard(&mut visual).as_deref(), Some("kept"));
+
+        window
+            .update(&mut visual, |host, _, cx| {
+                host.copy_on_select = true;
+                cx.notify();
+            })
+            .unwrap();
+        visual.refresh().unwrap();
+        drag(&mut visual);
+        assert_eq!(clipboard(&mut visual), Some(selected.clone()));
+        assert_eq!(left_terminal.selection_text(), Some(selected));
+    }
+
+    #[test]
+    fn blinking_cursor_toggles_on_one_timer_and_shows_again_on_output_or_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(RecordingRuntime::default());
+        let core = test_core(temp.path(), Arc::clone(&runtime));
+        let terminal = spawn_terminal(&core, &runtime, &probe_role(&core), temp.path());
+        let typed = terminal.typed_count();
+        terminal
+            .send_key("a", false, false, false, Some("a"))
+            .unwrap();
+        terminal.send_text("b").unwrap();
+        terminal.paste("c").unwrap();
+        assert_eq!(
+            terminal.typed_count(),
+            typed + 3,
+            "keys, text and pastes count"
+        );
+        let mut cx = TestAppContext::single();
+        let interaction = cx.new(|_| TerminalInteraction::new(terminal));
+        let at = GridPoint::new(Line(0), Column(0));
+        let visible = |cx: &mut TestAppContext, blinking: bool, restart: (u64, u64, GridPoint)| {
+            interaction.update(cx, |interaction, cx| {
+                interaction.cursor_visible(blinking, restart, cx)
+            })
+        };
+        let wait = |cx: &mut TestAppContext, duration: std::time::Duration| {
+            cx.executor().advance_clock(duration);
+            cx.run_until_parked();
+        };
+        let interval = super::CURSOR_BLINK_INTERVAL;
+        let half = interval / 2;
+        let timer = |cx: &mut TestAppContext| {
+            interaction.read_with(cx, |interaction, _| {
+                (interaction.blink.running, interaction.blink.task.is_some())
+            })
+        };
+
+        assert!(visible(&mut cx, false, (1, 0, at)));
+        assert_eq!(timer(&mut cx), (false, false));
+
+        assert!(visible(&mut cx, true, (1, 0, at)));
+        wait(&mut cx, interval);
+        assert!(!visible(&mut cx, true, (1, 0, at)));
+        wait(&mut cx, interval);
+        assert!(visible(&mut cx, true, (1, 0, at)));
+        wait(&mut cx, interval);
+        assert!(!visible(&mut cx, true, (1, 0, at)));
+
+        assert!(
+            visible(&mut cx, true, (2, 0, at)),
+            "output shows the cursor"
+        );
+        wait(&mut cx, interval);
+        assert!(!visible(&mut cx, true, (2, 0, at)));
+        assert!(
+            visible(&mut cx, true, (2, 1, at)),
+            "typing shows the cursor"
+        );
+        wait(&mut cx, interval);
+        assert!(!visible(&mut cx, true, (2, 1, at)));
+
+        // Restarts inside one interval push the next toggle back.
+        assert!(visible(&mut cx, true, (3, 1, at)));
+        for seq in 4..8 {
+            wait(&mut cx, half);
+            assert!(visible(&mut cx, true, (seq, 1, at)), "restart {seq}");
+        }
+        wait(&mut cx, half);
+        assert!(visible(&mut cx, true, (7, 1, at)));
+        wait(&mut cx, half);
+        assert!(!visible(&mut cx, true, (7, 1, at)));
+
+        assert!(
+            visible(&mut cx, false, (7, 1, at)),
+            "unfocused draws it steadily"
+        );
+        assert_eq!(
+            timer(&mut cx),
+            (false, false),
+            "turning blink off cancels the timer"
+        );
+
+        assert!(visible(&mut cx, true, (7, 1, at)));
+        assert_eq!(timer(&mut cx), (true, true));
+        wait(&mut cx, interval);
+        wait(&mut cx, interval);
+        assert!(
+            !timer(&mut cx).0,
+            "a terminal that stops painting stops its timer"
+        );
     }
 
     #[test]

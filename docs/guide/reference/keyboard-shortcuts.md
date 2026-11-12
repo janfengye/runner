@@ -13,18 +13,20 @@ In macOS terminal panes, **Settings → Terminal → Option as Meta key** defaul
 | Action | macOS | Windows / Linux |
 | --- | --- | --- |
 | New window | ⇧⌘N | Ctrl+Shift+N |
-| Open/focus the chat launcher in an empty pane or new tab | ⌘N | Ctrl+N |
+| New tab: show the launcher page; the tab is created when something starts | ⌘N | Ctrl+N |
 | New terminal; fill the focused empty pane or create a tab | ⌘T | Ctrl+Shift+T |
-| New mission | ⇧⌘M | Ctrl+Shift+M |
-| Command palette | ⌘K | Ctrl+K |
-| Toggle sidebar | ⌘S | Ctrl+S |
+| New mission: show the launcher page's crew step without creating a tab | ⇧⌘M | Ctrl+Shift+M |
+| Command palette | ⌘K | Ctrl+Shift+P |
+| Search files by name in the side panel's folder | ⇧⌘O | Ctrl+Shift+O |
+| Toggle sidebar | ⌘S | Ctrl+B |
+| Switch sidebar view (Projects / Active) | ⌘. | Ctrl+. |
 | Toggle mission terminal drawer | ⌥F12 | Alt+F12 |
 | Open Settings | ⌘, | Ctrl+, |
 | Previous recently viewed page | ⇧⌘[ | Ctrl+Shift+[ |
 | Next recently viewed page | ⇧⌘] | Ctrl+Shift+] |
 | Select visible sidebar row 1–9 | ⌘1–9 | Ctrl+1–9 |
 
-In Projects, number shortcuts follow the visible tabs and missions. In Active, they follow tabs and missions from top to bottom across Chats, Missions and Terminals, skipping collapsed groups; a split tab opens on the pane that needs attention. Hold the primary modifier to reveal row numbers when the selection binding is enabled.
+In Projects, number shortcuts follow the visible tabs and missions, with a linked group's missions right after their chat. In Active, they follow tabs and missions from top to bottom across Agents and Terminals, skipping collapsed headings and the missions of a collapsed group; a split tab opens on the pane that needs attention. Hold the primary modifier to reveal row numbers when the selection binding is enabled.
 
 ## Panes and sessions
 
@@ -32,9 +34,10 @@ In Projects, number shortcuts follow the visible tabs and missions. In Active, t
 | --- | --- | --- |
 | Previous chat pane | ⌘[ | Ctrl+[ |
 | Next chat pane | ⌘] | Ctrl+] |
-| Split right | ⌘D | Ctrl+D |
-| Split down | ⇧⌘D | Ctrl+Shift+D |
-| Hide focused mission drawer, close focused pane, or close chat tab | ⌘W | Ctrl+Shift+W |
+| Split right | ⌘D | Ctrl+Shift+D |
+| Split down | ⇧⌘D | Alt+Shift+D |
+| Maximize the focused pane of a split tab, or restore the split | ⇧⌘↩ | Ctrl+Shift+Enter |
+| Hide focused mission drawer, close focused pane, close chat tab, or close the launcher page | ⌘W | Ctrl+Shift+W |
 | Stop focused chat or mission slot | ⇧⌘X | Ctrl+Shift+X |
 | Resume focused stopped chat or mission slot | ⇧⌘R | Ctrl+Shift+R |
 | Previous mission feed/session tab | ⌘[ | Ctrl+[ |
@@ -42,15 +45,63 @@ In Projects, number shortcuts follow the visible tabs and missions. In Active, t
 | Copy terminal selection | ⌘C | Ctrl+C |
 | Paste | ⌘V | Ctrl+V |
 
-On Windows and Linux, **Ctrl+C** copies when terminal text is selected; otherwise it reaches the terminal as an interrupt. **Ctrl+W** remains available to terminal programs; Runner uses **Ctrl+Shift+W** to close a pane or tab.
+On Windows and Linux, **Ctrl+C** copies when terminal text is selected and clears the selection, so the next **Ctrl+C** reaches the terminal as an interrupt; without a selection it is an interrupt. **Ctrl+W**, **Ctrl+D**, **Ctrl+K**, **Ctrl+S** and **Ctrl+M** remain available to terminal programs: Runner uses **Ctrl+Shift+W** to close a pane or tab, **Ctrl+Shift+D** and **Alt+Shift+D** to split, **Ctrl+Shift+P** for the command palette and **Ctrl+B** for the sidebar.
+
+## Ctrl keys in terminals
+
+On Windows and Linux, **Settings → Keyboard shortcuts → Ctrl keys in terminals** decides which side gets a bare Ctrl key while a terminal has focus: a chat pane, terminal tab, mission slot, mission drawer or remote terminal.
+
+- **Runner first** (the default) keeps every Runner shortcut working, including in a focused terminal.
+- **Terminal first** sends a shortcut made of Ctrl and one key, without Shift or Alt, to the focused terminal instead. With the default keys this frees **Ctrl+N**, **Ctrl+B**, **Ctrl+.**, **Ctrl+[** / **Ctrl+]**, **Ctrl+1–9** and **Ctrl+,**; a shortcut you changed to a bare Ctrl key is freed too. Those rows show an **Outside terminals** tag, and the shortcuts still work everywhere else, such as from the sidebar.
+
+With Terminal first, Ctrl+. sends a plain period in legacy terminal programs. Programs that enable Kitty keyboard disambiguation receive Ctrl+. as a distinct key.
+
+Copy with a selection, paste and zoom work in a terminal in both modes. The setting takes effect immediately. macOS has no such setting, because ⌘ shortcuts never reach a terminal.
+
+## Find in terminal
+
+| Action | macOS | Windows / Linux |
+| --- | --- | --- |
+| Find in terminal; with the find bar open, select its query | ⌘F | Ctrl+Shift+F |
+| Next (older) match | Enter or ⌘G | Enter or F3 |
+| Previous (newer) match | ⇧Enter or ⇧⌘G | Shift+Enter or Shift+F3 |
+| Close the find bar | Esc | Esc |
+
+Find in terminal can be changed in **Settings → Keyboard shortcuts**; the keys inside the find bar are fixed. On Windows and Linux, **Ctrl+F** still reaches the terminal. Esc closes the find bar only while the bar has focus; once the terminal has focus, Esc goes to the program. See [Find in a terminal](../guides/chats-and-windows.md#find-in-a-terminal).
+
+## Side panel surfaces
+
+| Action | Keys |
+| --- | --- |
+| Open Info, or switch to it | I |
+| Open Files, or switch to it | F |
+| Move through the surfaces | ↑ / ↓ |
+| Open the highlighted surface | Return (Enter) |
+| Close the **+** list | Esc |
+
+These keys act only while the **+** list of a side panel, or a panel's **Open a surface** list, has focus; they are fixed. See [Chats, tabs and windows](../guides/chats-and-windows.md).
+
+## Files in the side panel
+
+| Action | macOS | Windows / Linux |
+| --- | --- | --- |
+| Open the selected file in the tree | Space or Return | Space or Enter |
+| Next file tab | ⌃Tab | Ctrl+Tab |
+| Previous file tab | ⌃⇧Tab | Ctrl+Shift+Tab |
+| Close the active file tab | ⌘W | Ctrl+Shift+W |
+| Find in the file | ⌘F | Ctrl+F |
+| Copy the selected text | ⌘C | Ctrl+C |
+| Larger or smaller text in the viewer | ⌘+ / ⌘− | Ctrl+= / Ctrl+− |
+
+These keys act while the side panel's Files view has focus and, except for zoom, are fixed. With focus elsewhere, or no file open, ⌘W (Ctrl+Shift+W) closes the pane as usual. In the file's find bar, Return and ⇧Return step through the matches and Esc closes the bar. The zoom keys change the viewer's text only while the file, its find bar or a rendered page has focus, and follow any rebinding of **Zoom in** and **Zoom out**; in the tree and elsewhere they zoom the app. **Reset zoom** resets the app's zoom everywhere, the viewer included. ⌘-click (Ctrl+click) on a file path in a terminal opens the file in a tab at its line when it is inside the Files view's folder. See [Read a file in the side panel](../guides/chats-and-windows.md#read-a-file-in-the-side-panel).
 
 ## Dialogs
 
 | Action | macOS | Windows / Linux |
 | --- | --- | --- |
-| Start a mission or add a role in its dialog | ⌘Enter | Ctrl+Enter |
+| Add a role to a running mission in its dialog | ⌘Enter | Ctrl+Enter |
 
-The dialog confirmation binding is fixed. In the launcher, ↑/↓ select rows, Enter starts the selected row, 1–4 start ranked rows while search is empty, and Esc clears a non-empty search. Digits type normally during a search.
+The dialog confirmation binding is fixed. In the launcher, ↑/↓ select rows, Enter starts the selected row, 1–4 start ranked rows while search is empty, and Esc on the default page returns to the previous tab/view. In a split pane, Esc clears a non-empty search. On the launcher's crew step, ⇧Enter starts an Empty mission, and Esc leaves the step even during a search; Backspace leaves it when the field is empty. On its goal step, Enter starts the mission, ⇧Enter adds a line, and Esc returns to the crews. Digits type normally during a search. The command palette shortcut also works from the launcher's search field, unlike other text fields; closing the palette returns to the search.
 
 ## Appearance and window controls
 
@@ -60,7 +111,7 @@ The dialog confirmation binding is fixed. In the launcher, ↑/↓ select rows, 
 | Zoom out | ⌘− | Ctrl+− |
 | Reset app zoom | ⌘0 | Ctrl+0 |
 | Close window and save layout | ⇧⌘W | Alt+F4 |
-| Minimize | ⌘M | Ctrl+M |
+| Minimize | ⌘M | No default shortcut |
 | Toggle fullscreen | ⌃⌘F | F11 |
 | Quit Runner | ⌘Q | Close the last window |
 | Quit and Stop Sessions | ⌥⌘Q | No default shortcut |
@@ -71,7 +122,7 @@ App zoom changes the application controls. Set terminal text size separately in 
 
 ## Customize
 
-Select an editable shortcut in **Settings → Keyboard shortcuts** and press the new combination. Runner checks conflicts within overlapping contexts. Fixed window and system bindings cannot be reassigned; the tab-selection group can be unbound as a group. Use **Reset all to defaults** to restore the standard map.
+**Settings → Keyboard shortcuts** groups shortcuts into **Navigation and creation**, **Panes and sessions**, **Missions**, **Terminal** and **Zoom and window**; search filters the rows within each section and hides a section with no match. Select an editable shortcut and press the new combination. Runner checks conflicts within overlapping contexts. Fixed window and system bindings cannot be reassigned; the tab-selection group can be unbound as a group. Use **Reset all to defaults** to restore the standard map.
 
 These tables follow Runner's shared keymap and its Windows/Linux Ctrl defaults. Agent commands such as slash commands and terminal editing keys belong to the agent itself.
 

@@ -7,6 +7,33 @@ pub trait TerminalHost: Send + Sync + 'static {
     fn set_live_title(&self, session_id: &str, title: &str) -> Result<()>;
     fn resize(&self, session_id: &str, cols: u16, rows: u16) -> Result<()>;
     fn is_local_host(&self, host: &str) -> bool;
+    /// An OSC 52 write from the program in the pane; `text` is never empty and
+    /// at most [`MAX_CLIPBOARD_BYTES`].
+    fn clipboard_store(&self, session_id: &str, target: ClipboardTarget, text: &str);
+}
+
+pub const MAX_CLIPBOARD_BYTES: usize = 1 << 20;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClipboardTarget {
+    Clipboard,
+    /// The primary selection on Linux; the clipboard elsewhere.
+    Selection,
+}
+impl ClipboardTarget {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Clipboard => "clipboard",
+            Self::Selection => "selection",
+        }
+    }
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "clipboard" => Some(Self::Clipboard),
+            "selection" => Some(Self::Selection),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -20,6 +47,7 @@ pub struct ModelOptions {
 
 pub struct TerminalModel {
     workers: Mutex<Vec<thread::JoinHandle<()>>>,
+    stopped: Arc<AtomicBool>,
     pub term: Arc<FairMutex<Term<EventProxy>>>,
     host: Arc<dyn TerminalHost>,
     session_id: String,
@@ -32,6 +60,7 @@ pub struct TerminalModel {
     scheme: Arc<SchemeState>,
     events: Sender<Event>,
     input_tracker: Mutex<InputTracker>,
+    publish_order: Mutex<()>,
     initial_observation: InputObservation,
     fixture_recorder: Option<FixtureRecorder>,
     cwd_reports: Option<Mutex<CwdReports>>,
@@ -75,6 +104,12 @@ impl TerminalModel {
     pub fn take_workers(&self) -> Vec<thread::JoinHandle<()>> {
         std::mem::take(&mut *self.workers.lock().unwrap())
     }
+    pub fn stop_workers(&self) -> Vec<thread::JoinHandle<()>> {
+        self.stopped.store(true, Ordering::Release);
+        let _ = self.events.send(Event::Wakeup);
+        let _ = self.sync_flush.send(());
+        self.take_workers()
+    }
     pub fn new(
         host: Arc<dyn TerminalHost>,
         session_id: String,
@@ -84,6 +119,7 @@ impl TerminalModel {
     ) -> Result<Arc<Self>> {
         let (events, rx) = mpsc::channel();
         let (sync_flush, sync_flush_requests) = mpsc::channel();
+        let stopped = Arc::new(AtomicBool::new(false));
         let term = Arc::new(FairMutex::new(Term::new(
             term_config(),
             &TermSize::new(cols as usize, rows as usize),
@@ -97,7 +133,7 @@ impl TerminalModel {
         let scheme = Arc::new(SchemeState::default());
         let palette = Arc::new(Mutex::new(PaletteState::new(palette::RUNNER)));
         let now = Instant::now();
-        let mut input_tracker = InputTracker::new(now);
+        let mut input_tracker = InputTracker::for_session(session_id.clone(), now);
         let initial_observation = input_tracker.initial_observation(now);
         let fixture_recorder = match FixtureRecorder::from_env(&session_id, cols, rows) {
             Ok(recorder) => recorder,
@@ -108,6 +144,7 @@ impl TerminalModel {
         };
         let model = Arc::new(Self {
             workers: Mutex::default(),
+            stopped: Arc::clone(&stopped),
             term: Arc::clone(&term),
             host: Arc::clone(&host),
             session_id: session_id.clone(),
@@ -120,6 +157,7 @@ impl TerminalModel {
             scheme: Arc::clone(&scheme),
             events,
             input_tracker: Mutex::new(input_tracker),
+            publish_order: Mutex::default(),
             initial_observation,
             fixture_recorder,
             cwd_reports: options.shell.then(Mutex::default),
@@ -129,6 +167,7 @@ impl TerminalModel {
             codex_native_attention: options.codex_native_attention,
         });
         let term_for_events = Arc::downgrade(&term);
+        let events_stopped = Arc::clone(&stopped);
         let worker = thread::Builder::new()
             .name(format!("native-term-events-{session_id}"))
             .spawn(move || {
@@ -136,6 +175,9 @@ impl TerminalModel {
                     let _ = host.write_reply(&session_id, bytes);
                 };
                 while let Ok(event) = rx.recv() {
+                    if events_stopped.load(Ordering::Acquire) {
+                        break;
+                    }
                     match event {
                         Event::PtyWrite(text) if text == SCHEME_PROBE_UNSUPPORTED => {
                             let state = if scheme.subscribed.load(Ordering::Relaxed) {
@@ -220,6 +262,15 @@ impl TerminalModel {
                                 }
                             }
                         }
+                        Event::ClipboardStore(target, text)
+                            if !text.is_empty() && text.len() <= MAX_CLIPBOARD_BYTES =>
+                        {
+                            let target = match target {
+                                ClipboardType::Clipboard => ClipboardTarget::Clipboard,
+                                ClipboardType::Selection => ClipboardTarget::Selection,
+                            };
+                            host.clipboard_store(&session_id, target, &text);
+                        }
                         _ => {}
                     }
                 }
@@ -232,6 +283,9 @@ impl TerminalModel {
             .spawn(move || {
                 while sync_flush_requests.recv().is_ok() {
                     loop {
+                        if stopped.load(Ordering::Acquire) {
+                            return;
+                        }
                         let Some(next) = weak.upgrade().map(|model| model.flush_sync_update())
                         else {
                             return;
@@ -253,6 +307,9 @@ impl TerminalModel {
     }
 
     pub fn feed_output(&self, seq: u64, bytes: &[u8]) -> Option<InputObservation> {
+        if self.stopped.load(Ordering::Acquire) {
+            return None;
+        }
         let now = Instant::now();
         let mut sequence = self.sequence.lock().unwrap();
         if seq <= sequence.last {
@@ -273,6 +330,7 @@ impl TerminalModel {
                         *self.pending_program_status.lock().unwrap() = Some((seq, report));
                     }
                 }
+                crate::program_status::Event::Shell(_) => {}
             }
         }
         queries.sort_by_key(|(end, _)| *end);
@@ -352,10 +410,18 @@ impl TerminalModel {
         *self.pending_program_status.lock().unwrap() = None;
     }
 
+    /// Callers publish after releasing the tracker, so each publication reports the tracker's
+    /// latest observation in order: a delayed caller cannot replace a newer state with its own.
     pub fn publish_input(&self, observation: Option<InputObservation>) {
-        if let Some(observation) = observation {
-            self.host.report_input_state(&self.session_id, observation);
+        if self.stopped.load(Ordering::Acquire) {
+            return;
         }
+        if observation.is_none() {
+            return;
+        }
+        let _order = self.publish_order.lock().unwrap();
+        let latest = self.input_tracker.lock().unwrap().latest_observation();
+        self.host.report_input_state(&self.session_id, latest);
     }
 
     fn flush_sync_update(&self) -> Option<Instant> {
@@ -415,6 +481,9 @@ impl TerminalModel {
     }
 
     pub fn write_input(&self, bytes: &[u8]) -> Result<()> {
+        if self.stopped.load(Ordering::Acquire) {
+            anyhow::bail!("terminal stopped");
+        }
         self.host.write_input(&self.session_id, bytes)
     }
     pub fn size(&self) -> (u16, u16) {
@@ -481,8 +550,25 @@ impl TerminalModel {
         let term = self.term.lock_unfair();
         tracker.track_delivery_submit(Instant::now(), &term);
     }
+    pub fn confirm_delivery(&self, revision: u64) -> Option<InputObservation> {
+        self.input_tracker
+            .lock()
+            .unwrap()
+            .confirm_delivery(revision, Instant::now())
+    }
+    pub fn recheck_delivery(&self) {
+        let observation = {
+            let mut tracker = self.input_tracker.lock().unwrap();
+            let term = self.term.lock_unfair();
+            tracker.recheck_delivery(Instant::now(), &term)
+        };
+        self.publish_input(observation);
+    }
     pub fn input_reset_guard(&self) -> u64 {
         self.input_tracker.lock().unwrap().reset_guard()
+    }
+    pub fn delivery_held(&self) -> bool {
+        self.input_tracker.lock().unwrap().delivery_held()
     }
     pub fn reset_input_state(&self, guard: u64) {
         let observation = self
@@ -551,6 +637,28 @@ mod delivery_tests {
         fn is_local_host(&self, _: &str) -> bool {
             true
         }
+        fn clipboard_store(&self, _: &str, _: ClipboardTarget, _: &str) {}
+    }
+
+    #[test]
+    fn stopped_workers_join_while_the_model_is_still_retained() {
+        let model = TerminalModel::new(
+            Arc::new(Host::default()),
+            "stopped".into(),
+            80,
+            4,
+            ModelOptions::default(),
+        )
+        .unwrap();
+        model.feed_output(1, b"\x1b[?2026hbuffered update");
+        let workers = model.stop_workers();
+        assert_eq!(workers.len(), 2);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert!(model.stop_workers().is_empty());
+        assert!(model.feed_output(2, b"\x1b]10;?\x1b\\").is_none());
+        assert!(model.write_input(b"late input").is_err());
     }
 
     #[test]
@@ -577,6 +685,7 @@ mod delivery_tests {
             fn is_local_host(&self, _: &str) -> bool {
                 true
             }
+            fn clipboard_store(&self, _: &str, _: ClipboardTarget, _: &str) {}
         }
         for terminator in ["\x07", "\x1b\\"] {
             let bytes = format!("\x1b]7501;?{terminator}\x1b[c");
@@ -692,6 +801,108 @@ mod delivery_tests {
         drop(model);
         for worker in workers {
             worker.join().unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::*;
+    use base64::Engine as _;
+
+    #[derive(Default)]
+    struct Host {
+        stores: Mutex<Vec<(ClipboardTarget, String)>>,
+        replies: Mutex<Vec<Vec<u8>>>,
+    }
+    impl TerminalHost for Host {
+        fn write_input(&self, _: &str, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        fn write_reply(&self, _: &str, bytes: &[u8]) -> Result<()> {
+            if !bytes.is_empty() {
+                self.replies.lock().unwrap().push(bytes.to_vec());
+            }
+            Ok(())
+        }
+        fn report_input_state(&self, _: &str, _: InputObservation) {}
+        fn set_live_title(&self, _: &str, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn resize(&self, _: &str, _: u16, _: u16) -> Result<()> {
+            Ok(())
+        }
+        fn is_local_host(&self, _: &str) -> bool {
+            true
+        }
+        fn clipboard_store(&self, session_id: &str, target: ClipboardTarget, text: &str) {
+            assert_eq!(session_id, "osc52");
+            self.stores.lock().unwrap().push((target, text.to_owned()));
+        }
+    }
+
+    fn feed(output: &[u8]) -> Arc<Host> {
+        let host = Arc::new(Host::default());
+        let model =
+            TerminalModel::new(host.clone(), "osc52".into(), 80, 4, ModelOptions::default())
+                .unwrap();
+        model.feed_output(1, output);
+        model.flush_events();
+        let workers = model.take_workers();
+        drop(model);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        host
+    }
+
+    fn osc52(selector: &str, payload: &str, terminator: &str) -> Vec<u8> {
+        format!("\x1b]52;{selector};{payload}{terminator}").into_bytes()
+    }
+
+    fn encode(text: &str) -> String {
+        base64::engine::general_purpose::STANDARD.encode(text)
+    }
+
+    #[test]
+    fn osc52_writes_reach_the_host_decoded() {
+        for terminator in ["\x07", "\x1b\\"] {
+            let host = feed(&osc52("c", &encode("runner-osc52 ✓"), terminator));
+            assert_eq!(
+                *host.stores.lock().unwrap(),
+                [(ClipboardTarget::Clipboard, "runner-osc52 ✓".to_owned())]
+            );
+        }
+        for selector in ["p", "s"] {
+            let host = feed(&osc52(selector, &encode("primary"), "\x07"));
+            assert_eq!(
+                *host.stores.lock().unwrap(),
+                [(ClipboardTarget::Selection, "primary".to_owned())]
+            );
+        }
+    }
+
+    #[test]
+    fn empty_oversize_and_invalid_osc52_writes_are_ignored() {
+        let largest = "a".repeat(MAX_CLIPBOARD_BYTES);
+        let host = feed(&osc52("c", &encode(&largest), "\x07"));
+        assert_eq!(host.stores.lock().unwrap().len(), 1);
+        for payload in [
+            String::new(),
+            encode(&format!("{largest}a")),
+            "not base64!".into(),
+        ] {
+            let host = feed(&osc52("c", &payload, "\x07"));
+            assert!(host.stores.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn osc52_reads_are_refused_without_a_reply() {
+        for terminator in ["\x07", "\x1b\\"] {
+            let host = feed(&osc52("c", "?", terminator));
+            assert!(host.stores.lock().unwrap().is_empty());
+            assert!(host.replies.lock().unwrap().is_empty());
         }
     }
 }

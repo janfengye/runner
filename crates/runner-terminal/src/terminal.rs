@@ -13,8 +13,8 @@ use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::test::TermSize;
-use alacritty_terminal::term::{Config, Term, TermMode};
-use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle, KeyboardModes};
+use alacritty_terminal::term::{ClipboardType, Config, Term, TermMode};
+use alacritty_terminal::vte::ansi::{CursorShape, CursorStyle, Handler, KeyboardModes};
 use anyhow::{Context as _, Result};
 use regex::Regex;
 use runner_core::protocol::terminal::{
@@ -23,8 +23,9 @@ use runner_core::protocol::terminal::{
 };
 use runner_core::protocol::{ClientError, ClientEvent, DaemonClient};
 
+pub mod find;
 mod model;
-pub use model::{ModelOptions, TerminalHost, TerminalModel};
+pub use model::{ClipboardTarget, ModelOptions, TerminalHost, TerminalModel, MAX_CLIPBOARD_BYTES};
 
 use crate::palette;
 use crate::{
@@ -311,6 +312,100 @@ struct ParserState {
     processor: crate::snapshot::TrackedProcessor,
     flush_scheduled: bool,
     boundary: crate::snapshot::BoundaryScanner,
+    burst: BurstHold,
+}
+
+/// A remote mirror receives an agent's full-history reprint, sent when its
+/// terminal is resized, as many relay chunks. Painting each chunk scrolls the
+/// view through the whole history, so a clear-scrollback or a large volume
+/// holds parsing until the stream is briefly quiet, and never past the cap.
+/// Typing echo is far below the volume threshold and is parsed at once. An
+/// explicit synchronized update stays with vte: the chunk that opens one, and
+/// every chunk while one is open, releases anything held and is parsed at once.
+const BURST_WINDOW: Duration = Duration::from_millis(100);
+const BURST_BYTES: usize = 32 * 1024;
+const BURST_QUIET: Duration = Duration::from_millis(80);
+const BURST_CAP: Duration = Duration::from_millis(500);
+const BURST_MAX_HELD: usize = 2 * 1024 * 1024;
+const CLEAR_SCROLLBACK: &[u8] = b"\x1b[3J";
+const BEGIN_SYNC: &[u8] = b"\x1b[?2026h";
+
+#[derive(Default)]
+struct BurstHold {
+    window: Option<(Instant, usize)>,
+    held: Vec<u8>,
+    holding: Option<(Instant, Instant)>,
+    // The stream's last bytes, so a marker split across chunks is still seen.
+    tail: Vec<u8>,
+}
+
+#[derive(Debug, PartialEq)]
+enum Burst {
+    Pass,
+    Held,
+    Release(Vec<u8>),
+}
+
+impl BurstHold {
+    fn feed(&mut self, bytes: &[u8], now: Instant, synchronized: bool) -> Burst {
+        let begins_sync = self.contains(bytes, BEGIN_SYNC);
+        let clears = self.contains(bytes, CLEAR_SCROLLBACK);
+        self.tail.extend_from_slice(bytes);
+        let excess = self.tail.len().saturating_sub(BEGIN_SYNC.len() - 1);
+        self.tail.drain(..excess);
+        if synchronized || begins_sync {
+            if self.holding.is_none() {
+                self.window = None;
+                return Burst::Pass;
+            }
+            self.held.extend_from_slice(bytes);
+            return Burst::Release(self.take());
+        }
+        let started = match self.holding {
+            Some((started, _)) => started,
+            None => {
+                let total = match self.window {
+                    Some((start, total)) if now.duration_since(start) <= BURST_WINDOW => {
+                        self.window = Some((start, total + bytes.len()));
+                        total + bytes.len()
+                    }
+                    _ => {
+                        self.window = Some((now, bytes.len()));
+                        bytes.len()
+                    }
+                };
+                if total < BURST_BYTES && !clears {
+                    return Burst::Pass;
+                }
+                now
+            }
+        };
+        self.held.extend_from_slice(bytes);
+        self.holding = Some((started, now));
+        if self.held.len() >= BURST_MAX_HELD || now >= started + BURST_CAP {
+            return Burst::Release(self.take());
+        }
+        Burst::Held
+    }
+
+    fn contains(&self, bytes: &[u8], marker: &[u8]) -> bool {
+        let tail = &self.tail[self.tail.len().saturating_sub(marker.len() - 1)..];
+        let mut edge = tail.to_vec();
+        edge.extend_from_slice(&bytes[..bytes.len().min(marker.len() - 1)]);
+        edge.windows(marker.len()).any(|window| window == marker)
+            || bytes.windows(marker.len()).any(|window| window == marker)
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.holding
+            .map(|(started, last)| (last + BURST_QUIET).min(started + BURST_CAP))
+    }
+
+    fn take(&mut self) -> Vec<u8> {
+        self.window = None;
+        self.holding = None;
+        std::mem::take(&mut self.held)
+    }
 }
 
 #[derive(Default)]
@@ -351,7 +446,11 @@ impl PaletteState {
 }
 
 fn parse(parser: &mut ParserState, term: &mut Term<EventProxy>, bytes: &[u8]) {
-    parser.processor.advance(term, bytes);
+    parse_with(parser, term, bytes);
+}
+
+fn parse_with<H: Handler>(parser: &mut ParserState, handler: &mut H, bytes: &[u8]) {
+    parser.processor.advance(handler, bytes);
     let held = parser
         .processor
         .sync_timeout()
@@ -379,6 +478,14 @@ pub struct TerminalMirror {
     frame_worker: Mutex<Option<FrameWorker>>,
     link_cwd: std::sync::OnceLock<Option<PathBuf>>,
     config: Mutex<Config>,
+    coalesce_bursts: bool,
+    /// Written only while the term is locked, so a reader holding the term
+    /// lock sees the mark that matches the grid.
+    scroll_mark: Mutex<find::ScrollMark>,
+    viewport_holds: Arc<AtomicUsize>,
+    /// Keys, typed text and pastes sent, so a blinking cursor shows again
+    /// before the echo arrives.
+    typed: AtomicU64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -417,6 +524,18 @@ pub struct TerminalView {
 impl Drop for TerminalView {
     fn drop(&mut self) {
         self.viewers.fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// While any hold is alive, output arriving at the bottom of the scrollback
+/// scrolls the viewport back so it stays on the same content.
+pub struct ViewportHold {
+    holds: Arc<AtomicUsize>,
+}
+
+impl Drop for ViewportHold {
+    fn drop(&mut self) {
+        self.holds.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -474,7 +593,11 @@ impl TerminalMirror {
                         return;
                     };
                     match frame {
-                        TerminalFrame::Output { seq, bytes } => mirror.feed_output(seq, &bytes),
+                        TerminalFrame::Output { seq, bytes } => {
+                            if !mirror.feed_output(seq, &bytes) {
+                                continue;
+                            }
+                        }
                         TerminalFrame::Resized {
                             seq,
                             cols,
@@ -484,6 +607,10 @@ impl TerminalMirror {
                             let mut sequence = mirror.sequence.lock().unwrap();
                             if seq > sequence.last {
                                 sequence.last = seq;
+                                mirror.release_burst(
+                                    &mut sequence,
+                                    &mut mirror.parser.lock().unwrap(),
+                                );
                                 mirror.resize_local(cols, rows);
                                 let changed = mirror.apply_controller(controller);
                                 if changed {
@@ -536,6 +663,24 @@ impl TerminalMirror {
         session_id: String,
         waker: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<Arc<Self>> {
+        Self::connect(client, session_id, waker, false)
+    }
+
+    /// A mirror of another computer's terminal, which paints output bursts once.
+    pub fn attach_remote(
+        client: DaemonClient,
+        session_id: String,
+        waker: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<Arc<Self>> {
+        Self::connect(client, session_id, waker, true)
+    }
+
+    fn connect(
+        client: DaemonClient,
+        session_id: String,
+        waker: Arc<dyn Fn() + Send + Sync>,
+        coalesce_bursts: bool,
+    ) -> Result<Arc<Self>> {
         let attachment = client.attach(&session_id)?;
         let (events, discarded) = mpsc::channel();
         drop(discarded);
@@ -578,6 +723,10 @@ impl TerminalMirror {
             frame_worker: Mutex::default(),
             link_cwd: std::sync::OnceLock::new(),
             config: Mutex::new(term_config()),
+            coalesce_bursts,
+            scroll_mark: Mutex::default(),
+            viewport_holds: Arc::default(),
+            typed: AtomicU64::new(0),
         });
         mirror.restore(&attachment);
         mirror.refresh_metadata();
@@ -588,7 +737,7 @@ impl TerminalMirror {
             .spawn(move || {
                 while requests.recv().is_ok() {
                     loop {
-                        let Some(next) = weak.upgrade().map(|mirror| mirror.flush_sync_update())
+                        let Some(next) = weak.upgrade().map(|mirror| mirror.flush_held_output())
                         else {
                             return;
                         };
@@ -646,6 +795,7 @@ impl TerminalMirror {
             TermMode::empty(),
             attachment.snapshot.seq,
         );
+        self.scroll_mark.lock().unwrap().rebuild();
         *self.size.lock().unwrap() = (attachment.snapshot.cols, attachment.snapshot.rows);
         self.apply_controller(attachment.snapshot.controller.clone());
         self.subscriber_id
@@ -680,13 +830,15 @@ impl TerminalMirror {
     pub fn palette(&self) -> palette::TerminalPalette {
         self.palette.lock().unwrap().theme
     }
-    pub fn configure(&self, scrollback: usize, cursor_shape: CursorShape) {
+    /// `blinking` is the default cursor's; a program's DECSCUSR still sets
+    /// its own. It stays app-side: runnerd's model never draws a cursor.
+    pub fn configure(&self, scrollback: usize, cursor_shape: CursorShape, blinking: bool) {
         let config = Config {
             scrolling_history: scrollback,
             semantic_escape_chars: XTERM_WORD_SEPARATORS.to_owned(),
             default_cursor_style: CursorStyle {
                 shape: cursor_shape,
-                blinking: true,
+                blinking,
             },
             ..term_config()
         };
@@ -713,54 +865,136 @@ impl TerminalMirror {
             last_output_at: sequence.last_output_at,
         }
     }
-    fn feed_output(&self, seq: u64, bytes: &[u8]) {
+    /// Returns whether the bytes reached the terminal; a held burst has not.
+    fn feed_output(&self, seq: u64, bytes: &[u8]) -> bool {
         let mut sequence = self.sequence.lock().unwrap();
         if seq <= sequence.last {
-            return;
+            return false;
         }
+        let now = Instant::now();
         sequence.last = seq;
-        sequence.last_output_at = Some(Instant::now());
+        sequence.last_output_at = Some(now);
         if chunk_indicates_tui_ready(bytes) {
             sequence.tui_ready_seq = sequence.tui_ready_seq.max(seq);
         }
         let mut parser = self.parser.lock().unwrap();
+        let released;
+        let bytes = if self.coalesce_bursts {
+            let synchronized = parser.processor.sync_timeout().sync_timeout().is_some();
+            match parser.burst.feed(bytes, now, synchronized) {
+                Burst::Pass => bytes,
+                Burst::Held => {
+                    if !std::mem::replace(&mut parser.flush_scheduled, true) {
+                        let _ = self.sync_flush.send(());
+                    }
+                    return false;
+                }
+                Burst::Release(held) => {
+                    released = held;
+                    &released
+                }
+            }
+        } else {
+            bytes
+        };
         let mut term = self.term.lock();
         let previous = *term.mode();
-        parse(&mut parser, &mut term, bytes);
+        self.track_scroll(&mut term, |tracker| parse_with(&mut parser, tracker, bytes));
         mark_paint(&mut sequence, &mut term, previous, seq);
         if parser.processor.sync_timeout().sync_timeout().is_some()
             && !std::mem::replace(&mut parser.flush_scheduled, true)
         {
             let _ = self.sync_flush.send(());
         }
+        true
     }
-    fn flush_sync_update(&self) -> Option<Instant> {
-        let mut sequence = self.sequence.lock().unwrap();
-        let mut parser = self.parser.lock().unwrap();
-        match parser.processor.sync_timeout().sync_timeout() {
-            Some(deadline) if deadline > Instant::now() => return Some(deadline),
-            Some(_) => {}
-            None => {
-                parser.flush_scheduled = false;
-                return None;
-            }
+    fn release_burst(&self, sequence: &mut SequenceState, parser: &mut ParserState) -> bool {
+        if parser.burst.deadline().is_none() {
+            return false;
         }
+        let held = parser.burst.take();
         let mut term = self.term.lock();
         let previous = *term.mode();
-        parser.processor.stop_sync(&mut *term);
-        parser.boundary.end_sync();
-        parser.flush_scheduled = false;
+        self.track_scroll(&mut term, |tracker| parse_with(parser, tracker, &held));
         let seq = sequence.last;
-        mark_paint(&mut sequence, &mut term, previous, seq);
-        drop(term);
+        mark_paint(sequence, &mut term, previous, seq);
+        true
+    }
+    fn flush_held_output(&self) -> Option<Instant> {
+        let mut sequence = self.sequence.lock().unwrap();
+        let mut parser = self.parser.lock().unwrap();
+        let now = Instant::now();
+        let mut flushed = parser
+            .burst
+            .deadline()
+            .is_some_and(|deadline| deadline <= now)
+            && self.release_burst(&mut sequence, &mut parser);
+        if parser
+            .processor
+            .sync_timeout()
+            .sync_timeout()
+            .is_some_and(|deadline| deadline <= now)
+        {
+            let mut term = self.term.lock();
+            let previous = *term.mode();
+            self.track_scroll(&mut term, |tracker| parser.processor.stop_sync(tracker));
+            parser.boundary.end_sync();
+            let seq = sequence.last;
+            mark_paint(&mut sequence, &mut term, previous, seq);
+            flushed = true;
+        }
+        let next = [
+            parser.burst.deadline(),
+            parser.processor.sync_timeout().sync_timeout(),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        if next.is_none() {
+            parser.flush_scheduled = false;
+        }
         drop(parser);
         drop(sequence);
-        self.wake_viewers();
-        None
+        if flushed {
+            self.wake_viewers();
+        }
+        next
     }
     fn wake_viewers(&self) {
         if self.viewers.load(Ordering::Acquire) > 0 {
             (self.waker)();
+        }
+    }
+
+    /// Feeds the term through a scroll tracker and records how far the
+    /// content moved. A held viewport at the bottom scrolls back by the same
+    /// amount, stopping at the oldest line; one already scrolled back is kept
+    /// in place by alacritty.
+    fn track_scroll(
+        &self,
+        term: &mut Term<EventProxy>,
+        apply: impl FnOnce(&mut find::ScrollTracker<'_, EventProxy>),
+    ) {
+        let display_offset = term.grid().display_offset();
+        let mut tracker = find::ScrollTracker::new(term);
+        apply(&mut tracker);
+        let moved = tracker.finish();
+        if let Some(lines) = moved.filter(|lines| *lines > 0) {
+            if display_offset == 0 && self.viewport_holds.load(Ordering::Acquire) > 0 {
+                term.scroll_display(Scroll::Delta(i32::try_from(lines).unwrap_or(i32::MAX)));
+            }
+        }
+        self.scroll_mark.lock().unwrap().advance(moved);
+    }
+
+    pub fn scroll_mark(&self) -> find::ScrollMark {
+        *self.scroll_mark.lock().unwrap()
+    }
+
+    pub fn hold_viewport(&self) -> ViewportHold {
+        self.viewport_holds.fetch_add(1, Ordering::AcqRel);
+        ViewportHold {
+            holds: Arc::clone(&self.viewport_holds),
         }
     }
     pub fn submit_text(&self, text: &str) -> std::result::Result<(), ClientError> {
@@ -783,14 +1017,14 @@ impl TerminalMirror {
         shift: bool,
         key_char: Option<&str>,
     ) -> std::result::Result<bool, ClientError> {
-        let input = InputEvent::Key {
-            kind: crate::mappings::classify_key(key, ctrl, alt, shift, key_char),
-        };
         let mode = *self.term.lock_unfair().mode();
+        let input = InputEvent::Key {
+            kind: crate::mappings::classify_key(mode, key, ctrl, alt, shift, key_char),
+        };
         match crate::mappings::encode_key(key, ctrl, alt, shift, key_char, mode) {
             Some(bytes) => {
                 self.observe_input(&input);
-                self.write_user_bytes(&bytes)?;
+                self.write_typed_bytes(&bytes)?;
                 Ok(true)
             }
             None => Ok(false),
@@ -805,7 +1039,7 @@ impl TerminalMirror {
                 text: text.to_owned(),
             },
         });
-        self.write_user_bytes(text.as_bytes())
+        self.write_typed_bytes(text.as_bytes())
     }
     pub fn set_composing(self: &Arc<Self>, composing: bool) {
         let mut pending = self.composition_clear_pending.lock().unwrap();
@@ -865,7 +1099,19 @@ impl TerminalMirror {
         self.observe_input(&InputEvent::Paste {
             text: text.to_owned(),
         });
-        self.write_user_bytes(&crate::mappings::encode_paste(text, bracketed))
+        self.write_typed_bytes(&crate::mappings::encode_paste(text, bracketed))
+    }
+    fn write_typed_bytes(&self, bytes: &[u8]) -> std::result::Result<(), ClientError> {
+        self.write_user_bytes(bytes)?;
+        if self.control().desktop() {
+            self.typed.fetch_add(1, Ordering::Relaxed);
+            (self.waker)();
+        }
+        Ok(())
+    }
+    /// How many keys, typed texts and pastes this mirror has sent.
+    pub fn typed_count(&self) -> u64 {
+        self.typed.load(Ordering::Relaxed)
     }
     fn observe_input(&self, input: &InputEvent) {
         if !self.control().desktop() {
@@ -941,6 +1187,9 @@ impl TerminalMirror {
         let mut term = self.term.lock();
         let mut size = self.size.lock().unwrap();
         let rows_changed = size.1 != rows;
+        if *size != (cols, rows) {
+            self.scroll_mark.lock().unwrap().rebuild();
+        }
         *size = (cols, rows);
         term.resize(TermSize::new(cols as usize, rows as usize));
         if rows_changed {
@@ -1699,8 +1948,9 @@ impl TerminalMirror {
         }
     }
     pub fn test_feed(&self, seq: u64, bytes: &[u8]) {
-        self.feed_output(seq, bytes);
-        self.wake_viewers();
+        if self.feed_output(seq, bytes) {
+            self.wake_viewers();
+        }
     }
     pub fn sync_state(&self) -> (Option<Instant>, usize, bool) {
         let parser = self.parser.lock().unwrap();
@@ -1722,538 +1972,4 @@ impl runner_core::protocol::terminal::TerminalLifecycle for TerminalBridge {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn link_term(columns: usize, bytes: &[u8]) -> Term<alacritty_terminal::event::VoidListener> {
-        let mut term = Term::new(
-            Config::default(),
-            &TermSize::new(columns, 8),
-            alacritty_terminal::event::VoidListener,
-        );
-        crate::snapshot::TrackedProcessor::new().advance(&mut term, bytes);
-        term
-    }
-
-    #[test]
-    fn terminal_links_follow_fragmented_osc_8_in_table_cells() {
-        let uri = "https://www.shopneighbour.com/en-us/collections/all-exclusions-cant-discount/products/our-legacy-mens-third-cut-blue-selvage";
-        let rows = [
-            vec!["Blue Selvedge at Neighbour", " (", "https://"],
-            vec!["www.shopneighbour.com/en", "-us/"],
-            vec!["collections/all-exclusions-cant-"],
-            vec!["discount/products/our-legacy-mens-"],
-            vec!["third-cut-blue-selvage", ")"],
-        ];
-        let mut bytes = String::new();
-        let mut linked_points = Vec::new();
-        let mut unlinked_points = Vec::new();
-        for (line, fragments) in rows.iter().enumerate() {
-            if line > 0 {
-                bytes.push_str("\r\n");
-            }
-            bytes.push_str("  ");
-            let mut column = 2;
-            for fragment in fragments {
-                let linked = !matches!(*fragment, " (" | ")");
-                if linked {
-                    bytes.push_str(&format!("\x1b]8;;{uri}\x1b\\\x1b[4;34m"));
-                }
-                bytes.push_str(fragment);
-                for offset in 0..fragment.len() {
-                    let point = Point::new(Line(line as i32), Column(column + offset));
-                    if linked {
-                        linked_points.push(point);
-                    } else {
-                        unlinked_points.push(point);
-                    }
-                }
-                if linked {
-                    bytes.push_str("\x1b[0m\x1b]8;;\x1b\\");
-                }
-                column += fragment.len();
-            }
-            bytes.push_str(&" ".repeat(38 - column));
-            bytes.push_str("│ ");
-            bytes.push_str(&format!("\x1b]8;;{uri}\x1b\\other cell\x1b]8;;\x1b\\"));
-            unlinked_points.push(Point::new(Line(line as i32), Column(38)));
-            unlinked_points.push(Point::new(Line(line as i32), Column(40)));
-            unlinked_points.push(Point::new(Line(line as i32), Column(0)));
-        }
-        let term = link_term(72, bytes.as_bytes());
-        let expected = terminal_link_at(&term, linked_points[0], &[]).unwrap();
-        assert_eq!(expected.target, LinkTarget::Url(uri.into()));
-        assert_eq!(expected.start, linked_points[0]);
-        assert_eq!(expected.end, *linked_points.last().unwrap());
-        for point in linked_points {
-            assert!(expected.contains(point), "missing linked cell {point:?}");
-            assert_eq!(terminal_link_at(&term, point, &[]), Some(expected.clone()));
-        }
-        for point in unlinked_points {
-            assert!(
-                !expected.contains(point),
-                "included unlinked cell {point:?}"
-            );
-        }
-        let restored = link_term(72, &crate::snapshot::serialize(&term, &[]));
-        assert_eq!(
-            terminal_link_at(&restored, Point::new(Line(1), Column(4)), &[]),
-            Some(expected)
-        );
-    }
-
-    #[test]
-    fn terminal_links_keep_unrelated_osc_8_rows_separate() {
-        for separator in [
-            "",
-            "────────────────────",
-            "\x1b]8;;https://other.example\x1b\\other\x1b]8;;\x1b\\",
-        ] {
-            let bytes = format!(
-                "\x1b]8;;https://example.com\x1b\\first\x1b]8;;\x1b\\\r\n  \x1b]8;;https://example.com\x1b\\continued\x1b]8;;\x1b\\\r\n{separator}\r\n\x1b]8;;https://example.com\x1b\\separate\x1b]8;;\x1b\\"
-            );
-            let term = link_term(40, bytes.as_bytes());
-            let first = terminal_link_at(&term, Point::new(Line(0), Column(1)), &[]).unwrap();
-            let separate = terminal_link_at(&term, Point::new(Line(3), Column(1)), &[]).unwrap();
-            assert_eq!(first.end, Point::new(Line(1), Column(10)));
-            assert_eq!(separate.start, Point::new(Line(3), Column(0)));
-            assert!(!first.contains(separate.start));
-            assert!(!separate.contains(first.start));
-        }
-    }
-
-    #[test]
-    fn terminal_links_follow_indented_underlined_url_rows() {
-        let term = link_term(
-            30,
-            b"  (\x1b[4;34mhttps://example.com/repo/\x1b[0m\r\n  \x1b[4;34mcommit/abc123\x1b[0m).",
-        );
-        let first = terminal_link_at(&term, Point::new(Line(0), Column(5)), &[]).unwrap();
-        let continuation =
-            terminal_link_at(&term, Point::new(Line(1), Column(3)), &[]).expect("URL continuation");
-        assert_eq!(first, continuation);
-        assert_eq!(
-            first.target,
-            LinkTarget::Url("https://example.com/repo/commit/abc123".into())
-        );
-        assert_eq!(first.start, Point::new(Line(0), Column(3)));
-        assert_eq!(first.end, Point::new(Line(1), Column(14)));
-        assert!(first.contains(Point::new(Line(0), Column(27))));
-        assert!(first.contains(Point::new(Line(1), Column(2))));
-        assert!(!first.contains(Point::new(Line(0), Column(28))));
-        assert!(!first.contains(Point::new(Line(1), Column(1))));
-        assert!(!first.contains(Point::new(Line(1), Column(15))));
-
-        let restored = link_term(30, &crate::snapshot::serialize(&term, &[]));
-        assert_eq!(
-            terminal_link_at(&restored, Point::new(Line(1), Column(3)), &[]),
-            Some(first)
-        );
-    }
-
-    #[test]
-    fn terminal_links_follow_osc_8_across_indented_rows() {
-        let term = link_term(
-            40,
-            b"\x1b]8;;https://example.com/target\x1b\\first row\x1b]8;;\x1b\\\r\n  \x1b]8;;https://example.com/target\x1b\\second row\x1b]8;;\x1b\\",
-        );
-        let first = terminal_link_at(&term, Point::new(Line(0), Column(1)), &[]).unwrap();
-        let second = terminal_link_at(&term, Point::new(Line(1), Column(3)), &[]).unwrap();
-        assert_eq!(first, second);
-        assert_eq!(first.end, Point::new(Line(1), Column(11)));
-        assert!(!first.contains(Point::new(Line(1), Column(0))));
-        assert!(!first.contains(Point::new(Line(0), Column(9))));
-    }
-
-    #[test]
-    fn terminal_links_keep_unrelated_hard_lines_separate() {
-        for bytes in [
-            b"https://example.com/path\r\n  continuation".as_slice(),
-            b"\x1b[4;34mhttps://example.com/path\x1b[0m\r\n  continuation",
-            b"\x1b[4;34mhttps://example.com/path\r\n  https://other.example/path",
-            b"\x1b[4;34mhttps://example.com/path\r\n  \x1b[31mcontinuation",
-            b"\x1b[4;34mhttps://example.com/path\r\n\r\n  continuation",
-            b"\x1b[4;34mhttps://example.com/path\r\n  www.b.example/two",
-            b"\x1b[4;34mhttps://example.com/path\r\n  docs/guide.md",
-            b"\x1b[4;34mSee https://example.com/path\r\n  and more text",
-        ] {
-            let term = link_term(40, bytes);
-            let first = terminal_link_at(&term, Point::new(Line(0), Column(4)), &[]).unwrap();
-            assert_eq!(
-                first.target,
-                LinkTarget::Url("https://example.com/path".into())
-            );
-            assert_eq!(first.end.line, Line(0));
-        }
-    }
-
-    #[test]
-    fn terminal_links_follow_three_rows_and_preserve_soft_wraps() {
-        let term = link_term(
-            30,
-            b"  (\x1b[4;34mhttps://example.com/repo/\x1b[0m\r\n  \x1b[4;34mcommit/abcdef0123456789/\x1b[0m\r\n  \x1b[4;34mabc123\x1b[0m.",
-        );
-        let first = terminal_link_at(&term, Point::new(Line(0), Column(4)), &[]).unwrap();
-        for line in 1..=2 {
-            assert_eq!(
-                terminal_link_at(&term, Point::new(Line(line), Column(3)), &[]),
-                Some(first.clone())
-            );
-            assert!(!first.contains(Point::new(Line(line), Column(0))));
-        }
-        assert_eq!(
-            first.target,
-            LinkTarget::Url("https://example.com/repo/commit/abcdef0123456789/abc123".into())
-        );
-
-        let term = link_term(14, b"xxhttps://example.com/path");
-        let first = terminal_link_at(&term, Point::new(Line(0), Column(3)), &[]).unwrap();
-        assert_eq!(
-            terminal_link_at(&term, Point::new(Line(1), Column(3)), &[]),
-            Some(first.clone())
-        );
-        assert_eq!(
-            first.target,
-            LinkTarget::Url("https://example.com/path".into())
-        );
-        assert_eq!(first.start, Point::new(Line(0), Column(2)));
-        assert_eq!(first.end, Point::new(Line(1), Column(11)));
-    }
-
-    #[test]
-    fn terminal_links_keep_underlined_file_rows_separate() {
-        let cwd = tempfile::tempdir().unwrap();
-        std::fs::create_dir(cwd.path().join("src")).unwrap();
-        for names in [
-            ["a", "b", "c"],
-            [
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                "ccccccccccccccccccccccccccccc",
-            ],
-        ] {
-            let mut bytes = String::from("\x1b[4;34m");
-            for (line, name) in names.iter().enumerate() {
-                std::fs::write(cwd.path().join(format!("src/{name}.rs")), "").unwrap();
-                if line > 0 {
-                    bytes.push_str("\r\n");
-                }
-                bytes.push_str(&format!("src/{name}.rs"));
-            }
-            let term = link_term(40, bytes.as_bytes());
-            for (line, name) in names.into_iter().enumerate() {
-                let link = terminal_link_at(
-                    &term,
-                    Point::new(Line(line as i32), Column(2)),
-                    &[cwd.path()],
-                )
-                .expect("independent file link");
-                assert_eq!(
-                    link.target,
-                    LinkTarget::File {
-                        path: cwd.path().join(format!("src/{name}.rs")),
-                        line: None,
-                        column: None,
-                    }
-                );
-                assert_eq!(link.start.line, link.end.line);
-            }
-        }
-    }
-
-    #[test]
-    fn terminal_links_do_not_join_an_underlined_scrollback_block() {
-        let mut bytes = String::from("\x1b[4;34m");
-        for line in 0..3000 {
-            if line > 0 {
-                bytes.push_str("\r\n");
-            }
-            bytes.push_str(&format!("row https://example.com/{line}"));
-        }
-        let term = link_term(40, bytes.as_bytes());
-        let point = Point::new(term.topmost_line(), Column(5));
-        let link = terminal_link_at(&term, point, &[]).unwrap();
-        assert_eq!(link.target, LinkTarget::Url("https://example.com/0".into()));
-        assert_eq!(link.start.line, point.line);
-        assert_eq!(link.end.line, point.line);
-    }
-
-    #[test]
-    fn terminal_links_keep_distinct_explicit_hyperlink_ids_separate() {
-        let term = link_term(
-            40,
-            b"\x1b]8;id=A;https://example.com\x1b\\first\x1b]8;id=B;https://example.com\x1b\\second\x1b]8;;\x1b\\\r\n\x1b]8;id=C;https://example.com\x1b\\third\x1b]8;;\x1b\\",
-        );
-        for (point, start, end) in [
-            (Point::new(Line(0), Column(1)), 0, 4),
-            (Point::new(Line(0), Column(6)), 5, 10),
-            (Point::new(Line(1), Column(1)), 0, 4),
-        ] {
-            let link = terminal_link_at(&term, point, &[]).unwrap();
-            assert_eq!(link.start, Point::new(point.line, Column(start)));
-            assert_eq!(link.end, Point::new(point.line, Column(end)));
-        }
-    }
-
-    #[test]
-    fn reconnect_cancels_an_idle_subscription_replaced_by_resync() {
-        use runner_core::protocol::terminal::{TerminalAttachment, TerminalSubscription};
-        use runner_core::protocol::{ClientError, EventSubscription, Request, Response, Transport};
-        use std::time::Duration;
-        type FrameResult = std::result::Result<TerminalFrame, ClientError>;
-        struct Frames {
-            rx: mpsc::Receiver<FrameResult>,
-            tx: mpsc::Sender<FrameResult>,
-            id: u64,
-            ready: mpsc::Sender<u64>,
-        }
-        impl TerminalSubscription for Frames {
-            fn recv(&mut self) -> std::result::Result<TerminalFrame, ClientError> {
-                self.rx.recv().unwrap()
-            }
-            fn cancellation(&self) -> Arc<dyn Fn() + Send + Sync> {
-                self.ready.send(self.id).unwrap();
-                let tx = self.tx.clone();
-                Arc::new(move || {
-                    let _ = tx.send(Err(ClientError::msg("cancelled")));
-                })
-            }
-        }
-        struct Mock {
-            senders: Mutex<Vec<mpsc::Sender<FrameResult>>>,
-            ready: mpsc::Sender<u64>,
-        }
-        impl Transport for Mock {
-            fn call(&self, _: Request) -> std::result::Result<Response, ClientError> {
-                Ok(Response::terminal_metadata(Ok(TerminalMetadata::default())))
-            }
-            fn subscribe(&self) -> Box<dyn EventSubscription> {
-                unreachable!()
-            }
-            fn attach(&self, _: &str) -> std::result::Result<TerminalAttachment, ClientError> {
-                let (tx, rx) = mpsc::channel();
-                let mut senders = self.senders.lock().unwrap();
-                let id = senders.len() as u64;
-                senders.push(tx.clone());
-                Ok(TerminalAttachment {
-                    subscriber_id: id,
-                    snapshot: runner_core::protocol::terminal::TerminalSnapshot {
-                        seq: 0,
-                        cols: 80,
-                        rows: 24,
-                        bytes: Vec::new(),
-                        unfinished_len: 0,
-                        preceding_char: None,
-                        controller: Default::default(),
-                    },
-                    frames: Box::new(Frames {
-                        rx,
-                        tx,
-                        id,
-                        ready: self.ready.clone(),
-                    }),
-                })
-            }
-        }
-        let (ready, installed) = mpsc::channel();
-        let host = Arc::new(Mock {
-            senders: Mutex::default(),
-            ready,
-        });
-        let mirror = TerminalMirror::attach(
-            DaemonClient::new(host.clone()),
-            "idle".into(),
-            Arc::new(|| {}),
-        )
-        .unwrap();
-        assert_eq!(installed.recv_timeout(Duration::from_secs(2)).unwrap(), 0);
-        host.senders.lock().unwrap()[0]
-            .send(Ok(TerminalFrame::Resync))
-            .unwrap();
-        assert_eq!(installed.recv_timeout(Duration::from_secs(2)).unwrap(), 1);
-        let next = mirror.clone();
-        let (done, result) = mpsc::channel();
-        let worker = thread::spawn(move || {
-            done.send(next.reattach()).unwrap();
-        });
-        result
-            .recv_timeout(Duration::from_secs(2))
-            .expect("reattach must wake an idle Resync subscription")
-            .unwrap();
-        worker.join().unwrap();
-        let frames = mirror.frame_worker.lock().unwrap().take().unwrap();
-        {
-            let state = frames.state.lock().unwrap();
-            state.stopped.store(true, Ordering::Release);
-            (state.cancel)();
-        }
-        frames.thread.join().unwrap();
-    }
-
-    #[test]
-    fn shared_parse_keeps_only_the_bytes_held_after_a_capacity_restart() {
-        let (tx, _) = mpsc::channel();
-        let mut term = Term::new(
-            Config::default(),
-            &TermSize::new(20, 5),
-            EventProxy {
-                tx,
-                waker: Arc::new(|| {}),
-            },
-        );
-        let mut parser = ParserState::default();
-        let mut first = b"\x1b[?2026h".to_vec();
-        first.resize(1024 * 1024, b'x');
-        let mut second = vec![b'y'; 1024 * 1024 - 12];
-        second.extend_from_slice(b"\x1b[?2026hheld");
-        for chunk in [first.as_slice(), second.as_slice(), b"z\x1b[?2026hnew"] {
-            parse(&mut parser, &mut term, chunk);
-        }
-        assert_eq!(parser.processor.sync_bytes_count(), 3);
-        assert_eq!(parser.boundary.unfinished().len(), 11);
-        assert_eq!(parser.boundary.unfinished(), b"\x1b[?2026hnew");
-    }
-
-    #[test]
-    fn shell_title_sanitization_preserves_content_and_bounds_the_label() {
-        assert_eq!(sanitize_title("  ⠋ shell ⠹  "), "  ⠋ shell ⠹  ");
-        assert_eq!(sanitize_title("A\nB\tC\u{2028}D"), "A B C D");
-        assert_eq!(sanitize_title(&"界".repeat(600)).chars().count(), 512);
-    }
-
-    fn osc7_payloads(chunks: &[&[u8]]) -> Vec<String> {
-        let mut reports = super::CwdReports::default();
-        chunks
-            .iter()
-            .flat_map(|chunk| reports.payloads(chunk))
-            .map(|payload| String::from_utf8(payload).unwrap())
-            .collect()
-    }
-
-    #[test]
-    fn osc7_reports_end_at_bel_or_st_across_any_chunk_split() {
-        let stream: &[u8] = "\x1b[31mls\x1b[0m\r\n\x1b]7;file://h/a\x07\x1b]0;title\x07\x1b]7;file://h/b%20c\x1b\\\x1b]8;;x\x1b\\$ "
-            .as_bytes();
-        let expected = vec!["file://h/a".to_string(), "file://h/b%20c".to_string()];
-        assert_eq!(osc7_payloads(&[stream]), expected);
-        for first in 0..=stream.len() {
-            for second in first..=stream.len() {
-                assert_eq!(
-                    osc7_payloads(&[&stream[..first], &stream[first..second], &stream[second..]]),
-                    expected,
-                    "split at {first} and {second}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn osc7_reports_abort_on_esc_can_and_sub_and_skip_overlong_payloads() {
-        assert_eq!(
-            osc7_payloads(&[b"\x1b]7;file:///a\x1b[0m\x1b]7;file:///b\x07"]),
-            vec!["file:///b"]
-        );
-        assert_eq!(
-            osc7_payloads(&[b"\x1b]7;file:///a\x1b", b"\x1b]7;file:///b\x07"]),
-            vec!["file:///b"]
-        );
-        assert_eq!(
-            osc7_payloads(&[b"\x1b]7;file:///a\x18 \x1b]7;file:///b\x1a \x1b]7;file:///c\x07"]),
-            vec!["file:///c"]
-        );
-        let overlong = format!("\x1b]7;file:///{}", "a".repeat(super::OSC7_MAX_PAYLOAD));
-        assert!(osc7_payloads(&[format!("{overlong}\x07").as_bytes()]).is_empty());
-        assert_eq!(
-            osc7_payloads(&[
-                overlong.as_bytes(),
-                b"aaaa\x07 \x1b]7;file:///ok\x1b",
-                b"\\"
-            ]),
-            vec!["file:///ok"]
-        );
-        // 0x9C ends a report only as C1 ST, never inside UTF-8 text: 朝 is E6 9C 9D.
-        assert_eq!(
-            osc7_payloads(&["\x1b]7;file:///tmp/朝\x07".as_bytes()]),
-            vec!["file:///tmp/朝"]
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn osc7_reports_name_an_absolute_directory_on_this_machine() {
-        let parse = |uri: &str| {
-            super::parse_cwd_report(uri.as_bytes(), &|host| {
-                matches!(host, "" | "localhost" | "test-host")
-            })
-        };
-        let host = "test-host";
-        let label = host.split('.').next().unwrap().to_owned();
-        let tmp = Some(std::path::PathBuf::from("/tmp/a b/中文"));
-        assert_eq!(parse("file:///tmp/a%20b/%E4%B8%AD%E6%96%87"), tmp);
-        assert_eq!(parse("file://localhost/tmp/a b/中文"), tmp);
-        assert_eq!(parse("FILE://local%68ost/tmp/a%20b/中文"), tmp);
-        assert_eq!(parse(&format!("file://{host}/tmp/a%20b/中文")), tmp);
-        assert_eq!(parse(&format!("file://{label}/tmp/a%20b/中文")), tmp);
-        assert_eq!(parse("file:///tmp/x?query#fragment"), Some("/tmp/x".into()));
-        for ignored in [
-            "file://runner-575-elsewhere.invalid/tmp",
-            "kitty-shell-cwd://localhost/tmp",
-            "http://localhost/tmp",
-            "file://localhost",
-            "file:",
-            "file:///tmp/%FF",
-            "",
-            "garbage",
-        ] {
-            assert_eq!(parse(ignored), None, "{ignored:?}");
-        }
-        assert_eq!(
-            super::parse_cwd_report(b"file:///tmp/\xff", &|_| true),
-            None
-        );
-    }
-
-    #[test]
-    fn osc7_file_uri_paths_drop_the_slash_before_a_windows_drive() {
-        assert_eq!(super::strip_drive_slash("/C:/Users/me"), "C:/Users/me");
-        assert_eq!(super::strip_drive_slash("/d:"), "d:");
-        assert_eq!(super::strip_drive_slash("/Users/me"), "/Users/me");
-        assert_eq!(super::strip_drive_slash("/1:/x"), "/1:/x");
-    }
-
-    #[test]
-    fn only_kitty_flag_queries_are_masked() {
-        use super::kitty_flags_reply;
-        let bits = |text| kitty_flags_reply(text).map(|flags| flags.bits());
-        assert_eq!(bits("\x1b[?0u"), Some(0));
-        assert_eq!(bits("\x1b[?31u"), Some(31));
-        for other in [
-            "\x1b[?u",
-            "\x1b[?6c",
-            "\x1b[?2031;0$y",
-            "\x1b[0n",
-            "\x1b[?1;2u",
-            "\x1b[?999u",
-        ] {
-            assert_eq!(bits(other), None, "{other:?}");
-        }
-    }
-
-    #[test]
-    fn scheme_sequences_are_seen_once_across_chunk_splits() {
-        use super::{scan_scheme_sequences, SchemeSequence};
-        let mut tail = Vec::new();
-        assert_eq!(
-            scan_scheme_sequences(&mut tail, b"\x1b[?2031h\x1b[?996n"),
-            vec![(8, SchemeSequence::Subscribe), (15, SchemeSequence::Query)]
-        );
-        assert_eq!(scan_scheme_sequences(&mut tail, b"plain"), vec![]);
-        assert_eq!(scan_scheme_sequences(&mut tail, b"\x1b[?20"), vec![]);
-        assert_eq!(
-            scan_scheme_sequences(&mut tail, b"31l"),
-            vec![(3, SchemeSequence::Unsubscribe)]
-        );
-        assert_eq!(scan_scheme_sequences(&mut tail, b""), vec![]);
-        assert_eq!(scan_scheme_sequences(&mut tail, b"\x1b[?25h"), vec![]);
-    }
-}
+mod tests;

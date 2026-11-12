@@ -7,43 +7,23 @@ impl NativeRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.create_modal_open() {
+        if self.create_modal_open() || self.launcher_start_pending(cx) {
             return;
         }
-        let pane = self
-            .front_page_is_chat()
-            .then(|| self.front_page_layout())
-            .flatten()
-            .and_then(|layout| {
-                layout
-                    .root
-                    .leaves()
-                    .into_iter()
-                    .find(|leaf| leaf.id == layout.focused_pane_id && leaf.session_id.is_none())
-                    .map(|leaf| PaneKey::new(&layout.id, &leaf.id))
-            });
-        if let Some(pane) = pane {
-            let default_page = self
-                .front_page_layout()
-                .is_some_and(|layout| layout.root.leaves().len() == 1);
-            let launcher = self.render_launcher(Some(pane), default_page, window, cx);
-            launcher.update(cx, |launcher, cx| launcher.focus(window, cx));
-        } else {
-            self.open_launcher_tab(
-                ProjectScope::or_root(self.active_project_id(cx)),
-                window,
-                cx,
-            );
-        }
+        let scope = ProjectScope::or_root(self.new_tab_project_id(cx));
+        self.open_launcher_page(scope, launcher::Step::Start, false, window, cx);
+        self.front_page_sidebar()
+            .update(cx, |sidebar, cx| sidebar.set_active_project(None, cx));
     }
 
+    /// A sidebar +: locked to its project, while Recents has none to lock to.
     pub(crate) fn open_sidebar_chat_modal(
         &mut self,
         scope: ProjectScope,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_launcher_tab(scope, window, cx);
+        self.open_launcher_page(scope, launcher::Step::Start, true, window, cx);
     }
 
     pub(crate) fn open_remote_role_chat(

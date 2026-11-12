@@ -164,8 +164,6 @@ impl SessionManager {
         role.codex_speed = speed_override.or(role.codex_speed);
         let mut launch_definition = crate::session::launch_definition::from_effective(&role);
         let mut role = self.resolve_role_executable(&role, &pool)?;
-        // Attended chats strip the row's permission flags and leave
-        // every other arg alone.
         role.args = crate::runtimes::for_key(&role.runtime)
             .permissions()
             .strip(&role.args);
@@ -178,8 +176,13 @@ impl SessionManager {
             true,
         )?;
         if let Some(account) = &mut launch_definition.claude_account {
+            let options = crate::db::runtime_launch_options(&pool)?
+                .get(&role.runtime)
+                .copied()
+                .unwrap_or_default();
+            let effective = crate::runtimes::apply_launch_options(&role, false, options);
             account.permission_mode = crate::runtimes::for_key(&role.runtime)
-                .native_permission_mode(&role.args)
+                .native_permission_mode(&effective.args)
                 .expect("account runtime has a native permission mode");
         }
 
@@ -314,7 +317,14 @@ impl SessionManager {
             &role.runtime,
             spec.cwd.as_deref(),
             role.env.get("COPILOT_HOME").map(String::as_str),
+            crate::runtimes::claude_code::spawned_config_dir(&spec.env),
         );
+        let starts_trusted = first_turn.is_none()
+            && crate::runtimes::for_key(&role.runtime).starts_trusted(
+                spec.cwd.as_deref(),
+                &spec.args,
+                &spec.env,
+            );
         let capture_root =
             match crate::runtimes::for_key(&role.runtime).key_capture_for_spawn(&spec) {
                 crate::runtimes::KeyCapture::RolloutScan { sessions_root } => sessions_root,
@@ -324,6 +334,7 @@ impl SessionManager {
         if *spawning {
             return Err(Error::msg("runnerd is stopping"));
         }
+        let status_hooks_enabled = crate::runtimes::status_hooks_enabled(&spec.env);
         let (rt_session, output) = match self.spawn_runtime(spec) {
             Ok(p) => p,
             Err(e) => {
@@ -390,7 +401,22 @@ impl SessionManager {
         self.install_handle(
             &session_id,
             SessionHandle {
-                startup: None,
+                // A report to the chat waits until the agent is ready (#748).
+                startup: (!Runtime::parse(&role.runtime).is_some_and(Runtime::is_shell)).then(
+                    || {
+                        let gate = if starts_trusted {
+                            startup::StartupDelivery::for_trusted_reports
+                        } else {
+                            startup::StartupDelivery::for_reports
+                        };
+                        gate(
+                            &role.runtime,
+                            first_turn.is_some(),
+                            super::super::clock::now(),
+                        )
+                        .with_status_hooks(status_hooks_enabled)
+                    },
+                ),
                 #[cfg(windows)]
                 pending_first_turn: None,
                 id: session_id.clone(),
@@ -434,7 +460,7 @@ impl SessionManager {
             Arc::clone(&pool),
             Arc::clone(&events),
             role.clone(),
-            plan.resuming,
+            None,
             emit_activity,
             None, // direct chats are off-bus — no log to append session_status to
             app_data_dir.to_path_buf(),

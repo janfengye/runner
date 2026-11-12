@@ -27,7 +27,7 @@ impl MissionWorkspace {
             &mission_id,
             window.is_window_active(),
         );
-        let generation = self.prepare_mission(mission_id.clone(), MissionRailView::Roles);
+        let generation = self.prepare_mission(mission_id.clone());
         self.composer_input.update(cx, |input, input_cx| {
             input.reset("", input_cx);
             input.set_disabled(false, input_cx);
@@ -229,7 +229,7 @@ impl MissionWorkspace {
         } else {
             self.settings(cx).sidebar_width * self.settings(cx).app_zoom
         };
-        let rail_width = if self.settings(cx).mission_rail_open {
+        let rail_width = if self.settings(cx).show_side_panel && self.rail_is_open(cx) {
             self.settings(cx).mission_rail_width * self.settings(cx).app_zoom
         } else {
             0.
@@ -240,7 +240,8 @@ impl MissionWorkspace {
             .max(160.);
         let font_size = self.settings(cx).terminal_font_size as f32 * self.settings(cx).app_zoom;
         let cell_width = font_size * 0.6;
-        let line_height = (font_size * crate::terminal::element::LINE_HEIGHT_FACTOR).round();
+        let line_height =
+            crate::terminal::element::row_height(font_size, self.settings(cx).terminal_line_height);
         (
             (width / cell_width).floor().max(2.) as u16,
             (height / line_height).floor().max(2.) as u16,
@@ -279,7 +280,7 @@ impl MissionWorkspace {
         } else {
             self.settings(cx).sidebar_width * self.settings(cx).app_zoom
         };
-        let rail_width = if self.settings(cx).mission_rail_open {
+        let rail_width = if self.settings(cx).show_side_panel && self.rail_is_open(cx) {
             self.settings(cx).mission_rail_width * self.settings(cx).app_zoom
         } else {
             0.
@@ -292,7 +293,8 @@ impl MissionWorkspace {
             .max(80. * zoom);
         let font_size = self.settings(cx).terminal_font_size as f32 * self.settings(cx).app_zoom;
         let cell_width = font_size * 0.6;
-        let line_height = (font_size * crate::terminal::element::LINE_HEIGHT_FACTOR).round();
+        let line_height =
+            crate::terminal::element::row_height(font_size, self.settings(cx).terminal_line_height);
         (
             (width / cell_width).floor().max(2.) as u16,
             (height / line_height).floor().max(2.) as u16,

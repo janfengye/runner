@@ -2,6 +2,7 @@ pub(crate) mod launch;
 pub(crate) mod models;
 pub(crate) mod onboarding;
 pub(crate) mod skills;
+mod trust;
 pub(crate) mod usage;
 /// Minimum spacing between consecutive `claude-code` PTY launches.
 /// Long enough for one claude's OAuth refresh round-trip (network
@@ -33,6 +34,7 @@ const CLAUDE_LAUNCH_GATE_GRACE: Duration = Duration::from_millis(0);
 pub(crate) mod claude_status;
 use super::helpers::*;
 use super::*;
+use std::ffi::OsString;
 
 pub(crate) fn inject_claude_settings(role_args: &[String]) -> bool {
     !role_args
@@ -45,6 +47,10 @@ pub(crate) fn claude_settings_args(
     app_data_dir: &Path,
     _runner_session_id: &str,
 ) -> Vec<String> {
+    claude_launch_settings(role_args, app_data_dir, true)
+}
+
+fn claude_launch_settings(role_args: &[String], app_data_dir: &Path, status: bool) -> Vec<String> {
     if !inject_claude_settings(role_args) {
         return Vec::new();
     }
@@ -73,6 +79,9 @@ pub(crate) fn claude_settings_args(
         "Stop",
         "StopFailure",
     ] {
+        if !status && event != "SessionStart" {
+            continue;
+        }
         if !ClaudeCode
             .status_hooks()
             .is_some_and(|hooks| hooks.supported(cfg!(windows)))
@@ -141,11 +150,71 @@ pub(crate) fn claude_code_project_dir(cwd: &str) -> String {
     format!("{}-{suffix}", &encoded[..MAX_LEN])
 }
 
+const CONFIG_DIR_VAR: &str = "CLAUDE_CONFIG_DIR";
+
+/// The `CLAUDE_CONFIG_DIR` in a spawn environment, given its entries lowest
+/// layer first. On Windows `CommandBuilder` folds the case of names and
+/// `spec.env` applies in name order, so among spellings the greatest name wins.
+pub(crate) fn spawned_config_dir<'a>(
+    env: impl IntoIterator<Item = (&'a String, &'a String)>,
+) -> Option<&'a str> {
+    env.into_iter()
+        .filter(|(name, _)| {
+            if cfg!(windows) {
+                name.eq_ignore_ascii_case(CONFIG_DIR_VAR)
+            } else {
+                *name == CONFIG_DIR_VAR
+            }
+        })
+        .max_by_key(|(name, _)| *name)
+        .map(|(_, value)| value.as_str())
+}
+
+/// The `CLAUDE_CONFIG_DIR` the agent process will see. `spawned` is the value
+/// in the spawn environment, which replaces what the child would inherit; an
+/// empty value counts as unset, even when it hides an inherited one.
+pub(crate) fn agent_config_dir(spawned: Option<&str>) -> Option<OsString> {
+    spawned
+        .map(OsString::from)
+        .or_else(inherited_config_dir)
+        .filter(|dir| !dir.is_empty())
+}
+
+/// The variable in the base environment `portable-pty` gives a child, which on
+/// Windows includes registry values set after `runnerd` started.
+fn inherited_config_dir() -> Option<OsString> {
+    #[cfg(not(test))]
+    let inherited = portable_pty::CommandBuilder::new("claude")
+        .get_env(CONFIG_DIR_VAR)
+        .map(ToOwned::to_owned);
+    // Tests must not depend on the developer's own Claude config folder (#1159).
+    #[cfg(test)]
+    let inherited = crate::golden::injected_config_var(CONFIG_DIR_VAR);
+    inherited
+}
+
+/// The folder Claude keeps this chat's transcripts in.
+fn conversation_folder(ctx: &ProbeContext<'_>) -> Option<PathBuf> {
+    match agent_config_dir(spawned_config_dir(ctx.role_env)) {
+        Some(dir) => Some(match ctx.cwd {
+            Some(cwd) => Path::new(cwd).join(dir),
+            None => dir.into(),
+        }),
+        None => agent_home(".claude"),
+    }
+}
+
 /// True iff claude-code's conversation file for `(cwd, uuid)` exists on
-/// disk. Used by `SessionManager::resume` to skip `--resume <uuid>` when
-/// the agent never persisted a turn.
-pub fn claude_code_conversation_exists(cwd: Option<&str>, uuid: &str) -> bool {
-    conversation_file_exists(".claude", cwd, uuid, claude_code_project_dir)
+/// disk, in the folder the agent launches with. Used by
+/// `SessionManager::resume` to skip `--resume <uuid>` when the agent never
+/// persisted a turn.
+pub fn claude_code_conversation_exists(ctx: &ProbeContext<'_>, uuid: &str) -> bool {
+    conversation_file_exists(
+        conversation_folder(ctx).as_deref(),
+        ctx.cwd,
+        uuid,
+        claude_code_project_dir,
+    )
 }
 
 use runner_core::protocol::runtime_metadata::claude_code::{PERMISSIONS, SKILL_DIRS};
@@ -203,6 +272,7 @@ impl RuntimeAdapter for ClaudeCode {
             interaction_prefix: Some("claude"),
             batch_feedback: true,
             compaction: CompactionPolicy::ResumeUnfinishedTurn,
+            compaction_requires_start: true,
             permission_prompt: PermissionPromptPolicy::VisibleCandidates,
             elicitation_uses_requests: true,
             idle_clears_compaction: true,
@@ -278,6 +348,18 @@ impl RuntimeAdapter for ClaudeCode {
     fn launch_gate(&self, session_id: &str, state: &Mutex<Option<Instant>>) {
         launch::enter_gate(session_id, state, CLAUDE_LAUNCH_GATE_GRACE);
     }
+    fn seed_trust(
+        &self,
+        session_id: &str,
+        cwd: Option<&Path>,
+        _copilot_home: Option<&str>,
+        claude_config_dir: Option<&str>,
+    ) -> crate::error::Result<()> {
+        if let Some(cwd) = trust_cwd(session_id, Runtime::ClaudeCode, cwd) {
+            trust::seed_project_trust(cwd, claude_config_dir)?;
+        }
+        Ok(())
+    }
     fn key_capture(&self) -> KeyCapture {
         KeyCapture::Hook
     }
@@ -317,12 +399,10 @@ impl RuntimeAdapter for ClaudeCode {
                 // when the conversation file was never persisted) is
                 // normally masked by spawn-time first-turn delivery. An
                 // untouched direct Claude fork intentionally has no first
-                // turn and can still reach this fallback. If a resume fails
-                // (e.g. the user killed the app
-                // within ~1.5s of spawn before the first turn went
-                // through), the reader thread's `resume_failed`
-                // heuristic wipes `agent_session_key` and the next
-                // launch starts fresh.
+                // turn and can still reach this fallback. If a resume exits
+                // early and the transcript is confirmed missing, the
+                // forwarder wipes `agent_session_key` and the next launch
+                // starts fresh.
                 args: vec!["--resume".into(), k.to_string()],
                 prepend: false,
                 assigned_key: Some(k.to_string()),
@@ -360,17 +440,23 @@ impl RuntimeAdapter for ClaudeCode {
             resuming: true,
         }))
     }
+    fn probe_uses_shell_env(&self) -> bool {
+        true
+    }
     fn conversation_exists(&self, key: &str, ctx: &ProbeContext<'_>) -> Option<bool> {
-        Some(claude_code_conversation_exists(ctx.cwd, key))
+        Some(claude_code_conversation_exists(ctx, key))
+    }
+    fn conversation_folder(&self, ctx: &ProbeContext<'_>) -> Option<PathBuf> {
+        conversation_folder(ctx)
     }
     fn launch_args(&self, ctx: &LaunchContext<'_>) -> Vec<String> {
         let mut out = Vec::new();
         out.extend(self.model_effort_args(ctx.model, ctx.effort));
-        out.extend(claude_settings_args(
-            ctx.role_args,
-            ctx.app_data_dir,
-            ctx.session_id,
-        ));
+        out.extend(if status_hooks_enabled(ctx.env) {
+            claude_settings_args(ctx.role_args, ctx.app_data_dir, ctx.session_id)
+        } else {
+            claude_launch_settings(ctx.role_args, ctx.app_data_dir, false)
+        });
         out.extend(self.first_turn_argv(if ctx.resuming { None } else { ctx.first_turn }));
         out
     }

@@ -185,7 +185,7 @@ impl RemoteClient {
                 Some(Item::Mission(id)) => {
                     overview.missions.iter().any(|mission| &mission.id == id)
                 }
-                Some(Item::Roles | Item::Crews) | None => true,
+                Some(Item::Launcher | Item::Roles | Item::Crews) | None => true,
             };
             if !valid {
                 remote.active = None;
@@ -193,16 +193,32 @@ impl RemoteClient {
         }
         if remote.active.is_none() {
             if let Some(overview) = clients.read(cx).overviews.get(&remote.computer.id) {
-                remote.active = overview
-                    .tabs
-                    .first()
-                    .map(|tab| Item::Tab(tab.id.clone()))
+                let viewed = remote
+                    .viewed_tabs
+                    .iter()
+                    .rev()
+                    .find(|tab| remote.layouts.contains_key(*tab))
+                    .map(|tab| Item::Tab(tab.clone()));
+                let left_a_tab = !remote.viewed_tabs.is_empty();
+                remote.active = viewed
+                    .or_else(|| overview.tabs.first().map(|tab| Item::Tab(tab.id.clone())))
                     .or_else(|| {
                         overview
                             .missions
                             .first()
                             .map(|mission| Item::Mission(mission.id.clone()))
                     });
+                if left_a_tab && matches!(remote.active, Some(Item::Tab(_))) {
+                    remote.landed_at = Some(std::time::Instant::now());
+                }
+            }
+        }
+        if let Some(Item::Tab(id)) = &remote.active {
+            if remote.viewed_tabs.last() != Some(id) {
+                remote
+                    .viewed_tabs
+                    .retain(|tab| tab != id && remote.layouts.contains_key(tab));
+                remote.viewed_tabs.push(id.clone());
             }
         }
         remote
@@ -362,7 +378,6 @@ impl RemoteClient {
                 }
                 *remote.shell_placement.lock().unwrap() = None;
                 remote.action_error = None;
-                remote.recovery.clear();
             }
             remote.active = Some(item);
             remote.errors.clear();
@@ -434,10 +449,36 @@ impl RemoteClient {
                     .collect::<HashSet<_>>()
             })
             .unwrap_or_default();
-        remote.terminals.retain(|id, _| ids.contains(id));
+        let open = overview
+            .as_ref()
+            .map(|overview| remote.open_sessions(overview))
+            .unwrap_or_default();
+        let retained = if remote.connection == Connection::Connected {
+            open.clone()
+        } else {
+            HashSet::new()
+        };
+        // A hidden chat dropped only because the route is down recovers
+        // without taking control, as a visible one does.
+        let dropped = remote
+            .terminals
+            .keys()
+            .chain(remote.pending.keys())
+            .filter(|id| !ids.contains(id) && !retained.contains(*id) && open.contains(*id))
+            .cloned()
+            .collect::<Vec<_>>();
+        remote.recovery.extend(dropped);
+        if overview.is_some() {
+            remote
+                .recovery
+                .retain(|id| ids.contains(id) || open.contains(id));
+        }
+        remote
+            .terminals
+            .retain(|id, _| ids.contains(id) || retained.contains(id));
         remote
             .pending
-            .retain(|id, _| ids.contains(id) && running.contains(id));
+            .retain(|id, _| (ids.contains(id) && running.contains(id)) || retained.contains(id));
         remote.errors.retain(|id| running.contains(id));
         if remote.connection != Connection::Connected {
             return;
@@ -479,7 +520,7 @@ impl RemoteClient {
             let wake = remote.wake.clone();
             let wake_id = address.clone();
             let task = cx.background_spawn(async move {
-                TerminalMirror::attach(
+                TerminalMirror::attach_remote(
                     client,
                     address,
                     Arc::new(move || {
@@ -512,13 +553,15 @@ impl RemoteClient {
                         .overviews
                         .get(&remote.computer.id)
                         .is_some_and(|overview| {
-                            remote.visible_sessions(overview, cx).contains(&id)
+                            (remote.visible_sessions(overview, cx).contains(&id)
                                 && overview.sessions.get(&id).is_some_and(|session| {
                                     !matches!(
                                         session.status.status.effective(),
                                         Status::Stopped | Status::Error
                                     )
-                                })
+                                }))
+                                || (remote.connection == Connection::Connected
+                                    && remote.open_sessions(overview).contains(&id))
                         });
                     if !wanted {
                         return;

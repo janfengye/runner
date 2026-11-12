@@ -87,6 +87,8 @@ impl MissionWorkspace {
         let terminal_input = chat.terminal_input.clone();
         let terminal_focus = chat.terminal_focus.clone();
         let terminal_scrollbar = chat.terminal_scrollbar.clone();
+        let terminal_find = chat.terminal_find.clone();
+        let open_find = terminal_find.clone();
         let interactive = self.cached_mission_terminal_interactive(&session_id, cx);
         let key_id = session_id.clone();
         let copy_id = session_id.clone();
@@ -114,6 +116,9 @@ impl MissionWorkspace {
                     this.on_mission_terminal_copy(&copy_id, action, window, cx)
                 });
             })
+            .on_action(move |_: &crate::FindInTerminal, window, cx| {
+                open_find.update(cx, |find, cx| find.open(window, cx));
+            })
             .child(
                 div()
                     .relative()
@@ -132,6 +137,8 @@ impl MissionWorkspace {
                             self.terminal_style(cx),
                         )
                         .scrollable(interactive)
+                        .find(terminal_find.clone())
+                        .file_links(Some(self.file_link_route(cx)))
                         .cached(),
                     )
                     .child(terminal_scrollbar),
@@ -178,7 +185,7 @@ impl MissionWorkspace {
             } else {
                 self.settings(cx).sidebar_width * self.settings(cx).app_zoom
             };
-            let rail_width = if self.settings(cx).mission_rail_open {
+            let rail_width = if self.settings(cx).show_side_panel && self.rail_is_open(cx) {
                 self.settings(cx).mission_rail_width * self.settings(cx).app_zoom
             } else {
                 0.
@@ -196,6 +203,7 @@ impl MissionWorkspace {
                 cx,
             ));
         }
+        pane = pane.child(crate::terminal::find::find_bar(&terminal_find));
         pane = match overlay {
             SlotOverlayState::Resuming => pane.child(SessionOverlay::transition(
                 SharedString::from(format!("mission-resuming-{session_id}")),
@@ -353,6 +361,20 @@ impl MissionWorkspace {
             )
         {
             return div().into_any_element();
+        }
+        if let (Some(root), Some(runtime)) = (
+            self.shell.upgrade(),
+            runner_core::protocol::Runtime::parse(&session.runtime),
+        ) {
+            if let Some(overlay) = root.read(cx).agent_recovery_overlay(
+                &session.session.id,
+                &session.session.id,
+                runtime,
+                root.downgrade(),
+                cx,
+            ) {
+                return overlay.into_any_element();
+            }
         }
         let others = self
             .members()

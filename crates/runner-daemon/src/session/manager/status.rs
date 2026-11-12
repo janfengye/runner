@@ -168,6 +168,10 @@ impl SessionManager {
             })?;
             (sink, session.model.revision())
         };
+        #[cfg(test)]
+        if let Some(baseline_read) = self.wake_baseline_read.lock().unwrap().take() {
+            let _ = baseline_read.send(());
+        }
         match sink.try_append_with_retry(draft) {
             Ok(()) => {}
             Err(TryAppendError::Contended) => return Err(Error::msg("event log busy")),
@@ -181,6 +185,106 @@ impl SessionManager {
             super::super::clock::state_now(),
         );
         Ok(())
+    }
+
+    /// A confirmed report reads as busy until the chat's agent reports its
+    /// turn, or the submit window withdraws it, as a confirmed inbox notice does.
+    pub(crate) fn synthesize_report_busy(&self, session_id: &str) {
+        let Some(session) = self.session_state(session_id) else {
+            return;
+        };
+        let mut session = session.lock().unwrap();
+        if session.model.activity() == Some(SessionActivityState::Busy) {
+            return;
+        }
+        let revision = session.model.revision();
+        session.model.apply(
+            SessionEvent::Delivered { revision },
+            super::super::clock::state_now(),
+        );
+    }
+
+    /// Signals once the next synthetic wake has read its baseline revision and
+    /// released the session lock, just before it appends.
+    #[cfg(test)]
+    pub(crate) fn notify_wake_baseline_read(&self) -> std::sync::mpsc::Receiver<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        *self.wake_baseline_read.lock().unwrap() = Some(tx);
+        rx
+    }
+
+    /// A running session with the given activity, for tests outside the manager.
+    #[cfg(test)]
+    pub(crate) fn test_running_activity(&self, session_id: &str, state: SessionActivityState) {
+        let session = self.session_state_or_insert(session_id);
+        let mut session = session.lock().unwrap();
+        session.model.apply(
+            SessionEvent::Transition {
+                state,
+                source: StatusSource::Forwarder,
+                live: true,
+            },
+            super::super::clock::state_now(),
+        );
+        session.model.apply(
+            SessionEvent::TestLifecycle(crate::session::status::Lifecycle::Running),
+            super::super::clock::state_now(),
+        );
+    }
+
+    /// A running session whose agent reports `event`, for tests outside the manager.
+    #[cfg(test)]
+    pub(crate) fn test_agent_event(
+        &self,
+        session_id: &str,
+        event: super::super::state::agent::AgentEvent,
+    ) {
+        let session = self.session_state_or_insert(session_id);
+        let mut session = session.lock().unwrap();
+        session.model.apply(
+            SessionEvent::Agent { event, live: true },
+            super::super::clock::state_now(),
+        );
+        session.model.apply(
+            SessionEvent::TestLifecycle(crate::session::status::Lifecycle::Running),
+            super::super::clock::state_now(),
+        );
+    }
+
+    /// A session launch resume is still bringing back, for tests outside the manager.
+    #[cfg(test)]
+    pub(crate) fn test_resuming(&self, session_id: &str) {
+        self.session_state_or_insert(session_id)
+            .lock()
+            .unwrap()
+            .model
+            .apply(
+                SessionEvent::TestLifecycle(crate::session::status::Lifecycle::Resuming),
+                super::super::clock::state_now(),
+            );
+    }
+
+    /// A live mission session whose runtime refuses to stop it, for tests outside the manager.
+    #[cfg(test)]
+    pub(crate) fn test_attach_live(&self, session_id: &str, mission_id: &str) {
+        self.session_state_or_insert(session_id)
+            .lock()
+            .unwrap()
+            .handle = Some(super::SessionHandle {
+            startup: None,
+            #[cfg(windows)]
+            pending_first_turn: None,
+            id: session_id.to_owned(),
+            mission_id: Some(mission_id.to_owned()),
+            role_id: None,
+            runtime_session: crate::session::runtime::RuntimeSession {
+                runtime: "test".into(),
+                session_id: session_id.to_owned(),
+            },
+            rollout_capture: None,
+            forwarder: None,
+            stop: Default::default(),
+        });
     }
 
     pub(crate) fn publish_direct_activity(
@@ -332,6 +436,32 @@ impl SessionManager {
             .collect()
     }
 
+    /// A submit or delivery marks the session busy before its agent has said anything. If no turn
+    /// shows within the window the busy is withdrawn, so a Return that started nothing cannot
+    /// hold the session undeliverable. A turn that starts later puts the session back to busy.
+    pub(super) fn expire_submit_busy(
+        &self,
+        session_id: &str,
+        launch: &Arc<AtomicBool>,
+        events: &dyn SessionEvents,
+    ) {
+        let due = self.session_state(session_id).is_some_and(|session| {
+            session
+                .lock()
+                .unwrap()
+                .model
+                .submit_busy_due(super::super::clock::now())
+        });
+        if due {
+            self.publish_model_event_for_launch(
+                session_id,
+                SessionEvent::SubmitTimeout { live: true },
+                Some(launch),
+                events,
+            );
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn publish_agent_event(
         &self,
@@ -400,15 +530,19 @@ impl SessionManager {
             match &mut event {
                 SessionEvent::Agent { live, .. }
                 | SessionEvent::BridgeFailed { live }
+                | SessionEvent::SubmitTimeout { live }
                 | SessionEvent::CodexAttention { live, .. } => *live = is_live,
                 SessionEvent::ProgramStatus { live, .. } => *live = is_live,
                 _ => {}
             }
             let turn_started = matches!(&event, SessionEvent::Agent { event, live: true } if agent_turn_started(event));
+            let prompted = matches!(&event, SessionEvent::Agent { event, live: true }
+                if session.delivery_line.as_deref().is_some_and(|line| agent_prompted(event, line)));
             let was_idle = session.model.activity() == Some(SessionActivityState::Idle);
             let effects = session.model.apply(event, super::super::clock::state_now());
             if turn_started && effects.agent_feedback.accepted {
                 session.turn_started = session.turn_started.wrapping_add(1);
+                session.delivery_prompted |= prompted;
             }
             let became_idle =
                 !was_idle && session.model.activity() == Some(SessionActivityState::Idle);
@@ -511,6 +645,17 @@ impl SessionManager {
                     .map(|activity| (id, activity))
             })
             .collect()
+    }
+}
+
+fn agent_prompted(event: &super::super::state::agent::AgentEvent, line: &str) -> bool {
+    use super::super::state::agent::AgentEvent;
+    match event {
+        AgentEvent::PromptSubmitted { prompt } => prompt.trim() == line.trim(),
+        AgentEvent::Batch { events, .. } | AgentEvent::Transcript { events, .. } => {
+            events.iter().any(|event| agent_prompted(event, line))
+        }
+        _ => false,
     }
 }
 

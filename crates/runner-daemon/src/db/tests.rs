@@ -4,7 +4,7 @@ use rusqlite::{params, Connection, ErrorCode};
 
 use super::app_state::{
     login_shell_env_lkg, runtime_overrides, set_login_shell_env_lkg, set_runtime_override,
-    LoginShellEnvLkg,
+    set_usage_lkg, usage_lkg, LoginShellEnvLkg, UsageLkg,
 };
 use super::migrations::{run_migrations, run_migrations_up_to, MIGRATIONS};
 use super::seed::{
@@ -454,6 +454,27 @@ fn login_shell_lkg_round_trips_through_app_state() {
     assert_eq!(login_shell_env_lkg(&pool).unwrap(), None);
     set_login_shell_env_lkg(&pool, &snapshot).unwrap();
     assert_eq!(login_shell_env_lkg(&pool).unwrap(), Some(snapshot));
+}
+
+#[test]
+fn usage_lkg_round_trips_through_app_state() {
+    use runner_core::protocol::usage::{AgentUsage, UsageWindow};
+    let pool = open_in_memory().unwrap();
+    let usage = |percent| AgentUsage {
+        windows: vec![UsageWindow {
+            name: "Week".into(),
+            used_percent: percent,
+            resets_at: Some("2026-11-10T00:00:00.123456Z".parse().unwrap()),
+        }],
+        updated_at: "2026-11-03T08:15:00.5Z".parse().unwrap(),
+    };
+    let stored = UsageLkg {
+        runtimes: [(runner_core::Runtime::Codex, usage(27.5))].into(),
+        claude_accounts: BTreeMap::from([("work".into(), usage(64.))]),
+    };
+    assert_eq!(usage_lkg(&pool).unwrap(), None);
+    set_usage_lkg(&pool, &stored).unwrap();
+    assert_eq!(usage_lkg(&pool).unwrap(), Some(stored));
 }
 
 #[test]
@@ -1935,7 +1956,7 @@ fn migration_0028_preserves_every_row_column_and_mission_link() {
          INSERT INTO session_attention VALUES ('direct', NULL, NULL);",
     ).unwrap();
     let before = snapshot(&conn);
-    run_migrations(&mut conn).unwrap();
+    run_migrations_up_to(&mut conn, 28).unwrap();
     assert_eq!(snapshot(&conn), before);
     assert_eq!(
         conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
@@ -1955,4 +1976,95 @@ fn migration_0028_preserves_every_row_column_and_mission_link() {
         assert!(conn.execute(sql, []).is_err(), "{sql}");
     }
     conn.execute("INSERT INTO missions (id, title, status, started_at) VALUES ('empty', 'Empty', 'running', '2026-10-15T00:00:00Z')", []).unwrap();
+}
+
+#[test]
+fn migration_0029_leaves_missions_unlinked_and_deleting_the_chat_clears_a_link() {
+    fn link(conn: &Connection) -> (Option<String>, i64) {
+        conn.query_row(
+            "SELECT linked_session_id, report_to_chat FROM missions WHERE id = 'm'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    }
+    let mut conn = Connection::open_in_memory().unwrap();
+    super::init_connection(&mut conn).unwrap();
+    run_migrations_up_to(&mut conn, 28).unwrap();
+    conn.execute_batch(
+        "INSERT INTO missions (id, title, status, started_at) VALUES ('m', 'Mission', 'running', '2026-11-02T00:00:00Z');
+         INSERT INTO sessions (id, status) VALUES ('chat', 'running');",
+    )
+    .unwrap();
+    run_migrations(&mut conn).unwrap();
+    assert_eq!(link(&conn), (None, 1));
+
+    assert!(conn
+        .execute(
+            "UPDATE missions SET linked_session_id = 'missing' WHERE id = 'm'",
+            []
+        )
+        .is_err());
+    conn.execute(
+        "UPDATE missions SET linked_session_id = 'chat' WHERE id = 'm'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(link(&conn), (Some("chat".into()), 1));
+    conn.execute("DELETE FROM sessions WHERE id = 'chat'", [])
+        .unwrap();
+    assert_eq!(link(&conn), (None, 1));
+}
+
+#[test]
+fn migration_0030_adds_a_saved_files_root_that_goes_with_its_row() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.pragma_update(None, "foreign_keys", true).unwrap();
+    run_migrations_up_to(&mut conn, 29).unwrap();
+    conn.execute_batch(
+        "INSERT INTO sessions (id, status, cwd) VALUES ('chat', 'stopped', '/work');
+         INSERT INTO missions (id, title, status, started_at, cwd)
+         VALUES ('mission', 'M', 'running', '2026-11-04T00:00:00Z', '/work');",
+    )
+    .unwrap();
+    run_migrations_up_to(&mut conn, 30).unwrap();
+
+    use crate::repo::{mission, session};
+    assert_eq!(session::files_root(&conn, "chat").unwrap(), None);
+    assert_eq!(mission::files_root(&conn, "mission").unwrap(), None);
+    assert_eq!(
+        session::get_row(&conn, "chat")
+            .unwrap()
+            .unwrap()
+            .cwd
+            .as_deref(),
+        Some("/work")
+    );
+
+    assert_eq!(
+        session::set_files_root(&conn, "chat", Some("/work/src")).unwrap(),
+        1
+    );
+    assert_eq!(
+        mission::set_files_root(&conn, "mission", Some("/elsewhere")).unwrap(),
+        1
+    );
+    assert_eq!(
+        session::files_root(&conn, "chat").unwrap().as_deref(),
+        Some("/work/src")
+    );
+    assert_eq!(
+        mission::files_root(&conn, "mission").unwrap().as_deref(),
+        Some("/elsewhere")
+    );
+    assert_eq!(
+        session::set_files_root(&conn, "absent", Some("/x")).unwrap(),
+        0
+    );
+    assert_eq!(session::files_root(&conn, "absent").unwrap(), None);
+
+    session::set_files_root(&conn, "chat", None).unwrap();
+    assert_eq!(session::files_root(&conn, "chat").unwrap(), None);
+    session::delete_many(&conn, &["chat".into()]).unwrap();
+    assert_eq!(session::files_root(&conn, "chat").unwrap(), None);
 }

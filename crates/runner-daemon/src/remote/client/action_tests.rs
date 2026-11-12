@@ -111,6 +111,7 @@ impl Host {
     async fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
         let mut core = crate::test_support::test_core_in(root.path().into());
+        core.usage = Arc::new(crate::usage::UsageService::without_fetch());
         let runtime = Arc::new(Runtime::default());
         core.sessions = crate::session::SessionManager::new(
             core.runtime_shell_env.clone(),
@@ -156,6 +157,7 @@ impl Host {
             .request("2".into(), message)
             .await
             .map(|reply| reply.result)
+            .map_err(|error| error.message)
     }
     async fn ok(&self, value: Value) -> Value {
         let kind = value["type"].as_str().unwrap_or("unknown").to_owned();
@@ -641,14 +643,15 @@ async fn a_followed_feed_keeps_the_shared_route_alive_without_an_overview_follow
             title: "Feed".into(),
             goal_override: None,
             cwd: Some(host.path()),
+            started_by_session_id: None,
+            no_report: false,
         },
     )
     .unwrap();
     host.ok(json!({"type":"follow","mission":out.mission.id}))
         .await;
     tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(61)).await;
-    tokio::task::yield_now().await;
+    super::keep_alive(&host.fixture, 65).await;
     tokio::time::resume();
     host.fixture.client.overview("2".into()).await.unwrap();
     assert_eq!(host.fixture.relay.opens.load(Ordering::Relaxed), 1);
@@ -850,6 +853,8 @@ fn feed_mission(host: &Host) -> (String, runner_core::event_log::EventLog) {
             title: "Feed fixture".into(),
             goal_override: None,
             cwd: Some(host.path()),
+            started_by_session_id: None,
+            no_report: false,
         },
     )
     .unwrap();
@@ -1077,11 +1082,15 @@ async fn large_feed_pages_and_incremental_pushes_keep_the_shared_terminal_route_
     assert!(adapter.next(true).await.unwrap().is_none());
     adapter.in_flight(0);
     let mut probed = vec![];
-    while let Some(bytes) = adapter.next(true).await.unwrap() {
-        assert!(bytes.len() <= crate::companion::feed::MAX_BATCH_BYTES);
-        let c::HostMessage::FeedAppended(feed) = serde_json::from_slice(&bytes).unwrap() else {
-            panic!("feed batch expected")
+    while probed.len() < ids.len() {
+        let Some(bytes) = adapter.next(true).await.unwrap() else {
+            adapter.changed().await.unwrap();
+            continue;
         };
+        let c::HostMessage::FeedAppended(feed) = serde_json::from_slice(&bytes).unwrap() else {
+            continue;
+        };
+        assert!(bytes.len() <= crate::companion::feed::MAX_BATCH_BYTES);
         probed.extend(feed.entries.into_iter().map(|entry| entry.id));
     }
     assert_eq!(probed, ids);
@@ -1505,6 +1514,8 @@ async fn role_and_crew_actions_reject_invalid_fields_and_unknown_ids_without_lea
                 stopped_at: None,
                 pinned_at: None,
                 archived_at: None,
+                linked_session_id: None,
+                report_to_chat: true,
             },
         )
         .unwrap();
@@ -1582,4 +1593,112 @@ async fn role_permission_modes_match_the_desktop_inference_and_preserve_sent_arg
     let read = host.ok(json!({"type":"role","role":id})).await;
     assert_eq!(read["permissionMode"], "default");
     assert_eq!(read["args"], json!([]));
+}
+
+#[tokio::test]
+async fn usage_is_forwarded_with_the_negotiated_features() {
+    let host = Host::new().await;
+    let result = host
+        .fixture
+        .client
+        .request(
+            "2".into(),
+            serde_json::from_value(json!({"type":"usage","id":1,"popover":true})).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(result.features.iter().any(|feature| feature == "usage"));
+    let usage: c::Usage = serde_json::from_value(result.result).unwrap();
+    assert!(usage.agents.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn remote_launch_refusal_keeps_the_typed_runtime_version_gate() {
+    use std::os::unix::fs::PermissionsExt;
+    let host = Host::new().await;
+    let executable = host._root.path().join("codex-fixture");
+    std::fs::write(&executable, "#!/bin/sh\necho 'codex-cli 0.147.0'\n").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::db::set_runtime_override(&host.core.db, "codex", executable.to_str()).unwrap();
+    host.core
+        .runtime_discovery
+        .write()
+        .unwrap()
+        .versions
+        .set_installed(
+            runner_core::protocol::Runtime::Codex,
+            executable.to_str().unwrap(),
+            Some("0.147.0"),
+        );
+    let request = c::ClientMessage::decode(&serde_json::to_vec(&json!({"type":"startChat","id":1,"runtime":"codex","cwd":host.path(),"cols":80,"rows":24})).unwrap()).unwrap();
+    let error = host
+        .fixture
+        .client
+        .request("2".into(), request)
+        .await
+        .unwrap_err();
+    let gate = error
+        .version_gate
+        .expect("remote refusal lost its typed recovery details");
+    assert_eq!(gate.runtime, runner_core::protocol::Runtime::Codex);
+    assert_eq!(gate.installed_version, "0.147.0");
+    assert_eq!(gate.min_version, "0.149.0");
+    assert!(error.message.contains("Settings → Agents"));
+
+    let mission = {
+        let mut conn = host.core.db.get().unwrap();
+        let mission = crate::ops::mission::start(
+            &mut conn,
+            &host.core.app_data_dir,
+            runner_core::protocol::StartMissionInput {
+                crew_id: Some("crew".into()),
+                project_id: None,
+                title: "Old Codex mission".into(),
+                goal_override: None,
+                cwd: Some(host.path()),
+                started_by_session_id: None,
+                no_report: false,
+            },
+        )
+        .unwrap()
+        .mission;
+        let role = crate::ops::role::get(&conn, "role").unwrap();
+        let mut row = crate::test_support::test_session_row(
+            "old-codex",
+            crate::model::SessionStatus::Stopped,
+        );
+        row.mission_id = Some(mission.id.clone());
+        row.role_id = Some("role".into());
+        row.slot_id = Some("slot".into());
+        row.agent_runtime = Some("codex".into());
+        row.agent_command = Some("codex".into());
+        row.launch_definition = Some(crate::session::launch_definition::from_effective(&role));
+        crate::test_support::insert_session_row(&conn, &row).unwrap();
+        mission
+    };
+    let local = crate::daemon::InProcessTransport::client(host.core.as_ref().clone());
+    assert_eq!(
+        local
+            .mission_resume(&mission.id)
+            .unwrap_err()
+            .version_gate
+            .unwrap()
+            .installed_version,
+        "0.147.0"
+    );
+    let request = c::ClientMessage::decode(
+        &serde_json::to_vec(
+            &json!({"type":"resumeMission","id":2,"mission":mission.id,"cols":80,"rows":24}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let error = host
+        .fixture
+        .client
+        .request("2".into(), request)
+        .await
+        .unwrap_err();
+    assert_eq!(error.version_gate.unwrap().min_version, "0.149.0");
 }

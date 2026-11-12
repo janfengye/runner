@@ -39,11 +39,12 @@ struct Attempt {
 }
 
 /// A notice whose attempt ended without confirmation and may still sit in the composer;
-/// `seen` once the probe has found it there.
+/// `seen` once the probe has found it there, `tracked` once the input tracker has.
 struct Unsent {
     snapshot: DeliverySnapshot,
     probe: InputProbe,
     seen: bool,
+    tracked: bool,
 }
 
 struct Hold {
@@ -80,6 +81,15 @@ impl Dispatcher {
             redelivery: now + REDELIVERY_INTERVAL,
             stopped: false,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_reason(&self, handle: &str) -> Option<DeliveryReadiness> {
+        self.subscribers
+            .get(handle)?
+            .hold
+            .as_ref()
+            .map(|hold| hold.reason)
     }
 
     /// All timing is driven by the caller's clock. Port calls never hold router state.
@@ -250,7 +260,11 @@ impl Dispatcher {
                                 && current.turn_started != before.turn_started
                         },
                     );
-                    let outcome = if !unchanged {
+                    let prompted =
+                        turn_started && current.as_ref().is_some_and(|current| current.prompted);
+                    let outcome = if prompted {
+                        "Confirmed"
+                    } else if !unchanged {
                         "Unverified"
                     } else if turn_started || (state == ProbeState::Cleared && !unsent) {
                         "Confirmed"
@@ -304,6 +318,11 @@ impl Dispatcher {
                         .unwrap_or("unknown");
                     log::info!("router attempt outcome={outcome} mission={} session={} handle=@{handle} runtime={runtime}", router.mission_id, subscriber.session_id);
                     if outcome == "Confirmed" {
+                        if let Some(snapshot) = &attempt.snapshot {
+                            router
+                                .injector
+                                .confirm_delivery(&subscriber.session_id, snapshot);
+                        }
                         let draft = EventDraft::signal(
                             router.crew_id.as_deref(),
                             &router.mission_id,
@@ -324,6 +343,7 @@ impl Dispatcher {
                             snapshot,
                             probe: attempt.probe,
                             seen: false,
+                            tracked: unsent || current.as_ref().is_some_and(|current| current.held),
                         });
                         subscriber.pause_check = Some(now + CONFIRM_WINDOW);
                         subscriber.nudged = false;
@@ -345,16 +365,30 @@ impl Dispatcher {
                     .map(|current| unsent.probe.state(&current.rows))
                     .unwrap_or(ProbeState::Unknown);
                 let tracked = current.as_ref().is_some_and(|current| current.unsent);
+                let started = current.as_ref().is_some_and(|current| {
+                    current.generation == unsent.snapshot.generation
+                        && current.turn_started != unsent.snapshot.turn_started
+                });
                 if state == ProbeState::Present {
                     unsent.seen = true;
                     subscriber.input_cleared = false;
                 }
+                unsent.tracked |= tracked || current.as_ref().is_some_and(|current| current.held);
                 let readiness = router.injector.delivery_readiness(&subscriber.session_id);
-                let gone = (state == ProbeState::Cleared && !tracked)
+                // As for reports, a turn that reported the notice as its prompt, or whose notice
+                // the tracker let go of, took it (#1225).
+                let prompted = current.as_ref().is_some_and(|current| current.prompted);
+                let gone = (started && (prompted || (unsent.tracked && !tracked)))
+                    || (state == ProbeState::Cleared && !tracked)
                     || (state == ProbeState::Unknown
                         && unsent.seen
                         && subscriber.input_cleared
-                        && matches!(readiness, DeliveryReadiness::Ready { .. }));
+                        && matches!(
+                            readiness,
+                            DeliveryReadiness::Ready { .. }
+                                | DeliveryReadiness::Working
+                                | DeliveryReadiness::Unconfirmed
+                        ));
                 if !gone && (unsent.seen || tracked) {
                     // Typing again would stack a second notice on this one (#753).
                     let opportunity = subscriber.retry.is_none()
@@ -366,6 +400,8 @@ impl Dispatcher {
                         && matches!(
                             readiness,
                             DeliveryReadiness::Ready { .. }
+                                | DeliveryReadiness::Working
+                                | DeliveryReadiness::Unconfirmed
                                 | DeliveryReadiness::Unsent
                                 | DeliveryReadiness::Drafting
                         )
@@ -438,9 +474,21 @@ impl Dispatcher {
                 continue;
             }
             if reconcile && subscriber.attempt.is_none() && !subscriber.wanted && backoff_passed {
-                match router.injector.delivery_readiness(&subscriber.session_id) {
+                match Self::readiness(router, subscriber, unread) {
                     DeliveryReadiness::Ready { idle } => {
                         subscriber.wanted = idle;
+                        Self::hold(
+                            router,
+                            handle,
+                            subscriber,
+                            (!idle).then_some(DeliveryReadiness::Ready { idle }),
+                            unread,
+                            now,
+                        );
+                        Self::blocked(router, handle, subscriber, unread, None);
+                    }
+                    DeliveryReadiness::Working => {
+                        subscriber.wanted = false;
                         Self::hold(router, handle, subscriber, None, unread, now);
                         Self::blocked(router, handle, subscriber, unread, None);
                     }
@@ -464,12 +512,16 @@ impl Dispatcher {
                 continue;
             }
             subscriber.retry = None;
-            let readiness = router.injector.delivery_readiness(&subscriber.session_id);
+            let readiness = Self::readiness(router, subscriber, unread);
             Self::hold(
                 router,
                 handle,
                 subscriber,
-                (!matches!(readiness, DeliveryReadiness::Ready { .. })).then_some(readiness),
+                (!matches!(
+                    readiness,
+                    DeliveryReadiness::Ready { idle: true } | DeliveryReadiness::Working
+                ))
+                .then_some(readiness),
                 unread,
                 now,
             );
@@ -481,7 +533,7 @@ impl Dispatcher {
                 blocked_reason(readiness),
             );
             match readiness {
-                DeliveryReadiness::Ready { idle: true } => {
+                DeliveryReadiness::Ready { idle: true } | DeliveryReadiness::Working => {
                     match router.injector.reserve_delivery(&subscriber.session_id) {
                         Ok(DeliveryReservation::Ready(token)) => {
                             let unread = router
@@ -564,8 +616,25 @@ impl Dispatcher {
         )
     }
 
+    /// An unsent notice or draft that no unconfirmed attempt of ours left behind is re-checked
+    /// against the composer before it holds a member with unread messages.
+    fn readiness(router: &Router, subscriber: &Subscriber, unread: usize) -> DeliveryReadiness {
+        let readiness = router.injector.delivery_readiness(&subscriber.session_id);
+        if !matches!(
+            readiness,
+            DeliveryReadiness::Unsent | DeliveryReadiness::Drafting
+        ) || unread == 0
+            || subscriber.unsent.is_some()
+            || subscriber.attempt.is_some()
+        {
+            return readiness;
+        }
+        router.injector.recheck_composer(&subscriber.session_id);
+        router.injector.delivery_readiness(&subscriber.session_id)
+    }
+
     /// Log each change of the reason delivery is held, and warn once a hold with unread messages
-    /// outlasts the redelivery backoff.
+    /// outlasts the redelivery backoff. A working member is a hold that never warns.
     fn hold(
         router: &Router,
         handle: &str,
@@ -613,9 +682,11 @@ impl Dispatcher {
             DeliveryReadiness::NeedsYou => "it is waiting for a response to its prompt",
             DeliveryReadiness::RecentlyTyping(_) => "someone keeps typing in its terminal",
             DeliveryReadiness::InFlight => "earlier input to its terminal has not finished",
-            // An unavailable session has its own queued warning, and a hooked first turn
-            // stays Starting until it ends, so a long one is not a stall.
+            DeliveryReadiness::Unconfirmed => "it shows busy but its agent has not reported a turn",
+            // A working member's long turn is not a stall. An unavailable session has its own
+            // queued warning, and a hooked first turn stays Starting until it ends.
             DeliveryReadiness::Ready { .. }
+            | DeliveryReadiness::Working
             | DeliveryReadiness::Unavailable
             | DeliveryReadiness::Pending
             | DeliveryReadiness::Starting => return,

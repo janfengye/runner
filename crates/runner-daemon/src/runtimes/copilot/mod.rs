@@ -94,6 +94,7 @@ impl RuntimeAdapter for Copilot {
         session_id: &str,
         cwd: Option<&Path>,
         copilot_home: Option<&str>,
+        _claude_config_dir: Option<&str>,
     ) -> crate::error::Result<()> {
         if let Some(cwd) = trust_cwd(session_id, Runtime::Copilot, cwd) {
             copilot_trust::seed_project_trust(cwd, copilot_home)?;
@@ -146,7 +147,17 @@ impl RuntimeAdapter for Copilot {
         let mut out = Vec::new();
         out.extend(self.model_effort_args(ctx.model, ctx.effort));
         out.push("--no-auto-update".into());
-        out.extend(copilot_status_args(ctx.app_data_dir));
+        if status_hooks_enabled(ctx.env) {
+            out.extend(copilot_status_args(ctx.app_data_dir));
+        } else {
+            let directory = copilot_status::identity_plugin_dir(ctx.app_data_dir);
+            if directory.join("hooks/hooks.json").is_file() {
+                out.extend([
+                    "--plugin-dir".into(),
+                    directory.to_string_lossy().into_owned(),
+                ]);
+            }
+        }
         out.extend(self.first_turn_argv(if ctx.resuming { None } else { ctx.first_turn }));
         out
     }

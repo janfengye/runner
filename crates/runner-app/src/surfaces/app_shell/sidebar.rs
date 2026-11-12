@@ -58,6 +58,13 @@ impl NativeRoot {
             } else {
                 theme::sidebar()
             })
+            .map(|sidebar| {
+                #[cfg(target_os = "linux")]
+                let sidebar = crate::platform_ui::round_window_corners(sidebar, window)
+                    .rounded_tr(px(0.))
+                    .rounded_br(px(0.));
+                sidebar
+            })
             .map(|element| {
                 #[cfg(test)]
                 let element = crate::theme_snapshot::record_fill("APP_SIDEBAR", element);
@@ -88,68 +95,24 @@ impl NativeRoot {
         (Some(sidebar.into_any_element()), divider)
     }
 
+    pub(super) fn toggle_sidebar_view(&mut self, cx: &mut Context<Self>) {
+        self.front_page_sidebar().update(cx, |sidebar, cx| {
+            sidebar.clear_sidebar_drag("change-view", cx);
+            sidebar.toggle_active_only(cx);
+        });
+        self.sync_sidebar_shortcut_rows(cx);
+        cx.notify();
+    }
+
     pub(super) fn render_sidebar_brand(
         &self,
-        update_version: Option<String>,
+        update: Option<runner_app::updater::UpdateState>,
+        window: &Window,
         cx: &Context<Self>,
     ) -> Div {
-        let zoom = self.settings(cx).app_zoom;
-        let updater = global_updater(cx);
-        let update_hint = update_version
+        let update_hint = update
             .filter(|_| self.remote_client.is_local())
-            .map(|version| {
-                let click_updater = updater.clone();
-                let click_root = cx.weak_entity();
-                #[cfg(target_os = "macos")]
-                let tooltip = crate::platform_ui::update_hint_tooltip(&version);
-                #[cfg(any(windows, target_os = "linux"))]
-                let tooltip =
-                    crate::platform_ui::update_hint_tooltip(&version, updater.read(cx).state());
-                Tooltip::new(
-                    "sidebar-update-tooltip",
-                    tooltip,
-                    div()
-                        .id("sidebar-update")
-                        .when(cfg!(test), |button| {
-                            button.debug_selector(|| "SIDEBAR_UPDATE".into())
-                        })
-                        .flex_none()
-                        .size(rems(24. / 16.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_sm()
-                        .border_1()
-                        .border_color(gpui::transparent_black())
-                        .cursor_pointer()
-                        .hover(|button| {
-                            button
-                                .border_color(alpha(theme::accent(), 0.4))
-                                .bg(alpha(theme::accent(), 0.1))
-                        })
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(move |_, _window, cx| {
-                            cx.stop_propagation();
-                            if !click_root
-                                .upgrade()
-                                .is_some_and(|root| root.read(cx).remote_client.is_local())
-                            {
-                                return;
-                            }
-                            #[cfg(target_os = "macos")]
-                            crate::platform_ui::activate_update_hint(&click_updater, cx);
-                            #[cfg(any(windows, target_os = "linux"))]
-                            crate::platform_ui::activate_update_hint(&click_updater, _window, cx);
-                        })
-                        .child(
-                            svg()
-                                .path("circle-arrow-down.svg")
-                                .flex_none()
-                                .size(px(14. * zoom))
-                                .text_color(theme::accent()),
-                        ),
-                )
-            });
+            .and_then(|update| self.render_update_hint(&update, window, cx));
         let active_only = self.front_page_sidebar().read(cx).active_only(cx);
         let active_toggle = IconButton::new("sidebar-active-toggle", "list-filter.svg")
             .size(IconButtonSize::Md)
@@ -167,33 +130,18 @@ impl NativeRoot {
                 let owner = cx.entity();
                 move |_, cx| {
                     owner.update(cx, |this, cx| {
-                        this.clear_sidebar_drag("change-view", cx);
-                        if this.remote_client.is_active() {
-                            this.front_page_sidebar()
-                                .update(cx, |sidebar, cx| sidebar.toggle_active_only(cx));
-                            this.sync_sidebar_shortcut_rows(cx);
-                            cx.notify();
-                            return;
-                        }
-                        this.app_store.update(cx, |store, cx| {
-                            store.update_settings(
-                                |settings| {
-                                    settings.sidebar_active_only = !settings.sidebar_active_only;
-                                    true
-                                },
-                                true,
-                                cx,
-                            );
-                        });
-                        this.sync_sidebar_shortcut_rows(cx);
-                        cx.notify();
+                        this.toggle_sidebar_view(cx);
                     });
                 }
             });
         let search_button = div()
             .id("sidebar-search")
+            .debug_selector(|| "SIDEBAR_SEARCH".into())
             .group("sidebar-search")
             .tab_index(0)
+            // A click leaves keyboard focus where it was, so dismissing the palette returns
+            // there instead of to this button.
+            .capture_any_mouse_down(|_, window, _| window.prevent_default())
             .flex_none()
             .size(px(24. * self.settings(cx).app_zoom))
             .flex()
@@ -310,87 +258,82 @@ impl NativeRoot {
         self.sync_sidebar_shortcut_rows(cx);
         let titlebar = self.render_sidebar_titlebar(window, cx);
         let zoom = self.settings(cx).app_zoom;
-        let updater = global_updater(cx);
-        let update_version =
-            app_update_hint_version(updater.read(cx).available()).map(str::to_owned);
-        let brand = self.render_sidebar_brand(update_version, cx);
-        let enabled = self.settings(cx).model_runtimes();
-        let visible_usage_runtimes = visible_usage_runtimes(&self.usage_installed, &enabled);
-        let show_usage = self.remote_client.is_local()
-            && !visible_usage_runtimes.is_empty()
+        let update = crate::surfaces::update_ui::visible_update_state(global_updater(cx).read(cx));
+        let brand = self.render_sidebar_brand(update, window, cx);
+        let (snapshot, visible_usage_runtimes, dimmed) = self.sidebar_usage(cx);
+        let older_host = self.remote_client.older_host(cx).is_some();
+        let show_usage = (older_host || !visible_usage_runtimes.is_empty())
             && !self.front_page_sidebar_collapsed();
+        if !show_usage {
+            self.usage_open = false;
+        }
+        self.remote_client.sync_usage_popover(self.usage_open, cx);
         let anchor_owner = cx.entity();
         let usage = show_usage.then(|| {
-            let snapshot = self.app_store.read(cx).usage.clone();
-            let trigger = sidebar_usage_element(&snapshot, &visible_usage_runtimes, zoom)
+            let available = (self.front_page_sidebar_width(cx) - 96.) * zoom;
+            let trigger = if older_host {
+                sidebar_update_hint_element(available, zoom)
+                    .hover(|button| button.bg(theme::chrome_hover()))
+            } else {
+                sidebar_usage_element(&snapshot, &visible_usage_runtimes, zoom).max_w(px(available))
+            };
+            let trigger = trigger
+                .when(dimmed, |usage| usage.opacity(0.45))
                 .occlude()
                 .cursor_pointer()
-                .hover(|button| button.bg(theme::chrome_hover()))
+                .when(self.usage_open && !older_host, |button| {
+                    button.border_color(theme::muted())
+                })
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.usage_open = !this.usage_open;
-                    if this.usage_open {
+                    this.remote_client.sync_usage_popover(this.usage_open, cx);
+                    if this.usage_open && this.remote_client.is_local() {
+                        this.start_usage_refresh_timer(cx);
                         let core = this.core(cx).clone();
                         let _ = core.usage_refresh(RefreshReason::Open);
                         let _ = this.core(cx).runtime_check_updates(false);
                     }
                     cx.notify();
                 }));
-            div()
-                .relative()
-                .w(px((visible_usage_runtimes.len() as f32 * 52. + 20.)
-                    .min(self.front_page_sidebar_width(cx) - 56.)
-                    * zoom))
-                .flex_none()
-                .child(trigger)
-                .child(
-                    canvas(
-                        |_, _, _| {},
-                        move |bounds, _, _, cx| {
-                            anchor_owner.update(cx, |this, _| this.usage_anchor = Some(bounds));
-                        },
-                    )
-                    .absolute()
-                    .inset_0(),
+            div().relative().flex_none().child(trigger).child(
+                canvas(
+                    |_, _, _| {},
+                    move |bounds, _, _, cx| {
+                        anchor_owner.update(cx, |this, _| this.usage_anchor = Some(bounds));
+                    },
                 )
+                .absolute()
+                .inset_0(),
+            )
         });
         let footer = crate::platform_ui::sidebar_section()
             .when(cfg!(test), |footer| {
                 footer.debug_selector(|| "SIDEBAR_FOOTER".into())
             })
             .px_3()
+            .child(sidebar_footer_divider())
             .child(
-                div()
-                    .w_full()
-                    .h(px(1.))
-                    .flex()
-                    .children([90., 270.].map(|angle| {
-                        div().flex_1().h_full().bg(linear_gradient(
-                            angle,
-                            linear_color_stop(alpha(theme::chrome_selected_border(), 0.), 0.),
-                            linear_color_stop(theme::chrome_selected_border(), 1.),
-                        ))
-                    })),
-            )
-            .child(
-                div()
-                    .when(cfg!(test), |row| {
-                        row.debug_selector(|| "SIDEBAR_FOOTER_ROW".into())
-                    })
-                    .w_full()
-                    .pt_2()
-                    .flex()
-                    .items_center()
-                    .children(usage)
-                    .children(
-                        self.remote_client
-                            .is_active()
-                            .then(|| self.remote_client.render_remote_connection(cx)),
+                sidebar_footer_contents(
+                    usage.map(IntoElement::into_any_element),
+                    self.remote_client.render_host_button(cx),
+                    self.render_settings_button(cx),
+                    zoom,
+                )
+                .pt_2()
+                .child({
+                    let owner = cx.entity();
+                    canvas(
+                        |_, _, _| {},
+                        move |bounds, _, _, cx| {
+                            owner.update(cx, |this, _| {
+                                this.remote_client.ui.footer_left = Some(bounds.left())
+                            });
+                        },
                     )
-                    .when(self.remote_client.is_local(), |footer| {
-                        footer.child(div().flex_1())
-                    })
-                    .child(self.render_account_avatar(cx)),
+                    .absolute()
+                    .inset_0()
+                }),
             );
         // The content keeps its full width while the wrapper animates, so the
         // transition clips instead of squashing every row; a squashed row
@@ -404,19 +347,8 @@ impl NativeRoot {
             .pb_3()
             .children(titlebar)
             .child(brand)
-            .when(
-                self.app_store.read(cx).remote_access_enabled()
-                    && self
-                        .app_store
-                        .read(cx)
-                        .remote_status
-                        .as_ref()
-                        .is_some_and(crate::surfaces::settings::remote::account::signed_in),
-                |sidebar| sidebar.child(self.remote_client.render_computer_trigger(cx)),
-            )
             .child(self.front_page_sidebar())
             .child(footer)
-            .children(self.render_account_menu(window, cx))
             .children(
                 (self.usage_open && show_usage)
                     .then(|| {
@@ -437,7 +369,8 @@ impl NativeRoot {
                         })
                     })
                     .flatten(),
-            );
+            )
+            .children(self.render_update_popover(window, cx));
         content.into_any_element()
     }
 
@@ -449,13 +382,19 @@ impl NativeRoot {
         cx.notify();
     }
 
+    /// How far right of the sidebar's edge the border it resizes sits: the
+    /// island area's left edge, past the gap, when there are islands.
+    pub(crate) fn sidebar_border_offset(&self, cx: &App) -> f32 {
+        if self.front_page_has_islands() && !self.front_page_sidebar_collapsed() {
+            runner_app::ui::work_card::SIDEBAR_GAP * self.settings(cx).app_zoom
+        } else {
+            0.
+        }
+    }
+
     pub(crate) fn render_sidebar_resize_handle(&self, divider: f32, cx: &App) -> AnyElement {
         let zoom = self.settings(cx).app_zoom;
-        let left = if self.front_page_has_islands() && !self.front_page_sidebar_collapsed() {
-            divider
-        } else {
-            divider - resize_strip_inset(zoom)
-        };
+        let left = divider + self.sidebar_border_offset(cx) - resize_strip_inset(zoom);
         resize_strip(
             "sidebar-resize",
             ResizeAxis::Columns,
@@ -545,4 +484,68 @@ impl NativeRoot {
         })
         .detach();
     }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum SidebarFooterControl {
+    Host,
+    Settings,
+}
+
+impl SidebarFooterControl {
+    pub(crate) fn render(self, zoom: f32, color: gpui::Hsla) -> Div {
+        let (icon, size) = match self {
+            Self::Host => ("monitor.svg", 14.),
+            Self::Settings => ("settings.svg", 16.),
+        };
+        div()
+            .flex_none()
+            .size(px(32. * zoom))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .child(svg().path(icon).size(px(size * zoom)).text_color(color))
+    }
+}
+
+pub(crate) fn sidebar_footer_contents(
+    usage: Option<AnyElement>,
+    host: AnyElement,
+    settings: AnyElement,
+    zoom: f32,
+) -> Div {
+    div()
+        .when(cfg!(test), |row| {
+            row.debug_selector(|| "SIDEBAR_FOOTER_ROW".into())
+        })
+        .w_full()
+        .flex()
+        .items_center()
+        .relative()
+        .children(usage)
+        .child(div().flex_1())
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(8. * zoom))
+                .child(host)
+                .child(settings),
+        )
+}
+
+pub(crate) fn sidebar_footer_divider() -> Div {
+    div()
+        .w_full()
+        .h(px(1.))
+        .flex()
+        .children([90., 270.].map(|angle| {
+            div().flex_1().h_full().bg(linear_gradient(
+                angle,
+                linear_color_stop(alpha(theme::chrome_selected_border(), 0.), 0.),
+                linear_color_stop(theme::chrome_selected_border(), 1.),
+            ))
+        }))
 }

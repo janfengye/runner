@@ -2,16 +2,13 @@ use super::*;
 
 impl NativeRoot {
     pub(crate) fn render_settings_takeover(
-        &self,
+        &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let zoom = self.settings(cx).app_zoom;
         let width = self.settings(cx).sidebar_width * zoom;
-        let groups = filtered_nav_groups(
-            &self.settings_page.search_query,
-            self.app_store.read(cx).remote_access_enabled(),
-        );
+        let groups = filtered_nav_groups(&self.settings_page.search_query);
         let active = self.settings_page.pane;
         let nav = if groups.is_empty() {
             vec![div()
@@ -28,6 +25,15 @@ impl NativeRoot {
                 .collect()
         };
         let content = self.render_settings_pane(cx);
+        // Keep the full-size footer sample when zoom leaves little room for page gutters.
+        let horizontal_padding = if active == SettingsPane::Usage {
+            let preview_width = super::super::usage::USAGE_PREVIEW_WIDTH
+                + 2. * super::super::usage::USAGE_PREVIEW_PADDING;
+            let available = f32::from(window.bounds().size.width) - width - 8. * zoom - 4.;
+            ((available - preview_width * zoom) / 2.).clamp(0., 40. * zoom)
+        } else {
+            40. * zoom
+        };
 
         div()
             .absolute()
@@ -57,6 +63,11 @@ impl NativeRoot {
             .flex()
             .overflow_hidden()
             .bg(gpui::transparent_black())
+            .map(|settings| {
+                #[cfg(target_os = "linux")]
+                let settings = crate::platform_ui::round_window_corners(settings, window);
+                settings
+            })
             .occlude()
             .child(
                 div()
@@ -70,6 +81,13 @@ impl NativeRoot {
                         gpui::transparent_black()
                     } else {
                         theme::sidebar()
+                    })
+                    .map(|sidebar| {
+                        #[cfg(target_os = "linux")]
+                        let sidebar = crate::platform_ui::round_window_corners(sidebar, window)
+                            .rounded_tr(px(0.))
+                            .rounded_br(px(0.));
+                        sidebar
                     })
                     .children(self.render_sidebar_titlebar(window, cx))
                     .child(
@@ -154,24 +172,25 @@ impl NativeRoot {
                         &self.settings_page.content_scroll,
                         self.settings_page.content_scrollbar.clone(),
                         zoom,
+                        px(horizontal_padding),
                     )),
             )
             .child(self.render_sidebar_resize_handle(width, cx))
-            .when(active == SettingsPane::Skills, |takeover| {
-                takeover.children(
-                    self.settings_page
-                        .skills
-                        .as_ref()
-                        .map(|pane| pane.read(cx).detail.clone()),
-                )
-            })
-            .when(active == SettingsPane::Mcp, |takeover| {
-                takeover.children(
-                    self.settings_page
-                        .mcp
-                        .as_ref()
-                        .map(|pane| pane.read(cx).detail.clone()),
-                )
+            .when(active == SettingsPane::Agents, |takeover| {
+                if let Some(agents) = &self.settings_page.agents {
+                    let agents = agents.read(cx);
+                    match agents.tab {
+                        settings::agents::AgentTab::Skills => {
+                            takeover.child(agents.skills.read(cx).detail.clone())
+                        }
+                        settings::agents::AgentTab::Mcp => {
+                            takeover.child(agents.mcp.read(cx).detail.clone())
+                        }
+                        _ => takeover,
+                    }
+                } else {
+                    takeover
+                }
             })
             .into_any_element()
     }
@@ -315,6 +334,22 @@ impl NativeRoot {
                     }),
             )
             .child(div().min_w(px(0.)).truncate().child(pane.label()))
+            .when(
+                pane == SettingsPane::Agents
+                    && crate::surfaces::app_shell::update_dot_visible(
+                        &self.agent_updates,
+                        self.settings(cx),
+                    ),
+                |row| {
+                    row.child(div().flex_1()).child(
+                        div()
+                            .debug_selector(|| "SETTINGS_AGENTS_UPDATE_DOT".into())
+                            .size(rems(6. / 16.))
+                            .rounded_full()
+                            .bg(theme::accent()),
+                    )
+                },
+            )
             .on_click(move |_, window, cx| {
                 root.update(cx, |this, root_cx| {
                     this.enter_settings_pane(pane, window, root_cx)
@@ -331,9 +366,10 @@ impl NativeRoot {
             .into_any_element()
     }
 
-    pub(super) fn render_settings_pane(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(super) fn render_settings_pane(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         match self.settings_page.pane {
             SettingsPane::General => Some(self.render_general_settings(cx)),
+            SettingsPane::Usage => Some(self.render_usage_settings(cx)),
             SettingsPane::Missions => Some(self.render_missions_settings(cx)),
             SettingsPane::Appearance => Some(self.render_appearance_settings(cx)),
             SettingsPane::Account => Some(self.render_account_settings(cx)),
@@ -341,29 +377,17 @@ impl NativeRoot {
             SettingsPane::Notifications => Some(self.render_notifications_settings(cx)),
             SettingsPane::Terminal => Some(self.render_terminal_settings(cx)),
             SettingsPane::Shortcuts => Some(self.render_shortcuts_settings(cx)),
+            SettingsPane::SidePanel => Some(self.render_side_panel_settings(cx)),
+            SettingsPane::Files => Some(self.render_files_settings(cx)),
             SettingsPane::Agents => self
                 .settings_page
                 .agents
                 .clone()
                 .map(IntoElement::into_any_element),
-            SettingsPane::Skills => self
-                .settings_page
-                .skills
-                .clone()
-                .map(IntoElement::into_any_element),
-            SettingsPane::Mcp => self
-                .settings_page
-                .mcp
-                .clone()
-                .map(IntoElement::into_any_element),
+            SettingsPane::Skills | SettingsPane::Mcp => None,
             SettingsPane::Updates => self
                 .settings_page
                 .updates
-                .clone()
-                .map(IntoElement::into_any_element),
-            SettingsPane::Diagnostics => self
-                .settings_page
-                .diagnostics
                 .clone()
                 .map(IntoElement::into_any_element),
             SettingsPane::About => self

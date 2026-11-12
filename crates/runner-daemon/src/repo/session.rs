@@ -652,6 +652,13 @@ fn mark_running_for_resume(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<V
     Ok(ids)
 }
 
+/// The sessions with launch-resume work queued or in flight.
+pub fn resume_on_launch_ids(conn: &Connection) -> rusqlite::Result<HashSet<String>> {
+    let mut stmt = conn.prepare("SELECT id FROM sessions WHERE resume_on_launch != 0")?;
+    let ids = stmt.query_map([], |row| row.get(0))?.collect();
+    ids
+}
+
 /// Atomically claim the next quit-time stamp outside `excluded`. Excluded
 /// claims stay pending so a surface can resume them when it becomes visible.
 /// Shells need no prior conversation key because relaunching one always starts
@@ -861,6 +868,24 @@ pub fn unarchive_direct(conn: &Connection, id: &str) -> rusqlite::Result<usize> 
     )
 }
 
+/// The Files view's saved root (#634); `None` for no row or no saved root.
+pub fn files_root(conn: &Connection, id: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT files_root FROM sessions WHERE id = ?1",
+        rusqlite::params![id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map(Option::flatten)
+}
+
+pub fn set_files_root(conn: &Connection, id: &str, root: Option<&str>) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE sessions SET files_root = ?2 WHERE id = ?1",
+        rusqlite::params![id, root],
+    )
+}
+
 pub fn set_title(conn: &Connection, id: &str, title: Option<&str>) -> rusqlite::Result<usize> {
     conn.execute(
         "UPDATE sessions SET title = ?2 WHERE id = ?1",
@@ -1067,6 +1092,42 @@ pub fn get_direct(conn: &Connection, id: &str) -> rusqlite::Result<Option<Direct
     );
     conn.query_row(&sql, rusqlite::params![id], direct_row)
         .optional()
+}
+
+/// The title the sidebar shows for a direct chat when the app has no live
+/// title of its own: the person's name for it, the agent's persisted
+/// topic, else the role or runtime label.
+pub fn direct_title(chat: &DirectSessionRow) -> String {
+    let runtime = chat.row.agent_runtime.as_deref().unwrap_or_default();
+    let handle = chat.role_handle.as_deref();
+    runner_core::protocol::session_title::preferred_title(
+        chat.row.title.as_deref(),
+        None,
+        chat.row.live_title.as_deref(),
+        runtime,
+        handle,
+        chat.row.cwd.as_deref(),
+    )
+    .unwrap_or_else(|| {
+        let command = chat
+            .row
+            .launch_definition
+            .as_ref()
+            .map(|definition| definition.command.as_str())
+            .or(chat.row.agent_command.as_deref())
+            .unwrap_or_default();
+        let display_name = chat
+            .role_display_name
+            .as_deref()
+            .filter(|_| handle.is_some())
+            .or_else(|| {
+                crate::runtimes::for_key(runtime)
+                    .catalog()
+                    .map(|catalog| catalog.display_name)
+            })
+            .unwrap_or(runtime);
+        runner_core::protocol::session_title::default_label(runtime, command, handle, display_name)
+    })
 }
 
 pub fn live_handles_for_mission(

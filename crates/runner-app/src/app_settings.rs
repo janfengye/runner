@@ -17,16 +17,26 @@ pub const SIDEBAR_DEFAULT: f32 = 240.;
 pub const ZOOM_STEPS: [f32; 15] = [
     0.6, 0.7, 0.8, 0.9, 1., 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.,
 ];
-pub const TERMINAL_FONT_SIZE_MIN: u16 = 10;
-pub const TERMINAL_FONT_SIZE_MAX: u16 = 20;
+pub const TERMINAL_FONT_SIZE_MIN: u16 = 8;
+pub const TERMINAL_FONT_SIZE_MAX: u16 = 32;
 pub const TERMINAL_FONT_SIZE_DEFAULT: u16 = 13;
-pub const TERMINAL_SCROLLBACK_LINES: usize = 10_000;
+pub const TERMINAL_LINE_HEIGHT_MIN: f32 = 1.0;
+pub const TERMINAL_LINE_HEIGHT_MAX: f32 = 1.6;
+pub const TERMINAL_LINE_HEIGHT_DEFAULT: f32 = 1.4;
+pub const TERMINAL_SCROLLBACK_PRESETS: [usize; 5] = [1_000, 5_000, 10_000, 25_000, 50_000];
+pub const TERMINAL_SCROLLBACK_DEFAULT: usize = 10_000;
 pub const CHAT_PANEL_MIN: f32 = 200.;
 pub const CHAT_PANEL_MAX: f32 = 480.;
 pub const CHAT_PANEL_DEFAULT: f32 = 320.;
 pub const MISSION_RAIL_MIN: f32 = 200.;
 pub const MISSION_RAIL_MAX: f32 = 480.;
 pub const MISSION_RAIL_DEFAULT: f32 = 288.;
+pub const FILE_VIEWER_MIN: f32 = 200.;
+pub const FILE_VIEWER_MAX: f32 = 1200.;
+pub const FILE_VIEWER_DEFAULT: f32 = 440.;
+pub const FILE_TREE_MIN: f32 = 160.;
+pub const FILE_TREE_MAX: f32 = 480.;
+pub const FILE_TREE_DEFAULT: f32 = 240.;
 
 /// The terminal palette used while the app resolves to a light variant.
 /// Unknown keys (including the retired `match-app` and `monokai`) load as
@@ -139,7 +149,11 @@ pub fn configure_terminal(
         TerminalCursorStyle::Underline => CursorShape::Underline,
         TerminalCursorStyle::Bar => CursorShape::Beam,
     };
-    terminal.configure(TERMINAL_SCROLLBACK_LINES, cursor);
+    terminal.configure(
+        settings.terminal_scrollback_lines,
+        cursor,
+        settings.terminal_cursor_blink,
+    );
 }
 
 /// The UI typeface is pinned to the bundled Inter (`assets/fonts/Inter-*.ttf`);
@@ -155,38 +169,56 @@ pub fn app_font() -> Font {
     font
 }
 
-/// The bundled terminal face is the Nerd Font *Mono* build of JetBrains Mono
-/// (`assets/fonts/JetBrainsMonoNerdFontMono-*.ttf`): it keeps every icon one
-/// cell wide, which the grid renderer assumes. Settings saved under the retired
-/// "Meslo Nerd Font" default load as this face.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TerminalFontFamily {
-    #[serde(
-        alias = "System default",
-        alias = "Monaco",
-        alias = "SF Mono",
-        alias = "Fira Code"
-    )]
-    Menlo,
-    #[default]
-    #[serde(rename = "JetBrains Mono", alias = "Meslo Nerd Font")]
-    JetBrainsMono,
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct TerminalFontFamily(String);
+
+impl Default for TerminalFontFamily {
+    fn default() -> Self {
+        Self(crate::terminal::fonts::BUNDLED_FONT.to_owned())
+    }
+}
+
+impl<'de> Deserialize<'de> for TerminalFontFamily {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let family = String::deserialize(deserializer)?;
+        Ok(Self::new(match family.as_str() {
+            "JetBrains Mono" | "Meslo Nerd Font" => crate::terminal::fonts::BUNDLED_FONT,
+            "Menlo" => runner_app::theme::SYSTEM_MONOSPACE_FONT,
+            _ => &family,
+        }))
+    }
 }
 
 impl TerminalFontFamily {
-    pub fn family(self) -> &'static str {
-        match self {
-            Self::Menlo => runner_app::theme::SYSTEM_MONOSPACE_FONT,
-            Self::JetBrainsMono => "JetBrainsMono Nerd Font Mono",
-        }
+    pub fn new(family: impl Into<String>) -> Self {
+        Self(family.into())
     }
 
-    pub fn font(self) -> Font {
-        let mut font = font(self.family());
+    pub fn family(&self) -> &str {
+        &self.0
+    }
+
+    pub fn font(&self, cx: &gpui::App) -> Font {
+        let available = crate::terminal::fonts::FontFamilyCache::loaded(cx)
+            .is_some_and(|families| families.all.contains(&self.0));
+        self.resolved_font(available)
+    }
+
+    fn resolved_font(&self, available: bool) -> Font {
+        let mut font = font(if available {
+            self.0.clone()
+        } else {
+            crate::terminal::fonts::BUNDLED_FONT.to_owned()
+        });
         font.fallbacks = Some(FontFallbacks::from_fonts(
-            runner_app::platform_fonts::TERMINAL_FONT_FALLBACKS
-                .iter()
-                .map(|family| (*family).to_owned())
+            std::iter::once(crate::terminal::fonts::BUNDLED_FONT)
+                .chain(
+                    runner_app::platform_fonts::TERMINAL_FONT_FALLBACKS
+                        .iter()
+                        .copied(),
+                )
+                .map(str::to_owned)
                 .collect(),
         ));
         font
@@ -202,6 +234,32 @@ pub enum TerminalCursorStyle {
     Bar,
 }
 
+/// How a Markdown file opens in the viewer; the `</>` button switches a tab
+/// between the two.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MarkdownOpenAs {
+    Source,
+    #[default]
+    #[serde(other)]
+    Rendered,
+}
+
+impl MarkdownOpenAs {
+    pub const ALL: [Self; 2] = [Self::Rendered, Self::Source];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Rendered => "rendered",
+            Self::Source => "source",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.key() == value)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FileLinkEditor {
@@ -215,19 +273,6 @@ pub enum FileLinkEditor {
 
 impl FileLinkEditor {
     pub const ALL: [Self; 4] = [Self::DefaultApp, Self::Zed, Self::VsCode, Self::Cursor];
-
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::DefaultApp => "default-app",
-            Self::Zed => "zed",
-            Self::VsCode => "vscode",
-            Self::Cursor => "cursor",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|editor| editor.key() == value)
-    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -247,20 +292,6 @@ impl FileLinkEditor {
             Self::DefaultApp => None,
         }
     }
-
-    /// Where the editor's own UI installs that CLI.
-    pub fn install_hint(self) -> Option<&'static str> {
-        match self {
-            Self::Zed => Some(crate::i18n::text("ui.in_zed_run_zed_install_cli")),
-            Self::VsCode => Some(crate::i18n::text(
-                "ui.in_vs_code_run_shell_command_install_code_command_in_path",
-            )),
-            Self::Cursor => Some(crate::i18n::text(
-                "ui.in_cursor_run_shell_command_install_cursor_command",
-            )),
-            Self::DefaultApp => None,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -268,6 +299,7 @@ impl FileLinkEditor {
 pub struct NotificationSettings {
     pub chats: ChatNotifications,
     pub missions: MissionNotifications,
+    pub usage: UsageNotifications,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -299,10 +331,114 @@ pub struct MissionNotifications {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
+pub struct UsageNotifications {
+    pub near_limit: bool,
+    pub threshold: u8,
+    pub alerted: Vec<UsageAlertPeriod>,
+}
+impl Default for UsageNotifications {
+    fn default() -> Self {
+        Self {
+            near_limit: true,
+            threshold: 80,
+            alerted: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageAlertPeriod {
+    pub runtime: runner_core::Runtime,
+    pub account: String,
+    pub window: String,
+    pub resets_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct UsageSettings {
+    pub sidebar: bool,
+    pub codex: bool,
+    pub claude_code: bool,
+    pub five_hour: bool,
+}
+impl Default for UsageSettings {
+    fn default() -> Self {
+        Self {
+            sidebar: true,
+            codex: true,
+            claude_code: true,
+            five_hour: true,
+        }
+    }
+}
+impl UsageSettings {
+    pub fn badge(&self, runtime: runner_core::Runtime) -> bool {
+        self.sidebar
+            && match runtime {
+                runner_core::Runtime::Codex => self.codex,
+                runner_core::Runtime::ClaudeCode => self.claude_code,
+                _ => false,
+            }
+    }
+    pub fn checks(&self, runtime: runner_core::Runtime, alert: bool) -> bool {
+        self.badge(runtime) || alert
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RemoteSidebarSettings {
+    pub active_only: bool,
+    pub projects_open: bool,
+    pub chats_open: bool,
+    pub collapsed_projects: BTreeSet<String>,
+    pub collapsed_active_groups: BTreeSet<String>,
+    pub collapsed_link_groups: BTreeSet<String>,
+}
+
+impl Default for RemoteSidebarSettings {
+    fn default() -> Self {
+        Self {
+            active_only: false,
+            projects_open: true,
+            chats_open: true,
+            collapsed_projects: BTreeSet::new(),
+            collapsed_active_groups: BTreeSet::new(),
+            collapsed_link_groups: BTreeSet::new(),
+        }
+    }
+}
+
+impl RemoteSidebarSettings {
+    pub(crate) fn from_settings(settings: &AppSettings) -> Self {
+        Self {
+            active_only: settings.sidebar_active_only,
+            projects_open: settings.sidebar_projects_open,
+            chats_open: settings.sidebar_chats_open,
+            collapsed_projects: settings.sidebar_collapsed_projects.clone(),
+            collapsed_active_groups: settings.sidebar_collapsed_active_groups.clone(),
+            collapsed_link_groups: settings.sidebar_collapsed_link_groups.clone(),
+        }
+    }
+
+    pub(crate) fn apply_to(self, settings: &mut AppSettings) {
+        settings.sidebar_active_only = self.active_only;
+        settings.sidebar_projects_open = self.projects_open;
+        settings.sidebar_chats_open = self.chats_open;
+        settings.sidebar_collapsed_projects = self.collapsed_projects;
+        settings.sidebar_collapsed_active_groups = self.collapsed_active_groups;
+        settings.sidebar_collapsed_link_groups = self.collapsed_link_groups;
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct AppSettings {
     pub language: runner_app::i18n::Language,
     pub notifications: NotificationSettings,
-    pub local_only: bool,
+    pub usage: UsageSettings,
     pub app_theme: ThemeIntent,
     pub window_material: runner_app::appearance::WindowMaterial,
     pub light_app_theme: LightTheme,
@@ -313,7 +449,11 @@ pub struct AppSettings {
     pub dark_terminal_theme: DarkTerminalTheme,
     pub terminal_font_family: TerminalFontFamily,
     pub terminal_font_size: u16,
+    pub terminal_line_height: f32,
     pub terminal_cursor_style: TerminalCursorStyle,
+    pub terminal_cursor_blink: bool,
+    pub terminal_scrollback_lines: usize,
+    pub terminal_copy_on_select: bool,
     pub option_as_meta: runner_app::terminal_ime::OptionAsMeta,
     pub sidebar_width: f32,
     pub roles_page_size: usize,
@@ -324,10 +464,29 @@ pub struct AppSettings {
     pub sidebar_chats_open: bool,
     pub sidebar_collapsed_projects: BTreeSet<String>,
     pub sidebar_collapsed_active_groups: BTreeSet<String>,
+    /// Collapsed linked groups (#748), by the node id of the tab heading them.
+    pub sidebar_collapsed_link_groups: BTreeSet<String>,
+    pub remote_sidebars: BTreeMap<String, RemoteSidebarSettings>,
     pub chat_panel_open: bool,
     pub chat_panel_width: f32,
     pub mission_rail_open: bool,
     pub mission_rail_width: f32,
+    /// The file's width in a side panel widened by an open file, beside the tree.
+    pub file_viewer_width: f32,
+    /// The tree's width on the outer edge of a panel widened by an open file.
+    pub file_tree_width: f32,
+    /// Settings → Side panel → Panel: off hides every tab's panel and its
+    /// toggle, keeping the open state and the view switches below.
+    pub show_side_panel: bool,
+    /// Whether the `+` menu offers Info and Files.
+    pub info_view: bool,
+    pub files_view: bool,
+    pub file_icons: crate::file_icons::IconSet,
+    /// `None` follows the terminal's Font family.
+    pub files_font_family: Option<TerminalFontFamily>,
+    /// `None` follows the terminal's font size.
+    pub files_font_size: Option<u16>,
+    pub markdown_open_as: MarkdownOpenAs,
     pub last_mission_terminal_ids: BTreeMap<String, String>,
     pub default_crew_id: String,
     pub default_working_dir: String,
@@ -338,6 +497,7 @@ pub struct AppSettings {
     pub automatically_check_for_updates: bool,
     #[cfg(any(windows, target_os = "linux"))]
     pub automatically_download_updates: bool,
+    pub skipped_update_version: Option<String>,
     pub default_runtime: String,
     pub disabled_agents: BTreeSet<String>,
     pub enabled_agents: BTreeSet<String>,
@@ -348,6 +508,8 @@ pub struct AppSettings {
     pub runner_skill_enabled: bool,
     #[serde(default, deserialize_with = "keymap::deserialize_overrides")]
     pub keymap_overrides: KeymapOverrides,
+    #[cfg(any(windows, target_os = "linux"))]
+    pub terminal_ctrl_keys: keymap::TerminalCtrlKeys,
 }
 
 impl Default for AppSettings {
@@ -355,7 +517,7 @@ impl Default for AppSettings {
         Self {
             language: runner_app::i18n::Language::System,
             notifications: NotificationSettings::default(),
-            local_only: false,
+            usage: UsageSettings::default(),
             app_theme: ThemeIntent::Auto,
             window_material: Default::default(),
             light_app_theme: LightTheme::RunnerLight,
@@ -363,9 +525,13 @@ impl Default for AppSettings {
             app_zoom: 1.,
             light_terminal_theme: LightTerminalTheme::RosePineDawn,
             dark_terminal_theme: DarkTerminalTheme::Runner,
-            terminal_font_family: TerminalFontFamily::JetBrainsMono,
+            terminal_font_family: TerminalFontFamily::default(),
             terminal_font_size: TERMINAL_FONT_SIZE_DEFAULT,
+            terminal_line_height: TERMINAL_LINE_HEIGHT_DEFAULT,
             terminal_cursor_style: TerminalCursorStyle::Block,
+            terminal_cursor_blink: false,
+            terminal_scrollback_lines: TERMINAL_SCROLLBACK_DEFAULT,
+            terminal_copy_on_select: false,
             option_as_meta: Default::default(),
             sidebar_width: SIDEBAR_DEFAULT,
             roles_page_size: runner_app::ui::DEFAULT_PAGE_SIZE,
@@ -376,10 +542,21 @@ impl Default for AppSettings {
             sidebar_chats_open: true,
             sidebar_collapsed_projects: BTreeSet::new(),
             sidebar_collapsed_active_groups: BTreeSet::new(),
+            sidebar_collapsed_link_groups: BTreeSet::new(),
+            remote_sidebars: BTreeMap::new(),
             chat_panel_open: true,
             chat_panel_width: CHAT_PANEL_DEFAULT,
             mission_rail_open: true,
             mission_rail_width: MISSION_RAIL_DEFAULT,
+            file_viewer_width: FILE_VIEWER_DEFAULT,
+            file_tree_width: FILE_TREE_DEFAULT,
+            show_side_panel: true,
+            info_view: true,
+            files_view: true,
+            file_icons: Default::default(),
+            files_font_family: None,
+            files_font_size: None,
+            markdown_open_as: MarkdownOpenAs::Rendered,
             last_mission_terminal_ids: BTreeMap::new(),
             default_crew_id: String::new(),
             default_working_dir: String::new(),
@@ -390,6 +567,7 @@ impl Default for AppSettings {
             automatically_check_for_updates: true,
             #[cfg(any(windows, target_os = "linux"))]
             automatically_download_updates: true,
+            skipped_update_version: None,
             default_runtime: String::new(),
             disabled_agents: BTreeSet::new(),
             enabled_agents: BTreeSet::new(),
@@ -399,11 +577,24 @@ impl Default for AppSettings {
             initialized_command_install: false,
             runner_skill_enabled: true,
             keymap_overrides: KeymapOverrides::new(),
+            #[cfg(any(windows, target_os = "linux"))]
+            terminal_ctrl_keys: Default::default(),
         }
     }
 }
 
 impl AppSettings {
+    pub(crate) fn terminal_ctrl_keys(&self) -> keymap::TerminalCtrlKeys {
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            self.terminal_ctrl_keys
+        }
+        #[cfg(target_os = "macos")]
+        {
+            keymap::TerminalCtrlKeys::RunnerFirst
+        }
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let contents = match fs::read_to_string(path) {
             Ok(contents) => contents,
@@ -426,11 +617,24 @@ impl AppSettings {
     pub fn normalize(&mut self) {
         self.app_zoom = normalize_zoom(self.app_zoom);
         self.terminal_font_size = normalize_terminal_font_size(self.terminal_font_size);
+        self.terminal_line_height = normalize_terminal_line_height(self.terminal_line_height);
+        self.terminal_scrollback_lines =
+            normalize_terminal_scrollback(self.terminal_scrollback_lines);
         self.sidebar_width = normalize_sidebar_width(self.sidebar_width);
         self.roles_page_size = runner_app::ui::list::normalize_page_size(self.roles_page_size);
         self.crews_page_size = runner_app::ui::list::normalize_page_size(self.crews_page_size);
         self.chat_panel_width = normalize_chat_panel_width(self.chat_panel_width);
         self.mission_rail_width = normalize_mission_rail_width(self.mission_rail_width);
+        self.file_viewer_width = normalize_file_viewer_width(self.file_viewer_width);
+        self.file_tree_width = normalize_file_tree_width(self.file_tree_width);
+        self.files_font_family = self
+            .files_font_family
+            .take()
+            .filter(|family| !family.family().trim().is_empty());
+        self.files_font_size = self
+            .files_font_size
+            .filter(|size| *size != 0)
+            .map(normalize_terminal_font_size);
         self.last_mission_terminal_ids
             .retain(|mission_id, session_id| !mission_id.is_empty() && !session_id.is_empty());
         self.default_crew_id = self.default_crew_id.trim().to_owned();
@@ -441,6 +645,29 @@ impl AppSettings {
         self.disabled_agents = normalize_agent_set(std::mem::take(&mut self.disabled_agents));
         self.enabled_agents = normalize_agent_set(std::mem::take(&mut self.enabled_agents));
         keymap::normalize_overrides(&mut self.keymap_overrides);
+    }
+
+    /// Whether a chat's or a terminal tab's panel is open: shown at all and
+    /// not collapsed.
+    pub fn chat_panel_shown(&self) -> bool {
+        self.show_side_panel && self.chat_panel_open
+    }
+
+    pub fn mission_rail_shown(&self) -> bool {
+        self.show_side_panel && self.mission_rail_open
+    }
+
+    /// The file viewer's code font: its own pick, or the terminal's; a font
+    /// that is not installed draws as the bundled one, the pick kept.
+    pub fn files_font(&self, cx: &gpui::App) -> Font {
+        self.files_font_family
+            .as_ref()
+            .unwrap_or(&self.terminal_font_family)
+            .font(cx)
+    }
+
+    pub fn files_font_size(&self) -> u16 {
+        self.files_font_size.unwrap_or(self.terminal_font_size)
     }
 
     pub fn model_runtimes(&self) -> Vec<Runtime> {
@@ -512,6 +739,25 @@ pub fn normalize_terminal_font_size(value: u16) -> u16 {
     }
 }
 
+pub fn normalize_terminal_line_height(value: f32) -> f32 {
+    if !value.is_finite() {
+        return TERMINAL_LINE_HEIGHT_DEFAULT;
+    }
+    let tenths = (value * 10.).round() as i32;
+    tenths.clamp(
+        (TERMINAL_LINE_HEIGHT_MIN * 10.) as i32,
+        (TERMINAL_LINE_HEIGHT_MAX * 10.) as i32,
+    ) as f32
+        / 10.
+}
+
+pub fn normalize_terminal_scrollback(value: usize) -> usize {
+    value.clamp(
+        TERMINAL_SCROLLBACK_PRESETS[0],
+        TERMINAL_SCROLLBACK_PRESETS[TERMINAL_SCROLLBACK_PRESETS.len() - 1],
+    )
+}
+
 pub fn normalize_sidebar_width(value: f32) -> f32 {
     if value.is_finite() && (SIDEBAR_MIN..=SIDEBAR_MAX).contains(&value) {
         value
@@ -536,6 +782,30 @@ pub fn clamp_chat_panel_width(value: f32) -> f32 {
     value.clamp(CHAT_PANEL_MIN, CHAT_PANEL_MAX)
 }
 
+pub fn normalize_file_viewer_width(value: f32) -> f32 {
+    if value.is_finite() && (FILE_VIEWER_MIN..=FILE_VIEWER_MAX).contains(&value) {
+        value
+    } else {
+        FILE_VIEWER_DEFAULT
+    }
+}
+
+pub fn clamp_file_viewer_width(value: f32) -> f32 {
+    value.clamp(FILE_VIEWER_MIN, FILE_VIEWER_MAX)
+}
+
+pub fn normalize_file_tree_width(value: f32) -> f32 {
+    if value.is_finite() && (FILE_TREE_MIN..=FILE_TREE_MAX).contains(&value) {
+        value
+    } else {
+        FILE_TREE_DEFAULT
+    }
+}
+
+pub fn clamp_file_tree_width(value: f32) -> f32 {
+    value.clamp(FILE_TREE_MIN, FILE_TREE_MAX)
+}
+
 pub fn normalize_mission_rail_width(value: f32) -> f32 {
     if value.is_finite() && (MISSION_RAIL_MIN..=MISSION_RAIL_MAX).contains(&value) {
         value
@@ -551,31 +821,41 @@ pub fn clamp_mission_rail_width(value: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn local_only_defaults_off_and_ignores_both_legacy_key_spellings() {
-        for key in ["remoteAccessEnabled", "remote_access_enabled"] {
-            for enabled in [false, true] {
-                let temp = tempfile::tempdir().unwrap();
-                let path = temp.path().join("settings.json");
-                std::fs::write(
-                    &path,
-                    serde_json::json!({(key):enabled,"appZoom":1.2}).to_string(),
-                )
-                .unwrap();
-                let mut settings = super::AppSettings::load(&path).unwrap();
-                assert!(!settings.local_only);
-                assert_eq!(settings.app_zoom, 1.2);
-                settings.local_only = true;
-                settings.save(&path).unwrap();
-                let saved: serde_json::Value =
-                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-                assert_eq!(saved["localOnly"], true);
-                assert!(saved.get(key).is_none());
-                assert!(super::AppSettings::load(&path).unwrap().local_only);
-            }
+    fn saved_local_only_and_legacy_remote_keys_are_ignored_and_dropped() {
+        for key in ["localOnly", "remoteAccessEnabled", "remote_access_enabled"] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("settings.json");
+            std::fs::write(
+                &path,
+                serde_json::json!({(key):true,"appZoom":1.2}).to_string(),
+            )
+            .unwrap();
+            let settings = super::AppSettings::load(&path).unwrap();
+            assert_eq!(settings.app_zoom, 1.2);
+            settings.save(&path).unwrap();
+            let saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert!(saved.get(key).is_none());
         }
     }
 
     use super::*;
+
+    #[test]
+    fn remote_sidebars_default_for_older_settings_and_partial_views() {
+        let old: AppSettings = serde_json::from_str(r#"{"sidebarProjectsOpen":false}"#).unwrap();
+        assert!(old.remote_sidebars.is_empty());
+        assert!(!old.sidebar_projects_open);
+        let partial: AppSettings =
+            serde_json::from_str(r#"{"remoteSidebars":{"host":{"activeOnly":true}}}"#).unwrap();
+        assert_eq!(
+            partial.remote_sidebars["host"],
+            RemoteSidebarSettings {
+                active_only: true,
+                ..Default::default()
+            }
+        );
+    }
 
     #[test]
     fn language_defaults_migrates_and_persists_intent() {
@@ -632,6 +912,48 @@ mod tests {
         }
     }
 
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn terminal_ctrl_keys_default_to_runner_first_and_persist_each_mode() {
+        use crate::keymap::TerminalCtrlKeys;
+
+        for json in [r#"{"appZoom":1.2}"#, r#"{"terminalCtrlKeys":"future"}"#] {
+            let settings: AppSettings = serde_json::from_str(json).unwrap();
+            assert_eq!(settings.terminal_ctrl_keys(), TerminalCtrlKeys::RunnerFirst);
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        for (mode, saved) in [
+            (TerminalCtrlKeys::RunnerFirst, "runner-first"),
+            (TerminalCtrlKeys::TerminalFirst, "terminal-first"),
+        ] {
+            let settings = AppSettings {
+                terminal_ctrl_keys: mode,
+                ..AppSettings::default()
+            };
+            settings.save(&path).unwrap();
+            let json: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(json["terminalCtrlKeys"], saved);
+            let loaded = AppSettings::load(&path).unwrap();
+            assert_eq!(loaded, settings);
+            assert_eq!(loaded.terminal_ctrl_keys(), mode);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn terminal_ctrl_keys_do_not_exist_on_macos() {
+        let settings: AppSettings =
+            serde_json::from_str(r#"{"terminalCtrlKeys":"terminal-first"}"#).unwrap();
+        assert_eq!(
+            settings.terminal_ctrl_keys(),
+            crate::keymap::TerminalCtrlKeys::RunnerFirst
+        );
+        let json = serde_json::to_value(&settings).unwrap();
+        assert!(json.get("terminalCtrlKeys").is_none());
+    }
+
     #[test]
     fn file_link_editor_defaults_to_the_default_app_for_pre_feature_settings() {
         let settings: AppSettings = serde_json::from_str(r#"{"appZoom":1.0}"#).unwrap();
@@ -645,11 +967,124 @@ mod tests {
         assert!(json.contains(r#""fileLinkEditor":"vscode""#), "{json}");
         let reloaded: AppSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(reloaded.file_link_editor, FileLinkEditor::VsCode);
+    }
+
+    #[test]
+    fn side_panel_settings_default_to_todays_behaviour_and_round_trip() {
+        use crate::file_icons::IconSet;
+        let old: AppSettings = serde_json::from_str(r#"{"appZoom":1.0}"#).unwrap();
+        assert!(old.show_side_panel && old.info_view && old.files_view);
+        assert_eq!(old.file_icons, IconSet::Catppuccin);
+        assert_eq!(old.files_font_family, None);
+        assert_eq!(old.files_font_size, None);
+        assert_eq!(old.files_font_size(), TERMINAL_FONT_SIZE_DEFAULT);
+        assert_eq!(old.markdown_open_as, MarkdownOpenAs::Rendered);
+        assert_eq!(old, AppSettings::default());
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("ui-settings.json");
+        let settings = AppSettings {
+            show_side_panel: false,
+            info_view: false,
+            files_view: false,
+            file_icons: IconSet::Minimal,
+            files_font_family: Some(TerminalFontFamily::new("Berkeley Mono")),
+            files_font_size: Some(17),
+            markdown_open_as: MarkdownOpenAs::Source,
+            ..AppSettings::default()
+        };
+        settings.save(&path).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(json["showSidePanel"], false);
+        assert_eq!(json["fileIcons"], "minimal");
+        assert_eq!(json["filesFontFamily"], "Berkeley Mono");
+        assert_eq!(json["filesFontSize"], 17);
+        assert_eq!(json["markdownOpenAs"], "source");
+        assert_eq!(AppSettings::load(&path).unwrap(), settings);
+        // The removed Open with a single click, A new chat's panel opens and
+        // Syntax highlighting are ignored on load.
+        let saved: AppSettings = serde_json::from_str(
+            r#"{"appZoom":1.0,"filesSingleClick":false,"newChatPanel":"info","filesSyntaxHighlighting":false}"#,
+        )
+        .unwrap();
+        assert_eq!(saved, AppSettings::default());
+        for set in IconSet::ALL {
+            assert_eq!(IconSet::from_key(set.key()), Some(set));
+        }
+        for mode in MarkdownOpenAs::ALL {
+            assert_eq!(MarkdownOpenAs::parse(mode.key()), Some(mode));
+        }
+    }
+
+    #[test]
+    fn bad_side_panel_values_normalize_to_their_defaults() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("ui-settings.json");
+        for (json, size) in [
+            (
+                r#"{"fileIcons":"seti","markdownOpenAs":"preview","newChatPanel":"changes","filesFontFamily":"  ","filesFontSize":0}"#,
+                None,
+            ),
+            (
+                r#"{"filesFontFamily":"","filesFontSize":99}"#,
+                Some(TERMINAL_FONT_SIZE_MAX),
+            ),
+            (
+                r#"{"filesFontFamily":null,"filesFontSize":3}"#,
+                Some(TERMINAL_FONT_SIZE_MIN),
+            ),
+        ] {
+            fs::write(&path, json).unwrap();
+            let settings = AppSettings::load(&path).unwrap();
+            assert_eq!(settings.file_icons, crate::file_icons::IconSet::Catppuccin);
+            assert_eq!(settings.markdown_open_as, MarkdownOpenAs::Rendered);
+            assert_eq!(settings.files_font_family, None, "{json}");
+            assert_eq!(settings.files_font_size, size, "{json}");
+        }
+    }
+
+    #[test]
+    fn the_viewer_font_follows_the_terminal_and_a_missing_one_draws_bundled() {
+        let terminal = AppSettings {
+            terminal_font_size: 15,
+            ..AppSettings::default()
+        };
+        assert_eq!(terminal.files_font_size(), 15, "follows the terminal");
+        let own = AppSettings {
+            files_font_size: Some(11),
+            ..terminal.clone()
+        };
+        assert_eq!(own.files_font_size(), 11);
         assert_eq!(
-            FileLinkEditor::parse("cursor"),
-            Some(FileLinkEditor::Cursor)
+            AppSettings {
+                files_font_size: None,
+                ..own
+            }
+            .files_font_size(),
+            15,
+            "Reset follows the terminal again"
         );
-        assert_eq!(FileLinkEditor::parse("emacs"), None);
+
+        // A saved font that is not installed draws as the bundled font,
+        // and the choice survives a save.
+        let missing = TerminalFontFamily::new("Gone Mono");
+        assert_eq!(
+            missing.resolved_font(false).family.as_ref(),
+            crate::terminal::fonts::BUNDLED_FONT
+        );
+        assert_eq!(missing.resolved_font(true).family.as_ref(), "Gone Mono");
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("ui-settings.json");
+        AppSettings {
+            files_font_family: Some(missing.clone()),
+            ..AppSettings::default()
+        }
+        .save(&path)
+        .unwrap();
+        assert_eq!(
+            AppSettings::load(&path).unwrap().files_font_family,
+            Some(missing)
+        );
     }
 
     #[test]
@@ -716,6 +1151,15 @@ mod tests {
         assert_eq!(normalize_chat_panel_width(376.), 376.);
         assert_eq!(normalize_chat_panel_width(f32::NAN), 320.);
         assert_eq!(clamp_chat_panel_width(999.), 480.);
+        assert_eq!(normalize_file_viewer_width(f32::NAN), 440.);
+        assert_eq!(normalize_file_viewer_width(9999.), 440.);
+        assert_eq!(clamp_file_viewer_width(9999.), 1200.);
+        assert_eq!(normalize_file_tree_width(320.), 320.);
+        assert_eq!(normalize_file_tree_width(f32::NAN), 240.);
+        assert_eq!(normalize_file_tree_width(100.), 240.);
+        assert_eq!(normalize_file_tree_width(481.), 240.);
+        assert_eq!(clamp_file_tree_width(100.), 160.);
+        assert_eq!(clamp_file_tree_width(9999.), 480.);
 
         let serialized = serde_json::to_value(AppSettings {
             terminal_cursor_style: TerminalCursorStyle::Bar,
@@ -778,7 +1222,71 @@ mod tests {
     }
 
     #[test]
-    fn persisted_labels_match_the_react_settings_contract() {
+    fn terminal_settings_default_round_trip_and_normalize() {
+        let old: AppSettings =
+            serde_json::from_str(r#"{"terminalFontSize":14,"terminalCursorStyle":"bar"}"#).unwrap();
+        assert_eq!(old.terminal_font_size, 14);
+        assert_eq!(old.terminal_line_height, 1.4);
+        assert!(!old.terminal_cursor_blink);
+        assert_eq!(old.terminal_scrollback_lines, 10_000);
+        assert!(!old.terminal_copy_on_select);
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("ui-settings.json");
+        let settings = AppSettings {
+            terminal_font_size: 8,
+            terminal_line_height: 1.1,
+            terminal_cursor_blink: true,
+            terminal_scrollback_lines: 50_000,
+            terminal_copy_on_select: true,
+            ..AppSettings::default()
+        };
+        settings.save(&path).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(json["terminalLineHeight"], serde_json::json!(1.1));
+        assert_eq!(json["terminalCursorBlink"], true);
+        assert_eq!(json["terminalScrollbackLines"], 50_000);
+        assert_eq!(json["terminalCopyOnSelect"], true);
+        assert_eq!(AppSettings::load(&path).unwrap(), settings);
+
+        fs::write(
+            &path,
+            r#"{"terminalFontSize":40,"terminalLineHeight":1.94,"terminalScrollbackLines":7000}"#,
+        )
+        .unwrap();
+        let loaded = AppSettings::load(&path).unwrap();
+        assert_eq!(loaded.terminal_font_size, 32);
+        assert_eq!(loaded.terminal_line_height, 1.6);
+        assert_eq!(loaded.terminal_scrollback_lines, 7_000);
+
+        assert_eq!(normalize_terminal_font_size(7), 8);
+        assert_eq!(normalize_terminal_font_size(20), 20);
+        assert_eq!(normalize_terminal_line_height(1.24), 1.2);
+        assert_eq!(normalize_terminal_line_height(1.25), 1.3);
+        assert_eq!(normalize_terminal_line_height(0.5), 1.0);
+        assert_eq!(normalize_terminal_line_height(f32::NAN), 1.4);
+        assert_eq!(normalize_terminal_scrollback(0), 1_000);
+        assert_eq!(normalize_terminal_scrollback(1_000_000), 50_000);
+        for preset in TERMINAL_SCROLLBACK_PRESETS {
+            assert_eq!(normalize_terminal_scrollback(preset), preset);
+        }
+    }
+
+    #[test]
+    fn a_skipped_update_version_survives_a_restart() {
+        let settings = AppSettings {
+            skipped_update_version: Some("0.19.5".into()),
+            ..AppSettings::default()
+        };
+        let saved = serde_json::to_string(&settings).unwrap();
+        let loaded: AppSettings = serde_json::from_str(&saved).unwrap();
+        assert_eq!(loaded.skipped_update_version.as_deref(), Some("0.19.5"));
+        let older: AppSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(older.skipped_update_version, None);
+    }
+
+    #[test]
+    fn persisted_settings_use_the_current_contract() {
         let value = serde_json::to_value(AppSettings::default()).unwrap();
         assert_eq!(value["appTheme"], "auto");
         assert_eq!(value["lightAppTheme"], "runner-light");
@@ -786,11 +1294,15 @@ mod tests {
         assert_eq!(value["lightTerminalTheme"], "rose-pine-dawn");
         assert_eq!(value["darkTerminalTheme"], "runner");
         assert!(value.get("terminalTheme").is_none());
-        assert_eq!(value["terminalFontFamily"], "JetBrains Mono");
+        assert_eq!(
+            value["terminalFontFamily"],
+            crate::terminal::fonts::BUNDLED_FONT
+        );
         assert_eq!(value["defaultCrewId"], "");
         assert_eq!(value["defaultWorkingDir"], "");
         assert_eq!(value["resumeOnLaunch"], true);
         assert_eq!(value["automaticallyCheckForUpdates"], true);
+        assert!(value["skippedUpdateVersion"].is_null());
         assert_eq!(value["defaultRuntime"], "");
         assert_eq!(value["initializedCommandInstall"], false);
         assert_eq!(value["runnerSkillEnabled"], true);
@@ -1014,44 +1526,63 @@ mod tests {
     }
 
     #[test]
-    fn terminal_fonts_default_to_jetbrains_mono_and_normalize_legacy_choices() {
+    fn terminal_fonts_migrate_each_legacy_choice() {
         assert_eq!(
-            AppSettings::default().terminal_font_family,
-            TerminalFontFamily::JetBrainsMono
+            AppSettings::default().terminal_font_family.family(),
+            crate::terminal::fonts::BUNDLED_FONT
         );
-        for legacy in ["System default", "Menlo", "Monaco", "SF Mono", "Fira Code"] {
+        for (saved, expected) in [
+            ("JetBrains Mono", crate::terminal::fonts::BUNDLED_FONT),
+            ("Meslo Nerd Font", crate::terminal::fonts::BUNDLED_FONT),
+            ("Menlo", runner_app::theme::SYSTEM_MONOSPACE_FONT),
+            ("System default", "System default"),
+            ("Monaco", "Monaco"),
+            ("SF Mono", "SF Mono"),
+            ("Fira Code", "Fira Code"),
+        ] {
             let parsed: TerminalFontFamily =
-                serde_json::from_str(&format!("\"{legacy}\"")).unwrap();
-            assert_eq!(parsed, TerminalFontFamily::Menlo, "{legacy}");
-        }
-        for bundled in ["JetBrains Mono", "Meslo Nerd Font"] {
-            let parsed: TerminalFontFamily =
-                serde_json::from_str(&format!("\"{bundled}\"")).unwrap();
-            assert_eq!(parsed, TerminalFontFamily::JetBrainsMono, "{bundled}");
+                serde_json::from_value(serde_json::json!(saved)).unwrap();
+            assert_eq!(parsed.family(), expected, "{saved}");
         }
     }
 
     #[test]
-    fn terminal_fonts_use_the_platform_fallback_chain() {
-        for family in [TerminalFontFamily::JetBrainsMono, TerminalFontFamily::Menlo] {
-            let font = family.font();
-            assert_eq!(font.family.as_ref(), family.family());
-            #[cfg(windows)]
-            assert_eq!(
-                font.fallbacks.unwrap().fallback_list(),
-                ["Microsoft YaHei", "Segoe UI"]
-            );
-            #[cfg(target_os = "linux")]
-            assert_eq!(
-                font.fallbacks.clone().unwrap().fallback_list(),
+    fn missing_terminal_font_falls_back_without_overwriting_saved_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ui-settings.json");
+        fs::write(&path, r#"{"terminalFontFamily":"Runner Missing Font 931"}"#).unwrap();
+        let settings = AppSettings::load(&path).unwrap();
+        assert_eq!(
+            settings
+                .terminal_font_family
+                .resolved_font(false)
+                .family
+                .as_ref(),
+            crate::terminal::fonts::BUNDLED_FONT
+        );
+        settings.save(&path).unwrap();
+        assert_eq!(
+            AppSettings::load(&path)
+                .unwrap()
+                .terminal_font_family
+                .family(),
+            "Runner Missing Font 931"
+        );
+    }
+
+    #[test]
+    fn terminal_fonts_use_bundled_icons_and_platform_fallbacks() {
+        let family = TerminalFontFamily::new("SF Mono");
+        let font = family.resolved_font(true);
+        assert_eq!(font.family.as_ref(), "SF Mono");
+        let expected = std::iter::once(crate::terminal::fonts::BUNDLED_FONT)
+            .chain(
                 runner_app::platform_fonts::TERMINAL_FONT_FALLBACKS
-            );
-            #[cfg(target_os = "macos")]
-            assert_eq!(
-                font.fallbacks.unwrap().fallback_list(),
-                ["Microsoft YaHei", "sans-serif"]
-            );
-        }
+                    .iter()
+                    .copied(),
+            )
+            .collect::<Vec<_>>();
+        assert_eq!(font.fallbacks.unwrap().fallback_list(), expected);
     }
 
     #[test]
@@ -1261,5 +1792,42 @@ mod notification_tests {
         assert!(json["notifications"]["missions"].get("enabled").is_none());
         let loaded: AppSettings = serde_json::from_str(&saved).unwrap();
         assert_eq!(loaded.notifications, settings.notifications);
+    }
+}
+
+#[test]
+fn usage_preferences_defaults_roundtrip_and_fetching_rules() {
+    let defaults: AppSettings = serde_json::from_str("{}").unwrap();
+    assert!(
+        defaults.usage.sidebar
+            && defaults.usage.codex
+            && defaults.usage.claude_code
+            && defaults.usage.five_hour
+    );
+    assert!(defaults.notifications.usage.near_limit);
+    assert_eq!(defaults.notifications.usage.threshold, 80);
+    let mut settings = defaults;
+    settings.usage.sidebar = false;
+    settings.usage.codex = false;
+    settings.usage.five_hour = false;
+    settings.notifications.usage.near_limit = false;
+    settings.notifications.usage.threshold = 60;
+    let saved: AppSettings =
+        serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+    assert_eq!(saved, settings);
+    for badges in [false, true] {
+        for agent in [false, true] {
+            for alert in [false, true] {
+                let usage = UsageSettings {
+                    sidebar: badges,
+                    codex: agent,
+                    claude_code: agent,
+                    ..Default::default()
+                };
+                for runtime in [Runtime::Codex, Runtime::ClaudeCode] {
+                    assert_eq!(usage.checks(runtime, alert), (badges && agent) || alert);
+                }
+            }
+        }
     }
 }

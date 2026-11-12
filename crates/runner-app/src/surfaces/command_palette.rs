@@ -57,8 +57,10 @@ enum PaletteDestination {
     NewTerminal,
     NewChat,
     NewMission,
+    SwitchSidebarView,
     InstallRunnerCommand,
     UninstallRunnerCommand,
+    ShowUpdate,
     Mission(String),
     Chat(String),
     Role(String),
@@ -144,13 +146,18 @@ fn palette_items(
     for (id, label, destination) in [
         (
             "new-chat",
-            crate::i18n::text("ui.new_chat"),
+            crate::i18n::text("ui.new_tab"),
             PaletteDestination::NewChat,
         ),
         (
             "new-mission",
             crate::i18n::text("ui.new_mission"),
             PaletteDestination::NewMission,
+        ),
+        (
+            "switch-sidebar-view",
+            crate::i18n::text("keymap.switch-sidebar-view.title"),
+            PaletteDestination::SwitchSidebarView,
         ),
     ] {
         items.push(PaletteItem {
@@ -296,6 +303,31 @@ fn palette_items(
     items
 }
 
+fn update_is_visible(cx: &App) -> bool {
+    cx.try_global::<GlobalUpdater>().is_some_and(|updater| {
+        crate::surfaces::update_ui::visible_update_state(updater.0.read(cx)).is_some()
+    })
+}
+
+/// The keyboard's way to the update popover, since a terminal keeps Tab for itself.
+fn show_update_item() -> PaletteItem {
+    let label = crate::i18n::text("ui.show_runner_update");
+    PaletteItem {
+        kind: PaletteKind::Command,
+        runtime: None,
+        live: false,
+        id: "show-update".into(),
+        label: label.into(),
+        destination: PaletteDestination::ShowUpdate,
+        search_text: format!(
+            "{label} {} update upgrade download install restart",
+            i18n::text_for(i18n::Locale::English, "ui.show_runner_update")
+        )
+        .to_lowercase(),
+        order: usize::MAX,
+    }
+}
+
 fn filtered_palette_items<'a>(items: &'a [PaletteItem], query: &str) -> Vec<&'a PaletteItem> {
     let query = query.trim().to_lowercase();
     let mut filtered = items
@@ -334,6 +366,7 @@ fn remote_palette_items(
             PaletteDestination::NewChat => client.supports(&["catalog", "startChat"]),
             PaletteDestination::NewMission => client.supports(&["catalog", "startMission"]),
             PaletteDestination::NewTerminal => client.supports(&["startShell", "layout"]),
+            PaletteDestination::SwitchSidebarView => true,
             _ => false,
         })
         .collect::<Vec<_>>();
@@ -524,6 +557,9 @@ impl CommandPaletteState {
                 store.runner_command_status(),
             )
         };
+        if self.remote_data.is_none() && update_is_visible(cx) {
+            self.items.push(show_update_item());
+        }
         self.query.clear();
         self.active_index = 0;
         self.list_scroll.set_offset(point(px(0.), px(0.)));
@@ -628,13 +664,7 @@ impl CommandPaletteState {
                              shell_cx: &mut Context<NativeRoot>| {
             match destination {
                 PaletteDestination::NewChat => {
-                    shell.open_sidebar_chat_modal(
-                        runner_core::protocol::project::ProjectScope::or_root(
-                            shell.active_project_id(shell_cx),
-                        ),
-                        window,
-                        shell_cx,
-                    );
+                    shell.open_new_tab_modal(&crate::NewTab, window, shell_cx);
                     true
                 }
                 PaletteDestination::NewMission => {
@@ -645,12 +675,20 @@ impl CommandPaletteState {
                     shell.new_terminal(window, shell_cx);
                     true
                 }
+                PaletteDestination::SwitchSidebarView => {
+                    shell.switch_sidebar_view(&SwitchSidebarView, window, shell_cx);
+                    true
+                }
                 PaletteDestination::InstallRunnerCommand => {
                     shell.install_runner_command(shell_cx);
                     true
                 }
                 PaletteDestination::UninstallRunnerCommand => {
                     shell.uninstall_runner_command(shell_cx);
+                    true
+                }
+                PaletteDestination::ShowUpdate => {
+                    shell.show_update_from_keyboard(window, shell_cx);
                     true
                 }
                 PaletteDestination::Mission(mission_id) => {
@@ -925,6 +963,7 @@ impl Render for CommandPaletteState {
                     )
                     .child(list),
             )
+            .map(crate::platform_ui::window_scrim)
             .into_any_element()
     }
 }
@@ -1009,6 +1048,83 @@ mod tests {
             assert_eq!(filtered[0].destination, destination);
             assert_eq!(filtered[0].kind, PaletteKind::Command);
         }
+    }
+
+    #[test]
+    fn palette_switch_sidebar_view_is_translated_searchable_and_executes() {
+        for locale in [i18n::Locale::English, i18n::Locale::SimplifiedChinese] {
+            i18n::testing::with_locale(locale, || {
+                let items = palette_items(&[], &[], &[], &[], None);
+                for query in [
+                    "switch sidebar view",
+                    i18n::text("keymap.switch-sidebar-view.title"),
+                ] {
+                    let matches = filtered_palette_items(&items, query);
+                    assert_eq!(matches.len(), 1);
+                    assert_eq!(
+                        matches[0].destination,
+                        PaletteDestination::SwitchSidebarView
+                    );
+                    assert_eq!(
+                        matches[0].label,
+                        i18n::text("keymap.switch-sidebar-view.title")
+                    );
+                }
+            });
+        }
+        use crate::surfaces::start_chat::tests::modal_harness;
+        use crate::surfaces::start_chat::ChatMode;
+        let mut harness = modal_harness(1200., 1000., Vec::new(), Vec::new(), ChatMode::Runtime);
+        let palette = harness.read_root(|root, _| root.command_palette.clone());
+        harness.act(|root, _, cx| root.set_sidebar_collapsed(true, true, cx));
+        harness.visual.update(|window, cx| {
+            palette.update(cx, |palette, cx| {
+                palette.open(window, cx);
+                palette.query = "switch sidebar view".into();
+                palette.select(0, window, cx);
+            });
+        });
+        harness.visual.run_until_parked();
+        harness.read_root(|root, cx| {
+            assert!(!root.front_page_sidebar_collapsed());
+            assert!(root.front_page_sidebar().read(cx).active_only(cx));
+        });
+    }
+
+    #[test]
+    fn palette_new_chat_starts_in_recents_with_no_project() {
+        use crate::surfaces::start_chat::tests::{modal_harness, project_fixture};
+        use crate::surfaces::start_chat::ChatMode;
+        use runner_core::protocol::project::ProjectScope;
+
+        let mut harness = modal_harness(1200., 1000., Vec::new(), Vec::new(), ChatMode::Runtime);
+        let projects = project_fixture(&mut harness);
+        let project = projects[0].id.clone();
+        harness.act(|root, window, cx| {
+            root.start_chat_modal = None;
+            root.open_sidebar_chat_modal(ProjectScope::Project(project.clone()), window, cx);
+        });
+        let palette = harness.read_root(|root, cx| {
+            assert_eq!(root.launcher_page_project(cx), Some(project.clone()));
+            root.command_palette.clone()
+        });
+        harness.visual.update(|window, cx| {
+            palette.update(cx, |palette, cx| {
+                palette.open(window, cx);
+                palette.query = "New chat".into();
+                assert_eq!(
+                    filtered_palette_items(&palette.items, &palette.query)[0].destination,
+                    PaletteDestination::NewChat
+                );
+                palette.select(0, window, cx);
+            });
+        });
+        harness.visual.run_until_parked();
+        harness.act(|root, _, cx| {
+            assert_eq!(root.route, crate::surfaces::AppRoute::Launcher);
+            assert_eq!(root.launcher_page_project(cx), None);
+            assert_eq!(root.active_project_id(cx), None);
+        });
     }
 
     #[test]
@@ -1229,7 +1345,12 @@ mod localization_tests {
     fn translated_commands_search_by_label_description_and_original_aliases() {
         i18n::testing::with_locale(i18n::Locale::SimplifiedChinese, || {
             let items = palette_items(&[], &[], &[], &[], None);
+            assert_eq!(
+                filtered_palette_items(&items, "新建标签页")[0].id,
+                "new-chat"
+            );
             assert_eq!(filtered_palette_items(&items, "新建对话")[0].id, "new-chat");
+            assert_eq!(filtered_palette_items(&items, "new tab")[0].id, "new-chat");
             assert_eq!(
                 filtered_palette_items(&items, "当前空窗格")[0].id,
                 "new-terminal"
@@ -1322,7 +1443,12 @@ mod remote_isolation_tests {
         let temp = tempfile::tempdir().unwrap();
         let mut cx = TestAppContext::single();
         cx.update(|cx| {
-            crate::keymap::install_bindings(cx, &crate::keymap::KeymapOverrides::new(), false)
+            crate::keymap::install_bindings(
+                cx,
+                &crate::keymap::KeymapOverrides::new(),
+                crate::keymap::TerminalCtrlKeys::RunnerFirst,
+                false,
+            )
         });
         let (store, fake, _) = fixture(&mut cx, temp.path());
         crate::surfaces::remote_client::tests::enable_missions(&fake);
@@ -1475,7 +1601,7 @@ mod remote_isolation_tests {
                 );
                 palette.select(0, window, cx);
             });
-            assert!(shell.read(cx).start_mission_modal.is_some());
+            assert!(shell.read(cx).mission_launcher_open(cx));
         });
         visual.run_until_parked();
         assert!(!palette.read_with(&visual, |palette, _| palette.open));

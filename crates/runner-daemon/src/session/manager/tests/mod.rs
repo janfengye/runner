@@ -1,4 +1,5 @@
 mod antigravity;
+mod archive;
 mod attention;
 mod codex;
 mod copilot;
@@ -30,6 +31,7 @@ mod startup;
 mod status;
 mod terminal_size;
 mod unlisted;
+mod version_gate;
 mod wake;
 #[cfg(windows)]
 mod windows_batch;
@@ -402,6 +404,7 @@ struct Capture {
     fork_started: Mutex<Vec<SessionForkStartedEvent>>,
     status: Mutex<Vec<SessionActivityEvent>>,
     activity: Mutex<Vec<RoleActivityEvent>>,
+    warning: Mutex<Vec<WarningEvent>>,
 }
 
 impl SessionEvents for Capture {
@@ -442,6 +445,9 @@ impl SessionEvents for Capture {
     }
     fn role_activity(&self, ev: &RoleActivityEvent) {
         self.activity.lock().unwrap().push(ev.clone());
+    }
+    fn warning(&self, ev: &WarningEvent) {
+        self.warning.lock().unwrap().push(ev.clone());
     }
 }
 
@@ -501,6 +507,7 @@ fn mission() -> Mission {
         stopped_at: None,
         pinned_at: None,
         archived_at: None,
+        linked_chat: None,
     }
 }
 

@@ -119,16 +119,24 @@ record!(AgentObservation {
     outcome,
     interactions,
     detail,
-    program_status
+    program_status,
+    background
 });
 record!(ProgramStatusEvidence { message });
+record!(StartupError {
+    runtime,
+    message,
+    output
+});
 record!(AgentStatus {
+    startup_error,
     lifecycle,
     observation,
     exit_code,
     error_since,
     failed_since,
-    unread_since
+    unread_since,
+    interrupted_since
 });
 record!(AgentUsage {
     windows,
@@ -296,7 +304,21 @@ record!(Mission {
     started_at,
     stopped_at,
     pinned_at,
-    archived_at
+    archived_at,
+    linked_chat
+});
+record!(LinkedChat {
+    session_id,
+    title,
+    archived,
+    reports
+});
+record!(MissionStarter { session_id, title });
+record!(MissionLinkInput {
+    mission_id,
+    session_id,
+    no_report,
+    caller_session_id
 });
 variant!(MissionActivityState => Self::Busy);
 variant!(MissionFeedOrder => Self::OldestFirst);
@@ -325,6 +347,9 @@ record!(MissionReadCursor {
 });
 record!(MissionStatusSnapshot {
     mission,
+    phase,
+    interrupted_at,
+    started_by,
     crew,
     sessions,
     latest_session_status_by_handle,
@@ -365,7 +390,9 @@ record!(MissionStart {
     scope,
     title,
     goal_override,
-    cwd
+    cwd,
+    started_by_session_id,
+    no_report
 });
 variant!(MissionStatus => Self::Running);
 record!(MissionSummary {
@@ -375,8 +402,10 @@ record!(MissionSummary {
     pending_ask_count,
     any_session_live,
     all_sessions_live,
-    activity
+    activity,
+    phase
 });
+variant!(MissionPhase => Self::Interrupted);
 record!(NodeRow {
     id,
     parent_id,
@@ -479,6 +508,7 @@ record!(RuntimeCatalogOption {
 });
 variant!(RuntimeCommandSource => Self::Override);
 record!(RuntimeExecutableStatus {
+    launch_options,
     name,
     display_name,
     command,
@@ -491,7 +521,9 @@ record!(RuntimeExecutableStatus {
     state,
     invalid_reason,
     installed_version,
-    available_version
+    available_version,
+    min_version,
+    below_minimum
 });
 variant!(RuntimeRowState => Self::Detected);
 record!(RuntimeStatusResponse { shell, runtimes });
@@ -671,6 +703,35 @@ record!(WindowEntry {
     focused
 });
 variant!(WorkDetail => Self::UsingTools);
+#[test]
+fn a_full_file_index_of_the_costliest_paths_fits_a_frame() {
+    for piece in ["\u{1}", "\"", "\\", "a"] {
+        let path = piece.repeat(4000);
+        let mut budget = files::IndexBudget::default();
+        let mut paths = Vec::new();
+        while budget.take(path.as_bytes()) {
+            paths.push(path.clone());
+        }
+        let encoded = serde_json::to_vec(&paths).unwrap().len();
+        assert!(encoded <= files::MAX_INDEX_BYTES, "{piece:?}: {encoded}");
+        let response = Response::files_index(Ok(files::FileIndex {
+            paths,
+            truncated: true,
+        }));
+        let frame = wire::Frame::json(wire::RESPONSE, &response).unwrap();
+        assert!(frame.check_size().unwrap() <= wire::MAX_FRAME, "{piece:?}");
+    }
+}
+
+#[test]
+fn the_index_budget_stops_at_either_limit() {
+    let mut files = files::IndexBudget::new(2, 100);
+    assert!(files.take(b"a") && files.take(b"b") && !files.take(b"c"));
+    let mut bytes = files::IndexBudget::new(100, 8);
+    assert!(bytes.take(b"aaaaa"), "five bytes, two quotes and a comma");
+    assert!(!bytes.take(b""), "nothing left for an empty string's three");
+}
+
 fn round_trip<T: Serialize + DeserializeOwned + std::fmt::Debug>(value: T) {
     let bytes = serde_json::to_vec(&value).unwrap();
     let decoded: T = serde_json::from_slice(&bytes).unwrap();
@@ -745,15 +806,7 @@ record!(TerminalMetadata {
     rows,
     controller
 });
-record!(RuntimeUpdateCommand {
-    session_id,
-    command,
-    args,
-    cwd,
-    env,
-    shell_path,
-    size
-});
+
 impl Sample for TerminalController {
     fn sample() -> Self {
         Self::Desktop
@@ -796,3 +849,166 @@ fn remote_pin_request_redacts_debug_and_trust_contains_no_pin() {
     assert!(Request::remote_trust {}.is_fast());
     assert!(!request.is_fast());
 }
+
+#[test]
+fn an_interrupted_summary_decodes_on_builds_that_predate_the_phase() {
+    #[derive(serde::Deserialize, Debug, PartialEq)]
+    #[serde(rename_all = "snake_case")]
+    enum OldPhase {
+        NeedsYou,
+        Failed,
+        Working,
+        Settled,
+        Ended,
+    }
+    #[derive(serde::Deserialize)]
+    struct OldSummary {
+        #[serde(default)]
+        phase: Option<OldPhase>,
+    }
+    let mut summary = MissionSummary::sample();
+    summary.phase = Some(MissionPhase::Interrupted);
+    let wire = serde_json::to_value(&summary).unwrap();
+    assert_eq!(wire["phase"], "working");
+    assert_eq!(wire["interrupted"], true);
+    let old: OldSummary = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(old.phase, Some(OldPhase::Working));
+    let new: MissionSummary = serde_json::from_value(wire).unwrap();
+    assert_eq!(new.phase, Some(MissionPhase::Interrupted));
+
+    summary.phase = Some(MissionPhase::Settled);
+    let wire = serde_json::to_value(&summary).unwrap();
+    assert!(wire.get("interrupted").is_none());
+    let new: MissionSummary = serde_json::from_value(wire).unwrap();
+    assert_eq!(new.phase, Some(MissionPhase::Settled));
+
+    let mut wire = serde_json::to_value(&summary).unwrap();
+    wire.as_object_mut().unwrap().remove("phase");
+    let older_daemon: MissionSummary = serde_json::from_value(wire).unwrap();
+    assert_eq!(older_daemon.phase, None);
+
+    let future: MissionPhase = serde_json::from_value(serde_json::json!("paused")).unwrap();
+    assert_eq!(future, MissionPhase::Unknown);
+    let mut status = AgentStatus::sample();
+    status.interrupted_since = None;
+    assert!(serde_json::to_value(&status)
+        .unwrap()
+        .get("interrupted_since")
+        .is_none());
+}
+impl Sample for files::FilesSubject {
+    fn sample() -> Self {
+        Self::Mission("mission 样例".into())
+    }
+}
+impl Sample for files::FilesRootOutcome {
+    fn sample() -> Self {
+        Self::Root(files::FilesRoot {
+            path: PathBuf::sample(),
+            name: String::sample(),
+            git: Some(files::GitCheckout {
+                top: PathBuf::sample(),
+                worktree: files::WorktreeKind::Linked,
+                branch: Some("feat/634".into()),
+                commit: None,
+            }),
+            cwd: Some("src/deep".into()),
+            source: files::FilesRootSource::Saved,
+        })
+    }
+}
+impl Sample for files::DirEntry {
+    fn sample() -> Self {
+        Self {
+            name: String::sample(),
+            kind: files::EntryKind::Symlink,
+            ignored: true,
+            size: Some(7),
+        }
+    }
+}
+impl Sample for files::GitStatus {
+    fn sample() -> Self {
+        Self::new(
+            vec![files::StatusEntry {
+                path: "new 名.rs".into(),
+                status: files::FileStatus::Renamed {
+                    from: "old\nname.rs".into(),
+                },
+            }],
+            vec!["target/".into()],
+        )
+    }
+}
+impl Sample for files::WorktreeEntry {
+    fn sample() -> Self {
+        Self {
+            path: PathBuf::sample(),
+            branch: None,
+            commit: Some("0123456".into()),
+            kind: files::WorktreeKind::Main,
+            locked: true,
+            prunable: true,
+        }
+    }
+}
+impl Sample for files::FileIndex {
+    fn sample() -> Self {
+        Self {
+            paths: vec!["src/样例.rs".into()],
+            truncated: true,
+        }
+    }
+}
+impl Sample for files::FileContent {
+    fn sample() -> Self {
+        Self::Text {
+            bytes: crate::companion::TerminalBytes(vec![0, 255, 10]),
+            size: 3,
+            modified: Some(Sample::sample()),
+        }
+    }
+}
+
+impl Sample for RuntimeLaunchOptions {
+    fn sample() -> Self {
+        Self::default()
+    }
+}
+
+variant!(RuntimeLaunchOption => Self::Bypass);
+record!(RuntimeCommandPreview { lines });
+record!(RuntimeCommandLine {
+    command,
+    note,
+    option
+});
+
+variant!(RuntimeCommandNote => Self::ActiveAccount { name: "Work".into() });
+
+#[test]
+fn optional_catalog_account_preserves_older_requests() {
+    let request = Request::skill_catalogs {
+        account_id: Some("work".into()),
+    };
+    round_trip(request);
+    let legacy: Request = serde_json::from_value(serde_json::json!({"skill_catalogs":{}})).unwrap();
+    assert!(matches!(
+        legacy,
+        Request::skill_catalogs { account_id: None }
+    ));
+    round_trip(Request::usage_set_interval { seconds: 1800 });
+}
+variant!(RuntimeUpdateState => Self::Running);
+record!(RuntimeUpdateTask {
+    id,
+    runtime,
+    from_version,
+    to_version,
+    state,
+    step,
+    message,
+    exit_code,
+    installed_version,
+    running_sessions
+});

@@ -1,10 +1,18 @@
 # 故障排查
 
-先检查失败的智能体或命令，再查看 Runner 设置与诊断。以下步骤会保留已有聊天和任务，帮助你定位问题。
+先检查失败的智能体或命令，再查看 Runner 设置与日志。以下步骤会保留已有聊天和任务，帮助你定位问题。
 
 ## Runner 无法打开
 
 Runner 在显示窗口前启动后台服务。若失败，会将原因写入 `runner.log`，并在 Windows 上显示 **Runner 无法启动（Runner could not start）** 对话框。日志在 macOS 的 `~/Library/Logs/com.wycstudios.runner` 与 Windows 的 `%APPDATA%\com.wycstudios.runner\logs`。请在[报告问题](#收集有用的错误报告)时附上该信息。
+
+若另一个版本或构建的 Runner 正在使用同一份数据，新打开的 Runner 不会接管后台服务，而是停止并提示另一个 Runner 构建正在使用这些数据。请退出另一个 Runner，再重新打开。若 Runner 打开期间后台服务换了主人，同一提示会以横幅显示：退出另一个 Runner 后点击 **重试（Try again）** 。此检查之前发布的 Runner 版本仍会直接接管后台服务。
+
+## Codex 启动慢，或聊天状态不够详细
+
+Codex 可能在每次启动时下载远程插件目录。关闭 **设置 → 智能体 → Codex → 启动 → 远程插件目录** 可跳过下载，目录中的插件也将不再加载。更改在新会话启动时生效。
+
+关闭 **状态钩子** 后，Runner 使用原生终端状态或终端活动。将 Codex 更新到 0.163.0+、Claude Code 更新到 2.1.295+、pi 更新到 1.1.0+ 可使用原生状态；也可重新开启钩子以获得详细报告。恢复仍使用会话标识钩子。任务始终使用状态钩子。
 
 ## 找不到智能体或无法启动
 
@@ -61,12 +69,24 @@ CLI 监控请运行 `runner mission show <mission-id> --json`，并阅读跟随�
 
 在 macOS 的 **关于 Runner（About Runner）** ，或各平台的 **设置 → 关于（Settings → About）** 中查看版本。macOS 关于窗口显示应用图标、版本与构建标识，以及版权。发布构建包含提交标识，本地开发构建显示 `dev`。
 
-打开 **设置 → 诊断 → 打开日志文件夹（Settings → Diagnostics → Open log folder）** 。在 [GitHub issue](https://github.com/yicheng47/runner/issues/new) 中附上 Runner 版本、操作系统、智能体 CLI 及版本、失败步骤与可见错误。去除密钥与私密对话后，仅分享相关日志片段。保留原会话与日志，直到证据已收集；删除应用数据不应是排障第一步。
+打开 **设置 → 关于 → 打开日志文件夹（Settings → About → Open log folder）** （macOS 上为 **在访达中显示日志（Reveal logs in Finder）** ）。在 [GitHub issue](https://github.com/yicheng47/runner/issues/new) 中附上 Runner 版本、操作系统、智能体 CLI 及版本、失败步骤与可见错误。去除密钥与私密对话后，仅分享相关日志片段。保留原会话与日志，直到证据已收集；删除应用数据不应是排障第一步。
 
 ## Linux 本地构建
 
 源码构建、图形依赖、安装包与 WSL 设置见 [main 上的 Linux 开发说明](https://github.com/yicheng47/runner/blob/main/docs/arch/linux.md)。通过 SSH 使用 CLI 时，请先运行 `systemctl --user start runnerd`；远程 CLI 调用不会自动启动服务。最小用户服务会解析账号登录 Shell 以发现 PATH。检查 `systemctl --user status runnerd` 与所选 XDG 数据根目录中的日志目录。
 
-Linux 通知权限由桌面管理。Runner 无法查询通用权限状态；请确认桌面通知守护进程与 portal 后端可用。GPUI 支持剪贴板文本，但不支持剪贴板文件路径。应用更新使用 **设置 → 更新（Settings → Updates）** 。系统 deb 安装需要桌面 polkit 认证代理与 `pkexec`。取消授权、包管理器忙碌或依赖错误会显示在 Runner 中；解决原因后重试。 **设置 → 诊断** 显示安装日志。源码构建与非受管理安装不能自我替换；请先安装受管理的包。WSL systemd 服务无法让空闲发行版保持运行。
+Linux 通知权限由桌面管理。Runner 无法查询通用权限状态；请确认桌面通知守护进程与 portal 后端可用。GPUI 支持剪贴板文本，但不支持剪贴板文件路径。应用更新使用 **设置 → 更新（Settings → Updates）** 。系统 deb 安装需要桌面 polkit 认证代理与 `pkexec`。取消授权、包管理器忙碌或依赖错误会显示在 Runner 中；解决原因后重试。 **设置 → 关于** 显示安装日志。源码构建与非受管理安装不能自我替换；请先安装受管理的包。WSL systemd 服务无法让空闲发行版保持运行。
 
 普通 Linux 窗口可拖动边缘或角调整大小。标题栏中间按钮切换最大化与还原；最大化/全屏窗口没有调整边框。新窗口使用桌面报告的逻辑显示边界。若合成器不报告独立工作区，边界可能包含面板/任务栏区域。报告窗口控制问题时，请注明桌面/会话类型，以及最大化、还原或边缘拖动中哪项失败。
+
+## Codex 版本过旧，无法用于 Runner
+
+Runner 要求 Codex **0.149.0 或更新版本**。启动器只在 Codex 的智能体行显示 **需要更新（Update needed）**；角色行不显示更新标签或操作。启动 Codex 或任何使用它的角色时，仍会先更新 Codex 再启动聊天；也可以在被拒绝的聊天卡片上选择 **更新 Codex（Update Codex）**。更新成功后窗格自动启动。如果仍显示旧版本，请检查 **设置 → 智能体 → Codex** 中的可执行文件覆盖路径，并刷新检测。
+
+## Codex 不接受 Runner 的启动参数
+
+Codex 拒绝启动配置且在首轮对话前退出时，已停止卡片会解释配置错误，并提供 **更新 Codex（Update Codex）**。更新后 Runner 会重试正在等待的聊天。普通停止的聊天保留原来的 **恢复（Resume）** 行为。如果更新后仍有错误，请保留显示的原因与相关终端输出，以便报告问题。
+
+## 智能体更新需要处理
+
+**可能正在等待你的输入（May be waiting for your input）** 是根据安装程序安静的提示状态作出的推测。Runner 不会自动打开任何窗口。打开后台任务列表并选择 **回答（Answer）**，才会将焦点交给安装程序终端；**隐藏（Hide）**、Escape 与关闭按钮都会让它继续运行。失败的更新提供 **重试（Retry）** 与 **显示输出（Show output）**。如果停止更新后可执行文件损坏，请在保留的任务行选择 **重新安装（Reinstall）**。

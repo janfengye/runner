@@ -94,9 +94,19 @@ pub(crate) fn test_home() -> Option<PathBuf> {
     CONVERSATION_HOME.with_borrow(|home| home.clone())
 }
 
-/// Check an agent conversation path using that CLI's project-directory encoder.
+/// `~/<agent_dir>`, under the fake home in tests.
+pub(super) fn agent_home(agent_dir: &str) -> Option<PathBuf> {
+    #[cfg(test)]
+    let home = test_home();
+    #[cfg(not(test))]
+    let home = runner_core::app_paths::home_dir();
+    home.map(|home| home.join(agent_dir))
+}
+
+/// Check for a conversation under an agent's config `folder`, using that CLI's
+/// project-directory encoder.
 pub(super) fn conversation_file_exists(
-    agent_dir: &str,
+    folder: Option<&Path>,
     cwd: Option<&str>,
     uuid: &str,
     encode_project_dir: fn(&str) -> String,
@@ -105,37 +115,25 @@ pub(super) fn conversation_file_exists(
     // for the resume flow don't have to fake out the agent project
     // directory. The encoders are exercised directly below.
     #[cfg(test)]
-    {
-        CONVERSATION_HOME.with_borrow(|home| match (home.as_deref(), cwd) {
-            (Some(home), Some(cwd)) => {
-                conversation_file_exists_at(home, agent_dir, cwd, uuid, encode_project_dir)
-            }
-            _ => true,
-        })
+    if test_home().is_none() {
+        return true;
     }
-    #[cfg(not(test))]
-    {
-        let Some(cwd) = cwd else {
-            // No cwd → claude-code falls back to the parent's, which we
-            // can't reproduce here. Be permissive: let `--resume` try and
-            // surface its own error rather than masking it.
-            return true;
-        };
-        let Some(home) = runner_core::app_paths::home_dir() else {
-            return true;
-        };
-        conversation_file_exists_at(&home, agent_dir, cwd, uuid, encode_project_dir)
-    }
+    // No cwd → claude-code falls back to the parent's, which we can't
+    // reproduce here. Be permissive: let `--resume` try and surface its
+    // own error rather than masking it.
+    let (Some(folder), Some(cwd)) = (folder, cwd) else {
+        return true;
+    };
+    conversation_file_exists_at(folder, cwd, uuid, encode_project_dir)
 }
 
 pub(super) fn conversation_file_exists_at(
-    home: &Path,
-    agent_dir: &str,
+    folder: &Path,
     cwd: &str,
     uuid: &str,
     encode_project_dir: fn(&str) -> String,
 ) -> bool {
-    let projects = home.join(agent_dir).join("projects");
+    let projects = folder.join("projects");
     let exists = |cwd: &str| {
         projects
             .join(encode_project_dir(cwd))
@@ -172,6 +170,62 @@ pub(crate) fn is_broad_trust_root(cwd: &Path, home: Option<&Path>) -> bool {
     home.map(|home| std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf()))
         .as_deref()
         == Some(cwd)
+}
+
+pub(crate) fn resolve_project_trust_root(cwd: &Path) -> crate::error::Result<PathBuf> {
+    let cwd = std::fs::canonicalize(cwd)
+        .map_err(|e| crate::error::Error::msg(format!("realpath {}: {e}", cwd.display())))?;
+    for ancestor in cwd.ancestors() {
+        let git_marker = ancestor.join(".git");
+        if git_marker.is_dir() {
+            return Ok(ancestor.to_path_buf());
+        }
+        if git_marker.is_file() {
+            return Ok(
+                resolve_worktree_main_root(ancestor).unwrap_or_else(|| ancestor.to_path_buf())
+            );
+        }
+    }
+    Ok(cwd)
+}
+
+fn resolve_worktree_main_root(cwd: &Path) -> Option<PathBuf> {
+    let git_file = cwd.join(".git");
+    let git_dir_reference = std::fs::read_to_string(&git_file).ok()?;
+    let git_dir_path = git_dir_reference.trim().strip_prefix("gitdir:")?.trim();
+    if git_dir_path.is_empty() {
+        return None;
+    }
+    let git_dir_path = Path::new(git_dir_path);
+    let git_dir = if git_dir_path.is_absolute() {
+        git_dir_path.to_path_buf()
+    } else {
+        cwd.join(git_dir_path)
+    };
+    let worktrees_dir = git_dir.parent()?;
+    if worktrees_dir.file_name()? != "worktrees" {
+        return None;
+    }
+
+    let backlink_reference = std::fs::read_to_string(git_dir.join("gitdir")).ok()?;
+    let backlink_path = backlink_reference.trim();
+    if backlink_path.is_empty() {
+        return None;
+    }
+    let backlink_path = Path::new(backlink_path);
+    let backlink = if backlink_path.is_absolute() {
+        backlink_path.to_path_buf()
+    } else {
+        git_dir.join(backlink_path)
+    };
+    let canonical_backlink = std::fs::canonicalize(backlink).ok()?;
+    let canonical_git_file = std::fs::canonicalize(&git_file).ok()?;
+    if canonical_backlink != canonical_git_file {
+        return None;
+    }
+
+    let main_root = worktrees_dir.parent()?.parent()?;
+    std::fs::canonicalize(main_root).ok()
 }
 
 pub(crate) fn resolve_config_write_path(config_path: &Path) -> crate::error::Result<PathBuf> {

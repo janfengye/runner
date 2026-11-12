@@ -228,8 +228,6 @@ impl SessionManager {
         }
         role = self.resolve_role_executable(&role, &pool)?;
 
-        // Resumed chats are attended, including runtime-only chats.
-        // Strip permission flags and leave every other arg alone.
         if snap.mission_id.is_none() {
             role.args = crate::runtimes::for_key(&role.runtime)
                 .permissions()
@@ -252,18 +250,7 @@ impl SessionManager {
         );
         let adapter = crate::runtimes::for_key(&role.runtime);
         let missing = adapter.missing_conversation();
-        let mut probe_env = role.env.clone();
-        if adapter.probe_uses_shell_env() {
-            probe_env = self
-                .shell_env
-                .read()
-                .expect("runtime shell environment lock poisoned")
-                .vars
-                .iter()
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect();
-            probe_env.extend(role.env.clone());
-        }
+        let probe_env = self.probe_env(adapter, &role.env);
         let previous_account = snap
             .launch_definition
             .as_ref()
@@ -285,32 +272,72 @@ impl SessionManager {
                 );
             }
         }
-        let conversation_missing = snap.agent_session_key.as_deref().is_some_and(|key| {
-            if let Some(account) = &claude_account {
-                return crate::claude_accounts::transcript(
-                    &account.origin_folder,
-                    resolved_cwd_for_check.as_deref(),
+        let recovery_env = probe_env.clone();
+        let conversation_exists = {
+            let origin_folder = claude_account
+                .as_ref()
+                .map(|account| account.origin_folder.clone());
+            let cwd = resolved_cwd_for_check.clone();
+            move |key: &str| {
+                super::output::conversation_exists(
+                    adapter,
+                    origin_folder.as_deref(),
+                    cwd.as_deref(),
+                    &probe_env,
                     key,
                 )
-                .is_some_and(|path| !path.is_file());
             }
-            adapter.conversation_exists(
-                key,
-                &crate::runtimes::ProbeContext {
-                    cwd: resolved_cwd_for_check.as_deref(),
-                    role_env: &probe_env,
-                },
-            ) == Some(false)
-        });
+        };
+        let conversation_missing = snap
+            .agent_session_key
+            .as_deref()
+            .is_some_and(|key| conversation_exists(key) == Some(false));
+        let recovered_key = snap
+            .agent_session_key
+            .as_deref()
+            .filter(|_| conversation_missing && !fresh)
+            .and_then(|key| {
+                let recovered = adapter.recover_conversation(
+                    session_id,
+                    key,
+                    &crate::runtimes::ProbeContext {
+                        cwd: resolved_cwd_for_check.as_deref(),
+                        role_env: &recovery_env,
+                    },
+                )?;
+                log::warn!(
+                    "session {session_id} conversation {key} is missing; resuming its original conversation {recovered}"
+                );
+                Some(recovered)
+            });
+        let conversation_missing = conversation_missing && recovered_key.is_none();
         if conversation_missing && !allow_fresh_fallback && !missing.resume_on_launch {
             return Err(Error::msg(format!(
                 "session {session_id} conversation is unavailable; resume it manually to start fresh"
             )));
         }
+        if let Some(key) = snap
+            .agent_session_key
+            .as_deref()
+            .filter(|_| conversation_missing && !fresh)
+        {
+            let folder = claude_account
+                .as_ref()
+                .map(|account| PathBuf::from(&account.origin_folder))
+                .or_else(|| {
+                    adapter.conversation_folder(&crate::runtimes::ProbeContext {
+                        cwd: resolved_cwd_for_check.as_deref(),
+                        role_env: &recovery_env,
+                    })
+                });
+            super::output::warn_missing_conversation(session_id, key, folder.as_deref());
+        }
         let effective_prior_key = if fresh || (conversation_missing && !missing.reuse_key) {
             None
         } else {
-            snap.agent_session_key.as_deref()
+            recovered_key
+                .as_deref()
+                .or(snap.agent_session_key.as_deref())
         };
         let mut plan = adapter.resume_plan(effective_prior_key);
         if conversation_missing {
@@ -570,6 +597,12 @@ impl SessionManager {
             &role.runtime,
             spec.cwd.as_deref(),
             role.env.get("COPILOT_HOME").map(String::as_str),
+            crate::runtimes::claude_code::spawned_config_dir(&spec.env),
+        );
+        let starts_trusted = crate::runtimes::for_key(&role.runtime).starts_trusted(
+            spec.cwd.as_deref(),
+            &spec.args,
+            &spec.env,
         );
         let capture_root =
             match crate::runtimes::for_key(&role.runtime).key_capture_for_spawn(&spec) {
@@ -580,6 +613,7 @@ impl SessionManager {
         if *spawning {
             return Err(Error::msg("runnerd is stopping"));
         }
+        let status_hooks_enabled = crate::runtimes::status_hooks_enabled(&spec.env);
         let (rt_session, output) = match self.spawn_runtime(spec) {
             Ok(p) => p,
             Err(e) => {
@@ -663,13 +697,32 @@ impl SessionManager {
         self.install_handle(
             session_id,
             SessionHandle {
-                startup: snap.mission_id.as_ref().map(|_| {
-                    startup::StartupDelivery::new(
-                        &role.runtime,
-                        !plan.resuming && first_turn.is_some(),
-                        super::super::clock::now(),
-                    )
-                }),
+                // A slot's inbox, and a chat's reports (#748), wait until the agent is ready.
+                startup: {
+                    let pending_turn = !plan.resuming && first_turn.is_some();
+                    let now = super::super::clock::now();
+                    if snap.mission_id.is_some() {
+                        Some(startup::StartupDelivery::new(
+                            &role.runtime,
+                            pending_turn,
+                            now,
+                        ))
+                    } else if Runtime::parse(&role.runtime).is_some_and(Runtime::is_shell) {
+                        None
+                    } else {
+                        // A resume that falls back to a fresh start can meet a trust prompt again,
+                        // unless the runtime's config already records the folder as trusted.
+                        let gate = if plan.resuming || (starts_trusted && !pending_turn) {
+                            startup::StartupDelivery::for_trusted_reports
+                        } else {
+                            startup::StartupDelivery::for_reports
+                        };
+                        Some(
+                            gate(&role.runtime, pending_turn, now)
+                                .with_status_hooks(status_hooks_enabled),
+                        )
+                    }
+                },
                 #[cfg(windows)]
                 pending_first_turn: None,
                 id: session_id.to_string(),
@@ -714,6 +767,10 @@ impl SessionManager {
             );
         }
 
+        let resume_check = effective_prior_key.filter(|_| plan.resuming).map(|key| {
+            let key = key.to_owned();
+            Box::new(move || conversation_exists(&key)) as super::output::ConversationCheck
+        });
         let forwarder = self.start_forwarder_thread(
             session_id.to_string(),
             started_at,
@@ -723,7 +780,7 @@ impl SessionManager {
             Arc::clone(&pool),
             Arc::clone(&events),
             role.clone(),
-            plan.resuming,
+            resume_check,
             snap.role_id.is_some(),
             resume_emit_ctx,
             app_data_dir.to_path_buf(),

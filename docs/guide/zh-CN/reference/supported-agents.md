@@ -2,13 +2,30 @@
 
 Runner 启动独立安装的智能体 CLI，并保留其原生终端界面。在 **设置 → 智能体（Settings → Agents）** 中启用智能体、检查检测到的可执行文件，或指定可执行文件覆盖。
 
-Claude Code、Codex 与 Antigravity CLI 是主要集成。Claude Code 和 Codex 的启动与提醒时序经过专门调整。
+Claude Code 与 Codex 是主要集成，启动与提醒时序经过专门调整。Antigravity CLI 及其他运行时属于次要集成：可运行聊天和任务，但不提供 Runner 的全部功能。Antigravity CLI 没有用量指示器。
 
 ## 智能体设置
 
 **设置 → 智能体** 将智能体分为已安装与未安装列表。每行打开对应智能体页面；使用 **智能体（Agents）** 面包屑返回。已安装行显示版本、可执行文件、默认标记、启用开关，以及可用时的更新按钮。Tab 与 Shift-Tab 在行和控件间移动；Enter 或 Space 打开焦点行。
 
 智能体页面提供启用开关、 **设为默认（Set as default）** 、检测和更新状态、带浏览及重置的 **可执行文件（Executable）** 字段，以及模型与推理强度的只读 **默认设置（Defaults）** 。Executable 保留 Auto 时自动发现。所选路径应用于使用该智能体默认命令的新会话；自定义命令的角色不变。未安装智能体页面提供安装说明与浏览。
+
+### 启动选项
+
+每个智能体页面都有 **启动（Launch）** 卡片和只读 **命令（Command）** 预览。切换 **聊天（Chat）** 或 **任务（Mission）** 可查看 Runner 组装的命令，模型、思考力度和首条消息以占位符显示。**复制（Copy）** 复制显示的命令。Claude Code 仅在启动时设置了 `CLAUDE_CONFIG_DIR` 的情况下显示该变量；原生账号启动时不额外添加该变量。
+
+| 选项 | 智能体 | 默认值 | 适用范围 |
+| --- | --- | --- | --- |
+| 跳过审批和沙盒 | Codex | 关闭 | 聊天 |
+| 跳过权限确认 | Claude Code | 关闭 | 所有账号的聊天 |
+| 远程插件目录 | Codex | 开启 | 聊天、恢复、任务和分叉 |
+| 状态钩子 | Codex、Claude Code、pi、Copilot CLI、OpenCode；macOS/Linux 上的 Grok；macOS 上的 Antigravity | 开启 | 聊天 |
+
+Bypass 让聊天无需权限确认即可运行；Codex 还会跳过沙盒。仅对信任的文件夹开启。Bypass 开关适用于所有 Codex 和 Claude Code 聊天，包括使用角色的聊天。聊天启动、恢复和分叉都会去除角色已保存的权限参数；关闭 Bypass 时，由智能体自身配置决定审批行为。任务始终使用宽松权限和状态钩子，不受聊天开关影响。
+
+关闭 **远程插件目录** 可跳过 Codex 每次启动时的目录下载，但目录中的插件也将不再加载。Runner 仅为该进程添加 `-c features.remote_plugin=false`，不修改 Codex 配置文件。
+
+关闭 **状态钩子** 后，Codex（0.163.0+）、Claude Code（2.1.295+）和 pi（1.1.0+）通过终端报告状态，其他智能体根据终端活动判断状态。审批和提问可能统一显示为 **需要你处理**；仅依赖终端活动的智能体无法报告详细等待和结果。会话标识钩子仍然开启，确保恢复时打开同一段对话。Cursor 只有会话标识钩子，TRAE 没有钩子，因此两者均无此开关。更改在会话下次启动时生效。
 
 ## 安装与登录
 
@@ -43,13 +60,13 @@ Claude Code、Codex 与 Antigravity CLI 是主要集成。Claude Code 和 Codex 
 | 需要输入报告 | 通用原生 Needs you（0.163.0） | 审批与问题 | 否 | 仅扩展报告 | 审批与问题 | 否 | macOS/Linux 上的审批 |
 | 从 CLI 发现模型 | 是 | 是 | 是 | 是 | 否 | 是 | 是 |
 | 通过设置 → 智能体更新 | 是 | 是 | 否 | 是 | 是 | 否 | 否 |
-| 用量指示器 | 是 | 是 | 是 | 否 | 否 | 否 | 否 |
+| 用量指示器 | 是 | 是 | 否 | 否 | 否 | 否 | 否 |
 | 技能 | 目录与开关 | 目录与开关 | 目录 | 目录 | 目录与开关 | 目录 | 目录 |
 | 安装 Runner 技能 | 是 | 是 | 是 | 是 | 是 | 是 | 是 |
 | 任务权限 | Bypass | Bypass | Bypass | 受信任工作区 | Bypass | Bypass | Bypass |
 | 终端渲染有 fixture 覆盖 | 是 | 是 | 是 | 否 | 否 | 否 | 是 |
 
-**终端程序状态** 使用 [OSC 7501](https://www.superlogical.com/rex/docs/build/program-status)。Claude Code 2.1.295+ 与 pi 1.1.0+ 通过探测检测支持；Codex 0.163.0+ 无条件报告。在终端标签页手动启动这些智能体，可通过已有侧边栏和标题栏指示器显示工作中、空闲与需要你。标题栏有空间时，阻塞消息显示在状态详情。受管理智能体聊天使用实时钩子桥接保持状态权威；流报告不能替代更新的钩子状态。原生状态本身不会产生未读回复。状态钩子更改和设置控制另在 [#1051](https://github.com/yicheng47/runner/issues/1051) 跟踪。
+**终端程序状态** 使用 [OSC 7501](https://www.superlogical.com/rex/docs/build/program-status)。Claude Code 2.1.295+ 与 pi 1.1.0+ 通过探测检测支持；Codex 0.163.0+ 无条件报告。在终端标签页手动启动这些智能体，可通过已有侧边栏和标题栏指示器显示工作中、空闲与需要你。标题栏有空间时，阻塞消息显示在状态详情。受管理智能体聊天使用实时钩子桥接保持状态权威；流报告不能替代更新的钩子状态。原生状态本身不会产生未读回复。启动卡片可关闭聊天的状态钩子；会话标识钩子仍保留，活动状态改由终端提供。
 
 **Codex 输入关注** 使用在 Codex CLI 0.163.0 验证的原生 OSC 7501 报告。`blocked` 报告在现有会话、侧边栏、标题栏与后台通知中显示通用的 **需要你处理（Needs you）** 。Codex 不区分提示是审批还是问题。原生 `working`、`idle` 或 `clear` 会解除关注；仅输入文字不会。钩子仍报告工作、完成、中断与对话标识。原生等待打开时也会暂停小队投递，解除后保留独立草稿。旧版或自定义 Codex 会话若无可用原生报告，保留原状态行为，不声称提供对话框投递保护。此信号在 macOS 与 Windows 的原生应用验证仍待完成。
 
@@ -59,10 +76,18 @@ Claude Code、Codex 与 Antigravity CLI 是主要集成。Claude Code 和 Codex 
 
 ## 平台与恢复说明
 
-- Runner 提供 Apple Silicon macOS 与 Windows x64 构建。上文 Linux 引用描述的是运行时适配器行为，不表示 Runner 的 Linux 构建能力；Linux 测试版安装与验证范围见[安装 Runner](../getting-started/install.md)。
+- Runner 提供 macOS（Apple Silicon 与 Intel）与 Windows x64 构建。上文 Linux 引用描述的是运行时适配器行为，不表示 Runner 的 Linux 构建能力；Linux 测试版安装与验证范围见[安装 Runner](../getting-started/install.md)。
 - Windows 智能体原生运行，无需 WSL。Claude Code 和 pi 的 bash 工具需要 Git for Windows。npm 安装的智能体需要 Node.js；Copilot 的 npm 安装需要 Node.js 22。PowerShell 7 可选。
 - Antigravity CLI 与 pi 有 Windows 实现路径，但没有完成原生 Windows 冒烟检查。Cursor、Grok 和 OpenCode 也存在 Windows 验证缺口。
 - Grok 聊天、任务与停止/恢复已在 macOS 检查；完整应用重启持久化仍未验证。在已加载 Grok 仪表盘切换对话，会在下次提示时更新恢复标识，而非空闲时切换就更新。
 - 恢复标识用于识别运行时对话，运行时仍须保有该历史。工作中/空闲与需要输入标记依赖运行时报告，不能证明任务完成。
 
 生命周期行为见[会话](../concepts/sessions.md)，检测与恢复问题见[故障排查](../guides/troubleshooting.md)。
+
+## 最低版本与智能体更新
+
+Codex 需要 **0.149.0 或更新版本**才能运行 Runner 的启动钩子。启动器只在旧版 Codex 的智能体行标记 **需要更新（Update needed）**；角色行不显示更新标签或操作。提示说明启动 Codex 或使用它的角色时，会先更新 Codex，窗格显示等待卡片；更新成功后聊天自动启动。恢复或分叉被拒绝时也提供同样的恢复方式。无法确定版本时，Runner 仍允许尝试启动。
+
+受支持的智能体有新版本时，只有智能体行显示已安装版本、可用版本与 **更新（Update）**，角色行保持原样。你仍可使用受支持的已安装版本启动聊天。侧边栏设置齿轮上的圆点打开 **设置 → 智能体**，覆盖所有已启用且提供更新命令的智能体，包括没有用量仪表的智能体。
+
+手动更新作为[后台任务](../guides/chats-and-windows.md#后台任务)运行。再次启动同一智能体的更新会加入现有任务。运行中的聊天继续使用原版本，直到重新启动。这些控件更新智能体 CLI；Runner 自身的更新仍位于 **设置 → 更新**。智能体自动更新属于另一项功能。

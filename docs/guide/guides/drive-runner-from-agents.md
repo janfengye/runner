@@ -19,28 +19,43 @@ Roles use their unique handles. Crews and projects accept an ID or exact name. M
 
 ## Start and follow a crew
 
-The start-and-watch instructions in this section are for external operators launching a different mission. That mission's updates are not automatically pushed into an outside agent's chat. Participants receive inbox notifications for their own mission as described below.
+From a shell, start the mission and follow its feed yourself. When an agent in a Runner chat starts a mission, Runner links the mission to that chat and reports back to it instead; see [Start from a Runner chat](#start-from-a-runner-chat). Mission members receive inbox notifications for their own mission as described below.
 
 Write a UTF-8 `brief.md` containing the task, directory assumptions, validation and authorized Git actions. In a macOS shell, run:
 
 ```sh
-mission=$(runner mission start --crew "Pair coding crew" --cwd /absolute/path/to/project --goal-file brief.md -q)
+mission=$(runner mission start --crew "Pair coding crew" --title "Fix the login bug" --cwd /absolute/path/to/project --goal-file brief.md -q)
 runner mission feed "$mission" --follow --json
 ```
 
 In Windows PowerShell:
 
 ```powershell
-$mission = runner mission start --crew "Pair coding crew" --cwd 'C:\Users\you\src\project' --goal-file brief.md -q
+$mission = runner mission start --crew "Pair coding crew" --title "Fix the login bug" --cwd 'C:\Users\you\src\project' --goal-file brief.md -q
 if ($LASTEXITCODE -ne 0) { throw 'Mission start failed' }
 runner mission feed $mission --follow --json
 ```
 
-Replace the crew name and directory with yours. `--goal-file -` reads standard input; a file path avoids shell-specific input-redirection differences. Use `--project "My app"` instead of `--cwd` when the project already names the folder.
+Replace the crew name, title and directory with yours. `--goal-file -` reads standard input; a file path avoids shell-specific input-redirection differences. Use `--project "My app"` instead of `--cwd` when the project already names the folder.
 
 The follower displays new events until the mission ends or all its sessions exit. Pressing **Ctrl+C** ends your follower; it does not stop the mission. Leave it running in one terminal and use another for commands.
 
-An external agent that starts a different mission must arrange a watch whose output and exit notifications reach it during later work and while idle. One unread background log is not a watch. If the host cannot deliver those events, the agent should say so and give you the feed command to run. On an interrupted watch, check the mission and resume from the last JSON event's `next_offset` using `--since <offset> --oldest-first`. See the generated [agent guide](../reference/cli.md#agent-guide) for the full watch contract.
+## Start from a Runner chat
+
+Inside a Runner chat, `runner mission start` links the new mission to that chat. The mission's row sits under the chat in the sidebar, and Runner types one short `[runner]` line into the chat when the mission needs you, fails, is interrupted by a Runner restart or settles, waiting until the chat is idle and its input is empty. After a restart, the chat hears that the mission was interrupted, not that it settled, while a member's lost turn has not been run again. Add `--no-report` to link without those lines. A mission started from the app, from a terminal or by an agent outside Runner starts unlinked.
+
+The agent that started the mission gives you its ID and says whether Runner will report back to this chat, which it does not for a mission started with `--no-report`, linked to another chat or started unlinked; then it ends its turn instead of watching the feed. When a `[runner]` line arrives, the agent reads the mission with `runner mission show` and `runner mission feed`, tells you what happened, and passes a pending question to you. It answers a question only with your decision.
+
+```sh
+runner mission link <mission-id>
+runner mission link <mission-id> --chat <session-id> --no-report
+runner mission unlink <mission-id>
+runner mission list --linked-here
+```
+
+`mission link` links an existing mission to the chat it runs in, or to `--chat` from outside a chat, and moves a link the mission already has. Only an agent chat that is not archived can be linked, in the mission's project or with both outside a project. `mission unlink` removes the link. `mission list --linked-here` lists the missions linked to the current chat, which helps an agent find them again after a compaction. You can also link from the sidebar, as [Chats and windows](chats-and-windows.md#missions-under-the-chat-that-started-them) describes.
+
+An agent outside a Runner chat gets no link and no reports. It tells you the mission ID, and you follow the mission in the app or with `runner mission feed <mission-id> --follow`.
 
 ## Send a message and answer a question
 
@@ -50,17 +65,24 @@ Use `mission show` to find the current handles, roles and pending questions. The
 runner mission show <mission-id> --json
 runner msg post --mission <mission-id> --to coder "Keep the change limited to the parser."
 runner mission answer <mission-id> <question-id> <choice>
+runner mission answer <mission-id> <question-id> <choice> --note "Only after the migration lands."
 runner mission stop <mission-id>
 runner mission archive <mission-id>
 ```
 
+`mission answer` takes a question ID that `mission show` lists as pending, or the ID of the member's `ask_human` event from the feed. Any other ID, including one for a question that has already been answered, is refused with the pending question IDs, so an answer is never dropped silently.
+
+Add `--note <text>`, or `--note-file <path>` (`-` reads stdin), when an answer needs a condition the choices don't carry. The member gets the choice and the note in one inbox message. A blank note is refused. The note goes to the member who asked: the app's mission feed shows only the choice.
+
 Inside a mission, members can use `runner msg post --to reviewer "Ready for review"` and `runner msg read` without supplying a mission ID. Outside a mission, writes need `--mission`. An outside caller without `--as` speaks as the person; do not use `--as` to impersonate another member.
 
-Runner pushes inbox notifications to every mission member. When waiting for a teammate and no independent work remains, finish your turn. Do not start a feed watcher, poll, or sleep-loop to wait for messages. Iterate with teammates across turns. External monitoring instructions do not apply to receiving messages in your own mission. Bounded diagnostic inspection, independent work and watching CI for an authorized PR remain valid.
+Runner pushes inbox notifications to every mission member. When waiting for a teammate and no independent work remains, finish your turn. Do not start a feed watcher, poll, or sleep-loop to wait for messages. Iterate with teammates across turns. Bounded diagnostic inspection, independent work and watching CI for an authorized PR remain valid.
 
 Address several members with `runner msg post --to coder --to reviewer "Please check the parser."`, or use leading mentions: `runner msg post "@coder @reviewer Please check the parser."`. Explicit `--to` recipients take precedence. A leading address token is `@handle`, optionally followed by one `:` or `,`, so `@coder, @reviewer: Please check.` addresses both members. Handles use lowercase letters, digits, `_` and `-`, starting with a letter or digit. Any other token ends the leading run: `@reviewer's audit` and a bare `@` stay text and do not address anyone. Mentions inside the message do not address it. Unknown handles and `@human` are refused; `mission show` lists valid members. Omit recipients to broadcast when everyone needs to act, and reply to the sender for ordinary follow-ups.
 
 When an `[inbox]` notification arrives, run `runner msg read`. It shows only new inbox messages, followed by up to ten short lines of other members' directed traffic. After a resume or whenever earlier messages are no longer in context, use `runner msg read --all` for all crew messages since joining, including sent messages and traffic between others. Unfiltered reads mark only printed inbox messages read. `--since <event-id>` and `--from <handle>` never mark messages read, even with `--all`, and omit the digest. Default reads already track unread messages; do not maintain a `--since` cursor or use `--from` as your inbox-consumption loop. When a filtered read leaves unread messages, stderr reports the unread count from that read and a hint to run unfiltered `runner msg read`, even if the filter returns no messages. Message output on stdout is unchanged. Reads also work while the daemon is unavailable. Do not post receipt-only replies such as “received” or standby messages; consuming the inbox with `runner msg read` is still required.
+
+When a member finishes a task or a handoff someone is waiting on, it posts the result with `runner msg post` before ending its turn: what it did, the key validation, and anything still needing the person or another member. It addresses the post to whoever asked, or omits `--to` when the person asked. The mission's operator, such as the chat that started the mission, reads the feed rather than the member's terminal, and an `idle` status only marks the end of a turn, so a result left in the terminal looks like a stuck member. This is one post per finished task, separate from the receipt-only and standby messages members do not send.
 
 ## Start without a saved crew
 
@@ -72,7 +94,7 @@ runner mission add-role <returned-mission-id> coder --task-file task.md
 runner mission add-role <returned-mission-id> reviewer --task "Review the coder's diff after its handoff."
 ```
 
-As an external operator, arm the feed watch for the returned ID as above. These members receive the shared goal, their own task and their own inbox notifications. Adding and removing roles is controlled by the person, not by an in-mission agent. The full [CLI reference](../reference/cli.md) lists overrides and lifecycle commands.
+Started from a Runner chat, the mission links to that chat as above. These members receive the shared goal, their own task and their own inbox notifications. Adding and removing roles is controlled by the person, not by an in-mission agent. The full [CLI reference](../reference/cli.md) lists overrides and lifecycle commands.
 
 ## Exit codes
 

@@ -67,6 +67,8 @@ impl Sidebar {
             .collect::<Vec<_>>();
         let root = cx.entity();
         let dismiss_root = root.clone();
+        let submenu_root = root.clone();
+        let submenu_actions = actions.clone();
         let return_focus = window.focused(cx);
         let menu = cx.new(move |menu_cx| {
             let action_root = root.clone();
@@ -90,7 +92,23 @@ impl Sidebar {
                     });
                 }),
             )
-            .return_focus(return_focus);
+            .return_focus(return_focus)
+            .on_submenu(Rc::new(move |index, bounds, window, cx| {
+                if let Some(SidebarMenuAction::LinkToChat(mission_id)) =
+                    submenu_actions.get(index).cloned()
+                {
+                    submenu_root.update(cx, |this, cx| {
+                        this.open_link_picker(
+                            mission_id,
+                            None,
+                            None,
+                            super::link::PickerAnchor::Row(bounds),
+                            window,
+                            cx,
+                        )
+                    });
+                }
+            }));
             match anchor {
                 Some(anchor) => menu.anchored_to(anchor),
                 None => menu,
@@ -101,6 +119,41 @@ impl Sidebar {
         focus.focus(window, cx);
         self.schedule_shell_notify(cx);
         cx.notify();
+    }
+
+    /// Whether the sidebar row of tab `tab_id` is pinned, or `None` when the
+    /// tab has no row to pin.
+    pub(crate) fn tab_pinned(&self, tab_id: &str, cx: &App) -> Option<bool> {
+        if self.front_page.is_remote() {
+            self.source_nodes(cx)
+                .into_iter()
+                .find(|node| node.id == tab_id)
+                .map(|node| node.pinned_position.is_some())
+        } else {
+            self.app_store
+                .read(cx)
+                .nodes
+                .iter()
+                .find(|node| node.id == tab_id)
+                .map(|node| node.pinned_position.is_some())
+        }
+    }
+
+    pub(crate) fn toggle_tab_pin(
+        &mut self,
+        tab_id: String,
+        pinned: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.handle_sidebar_menu_action(
+            SidebarMenuAction::TogglePin {
+                node_id: tab_id,
+                pinned,
+            },
+            window,
+            cx,
+        );
     }
 
     pub(super) fn open_tab_menu(
@@ -143,6 +196,7 @@ impl Sidebar {
         let entries = tab_menu_entries(
             &node.id,
             node.pinned_position.is_some(),
+            multi_pane,
             rename_original,
             rename_session_id,
             archive_all,
@@ -170,11 +224,13 @@ impl Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let pinned = self.mission_menu_pinned(&node, cx);
         let mut entries = mission_menu_entries(
             &node.id,
-            node.pinned_position.is_some(),
+            pinned,
             &summary.mission.id,
             summary.mission.title,
+            summary.mission.linked_chat.as_ref(),
         );
         if self.front_page.is_remote() {
             entries.insert(
@@ -195,19 +251,29 @@ impl Sidebar {
         self.open_sidebar_context_menu(position, entries, window, cx);
     }
 
-    pub(super) fn open_project_create_menu(
+    /// A linked mission's Pin acts on its group, so its menu reads the group's pin.
+    pub(super) fn mission_menu_pinned(&self, node: &NodeRow, cx: &App) -> bool {
+        let rows = self.resolved_sidebar_rows(cx);
+        super::link::LinkGroups::of(&rows)
+            .head(&node.id)
+            .and_then(|head| rows.iter().find(|row| row.node().id == head))
+            .map_or(node.pinned_position.is_some(), |head| {
+                head.node().pinned_position.is_some()
+            })
+    }
+
+    /// A sidebar +: the launcher page in `scope`, where chats, terminals and
+    /// missions start.
+    pub(crate) fn open_launcher_in(
         &mut self,
-        project_id: String,
-        anchor: gpui::Bounds<gpui::Pixels>,
+        scope: ProjectScope,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_sidebar_menu(
-            MenuOrigin::Button(anchor),
-            project_create_menu_entries(&project_id, &self.settings(cx).keymap_overrides),
-            window,
-            cx,
-        );
+        let action = SidebarMenuAction::NewChat(scope);
+        if self.menu_action_supported(&action, cx) {
+            self.handle_sidebar_menu_action(action, window, cx);
+        }
     }
 
     pub(super) fn open_project_menu(
@@ -282,52 +348,11 @@ impl Sidebar {
         match action {
             SidebarMenuAction::NewChat(scope) => {
                 self.set_active_project(scope.project_id().map(str::to_owned), cx);
-                if let Some(project_id) = scope.project_id() {
-                    let project_id = project_id.to_owned();
-                    self.update_app_settings(cx, true, move |settings| {
-                        settings.sidebar_projects_open = true;
-                        settings.sidebar_collapsed_projects.remove(&project_id);
-                        true
-                    });
-                }
                 if let Some(shell) = self.shell.upgrade() {
                     window.defer(cx, move |window, cx| {
                         shell.update(cx, |shell, shell_cx| {
+                            shell.reveal_started_scope(&scope, shell_cx);
                             shell.open_sidebar_chat_modal(scope, window, shell_cx)
-                        });
-                    });
-                }
-            }
-            SidebarMenuAction::NewTerminal(scope) => {
-                self.set_active_project(scope.project_id().map(str::to_owned), cx);
-                if let Some(project_id) = scope.project_id() {
-                    let project_id = project_id.to_owned();
-                    self.update_app_settings(cx, true, move |settings| {
-                        settings.sidebar_projects_open = true;
-                        settings.sidebar_collapsed_projects.remove(&project_id);
-                        true
-                    });
-                }
-                if let Some(shell) = self.shell.upgrade() {
-                    window.defer(cx, move |window, cx| {
-                        shell.update(cx, |shell, shell_cx| {
-                            shell.new_terminal_tab(scope, window, shell_cx)
-                        });
-                    });
-                }
-            }
-            SidebarMenuAction::NewMission(scope) => {
-                self.set_active_project(scope.project_id().map(str::to_owned), cx);
-                let client = self.front_page.clone();
-                if let Some(shell) = self.shell.upgrade() {
-                    window.defer(cx, move |window, cx| {
-                        shell.update(cx, |shell, shell_cx| {
-                            if !client.valid()
-                                || shell.front_page_client(shell_cx).target != client.target
-                            {
-                                return;
-                            }
-                            shell.open_start_mission_modal(None, scope, window, shell_cx)
                         });
                     });
                 }
@@ -431,6 +456,17 @@ impl Sidebar {
                     });
                 }
             }
+            SidebarMenuAction::LinkToChat(mission_id) => {
+                self.open_link_picker(
+                    mission_id,
+                    None,
+                    None,
+                    super::link::PickerAnchor::Pointer,
+                    window,
+                    cx,
+                );
+            }
+            SidebarMenuAction::UnlinkMission(mission_id) => self.unlink_mission(mission_id, cx),
             SidebarMenuAction::ArchiveMission(mission_id) => {
                 if !self.front_page.is_remote() && self.archiving_missions.contains(&mission_id) {
                     return;
@@ -500,10 +536,13 @@ impl Sidebar {
     }
 }
 
+/// One ordered list for a tab row, matching the pane title menu: Rename… ·
+/// Fork chat · Pin, then the destructive end action after a separator.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn tab_menu_entries(
     node_id: &str,
     pinned: bool,
+    split: bool,
     original: String,
     rename_session_id: Option<String>,
     archive_all: bool,
@@ -518,28 +557,19 @@ pub(super) fn tab_menu_entries(
         .then(|| keymap::effective_binding("close-pane", overrides))
         .flatten()
         .map(|combo| keymap::format_combo(&combo).into());
-    let mut entries = vec![
-        (
-            UiMenuItem::new(if pinned {
-                crate::i18n::message("ui.unpin")
-            } else {
-                crate::i18n::message("ui.pin")
-            })
-            .icon(if pinned { "pin-off.svg" } else { "pin.svg" }),
-            SidebarMenuAction::TogglePin {
-                node_id: node_id.to_owned(),
-                pinned,
-            },
-        ),
-        (
-            UiMenuItem::new(crate::i18n::message("ui.rename_tab")).icon("pencil.svg"),
-            SidebarMenuAction::Rename(SidebarRenameTarget::Tab {
-                node_id: node_id.to_owned(),
-                original,
-                session_id: rename_session_id,
-            }),
-        ),
-    ];
+    let mut entries = vec![(
+        UiMenuItem::new(if split {
+            crate::i18n::message("ui.rename_tab_action")
+        } else {
+            crate::i18n::message("ui.rename_chat_action")
+        })
+        .icon("pencil.svg"),
+        SidebarMenuAction::Rename(SidebarRenameTarget::Tab {
+            node_id: node_id.to_owned(),
+            original,
+            session_id: rename_session_id,
+        }),
+    )];
     if let Some(target) = fork_target {
         let mut item = UiMenuItem::new(crate::i18n::message("ui.fork_chat_action"))
             .icon("git-fork.svg")
@@ -549,10 +579,27 @@ pub(super) fn tab_menu_entries(
         }
         entries.push((item, SidebarMenuAction::ForkChat(target.session_id)));
     }
+    entries.push((
+        UiMenuItem::new(if pinned {
+            crate::i18n::message("ui.unpin")
+        } else {
+            crate::i18n::message("ui.pin")
+        })
+        .icon(if pinned { "pin-off.svg" } else { "pin.svg" }),
+        SidebarMenuAction::TogglePin {
+            node_id: node_id.to_owned(),
+            pinned,
+        },
+    ));
     if !chat_session_ids.is_empty() {
-        let mut item = UiMenuItem::new(crate::i18n::message("ui.archive"))
-            .icon("archive.svg")
-            .destructive(true);
+        let mut item = UiMenuItem::new(if split {
+            crate::i18n::message("ui.archive_all")
+        } else {
+            crate::i18n::message("ui.archive")
+        })
+        .icon("archive.svg")
+        .separator_before(true)
+        .destructive(true);
         item.shortcut = close_shortcut;
         entries.push((
             item,
@@ -568,6 +615,7 @@ pub(super) fn tab_menu_entries(
     } else if let Some(session_id) = terminal_session_id {
         let mut item = UiMenuItem::new(crate::i18n::message("ui.close_terminal"))
             .icon("close.svg")
+            .separator_before(true)
             .destructive(true);
         item.shortcut = close_shortcut;
         entries.push((
@@ -594,8 +642,9 @@ pub(super) fn mission_menu_entries(
     pinned: bool,
     mission_id: &str,
     original: String,
+    linked: Option<&runner_core::protocol::LinkedChat>,
 ) -> Vec<(UiMenuItem, SidebarMenuAction)> {
-    vec![
+    let mut entries = vec![
         (
             UiMenuItem::new(if pinned {
                 crate::i18n::message("ui.unpin")
@@ -616,60 +665,29 @@ pub(super) fn mission_menu_entries(
             }),
         ),
         (
-            UiMenuItem::new(crate::i18n::message("ui.archive"))
-                .icon("archive.svg")
-                .destructive(true),
-            SidebarMenuAction::ArchiveMission(mission_id.to_owned()),
+            UiMenuItem::new(crate::i18n::message("ui.link_to_chat"))
+                .icon("link.svg")
+                .submenu(),
+            SidebarMenuAction::LinkToChat(mission_id.to_owned()),
         ),
-    ]
-}
-
-pub(super) fn project_create_menu_entries(
-    project_id: &str,
-    overrides: &keymap::KeymapOverrides,
-) -> Vec<(UiMenuItem, SidebarMenuAction)> {
-    create_menu_entries(ProjectScope::Project(project_id.to_owned()), overrides)
-}
-
-pub(super) fn sidebar_create_menu_entries(
-    overrides: &keymap::KeymapOverrides,
-) -> Vec<(UiMenuItem, SidebarMenuAction)> {
-    create_menu_entries(ProjectScope::Root, overrides)
-}
-
-fn create_menu_entries(
-    scope: ProjectScope,
-    overrides: &keymap::KeymapOverrides,
-) -> Vec<(UiMenuItem, SidebarMenuAction)> {
-    [
-        (
-            "new-chat",
-            crate::i18n::message("ui.new_chat"),
-            "message-square-plus.svg",
-            SidebarMenuAction::NewChat(scope.clone()),
-        ),
-        (
-            "new-mission",
-            crate::i18n::message("ui.new_mission"),
-            "flag.svg",
-            SidebarMenuAction::NewMission(scope.clone()),
-        ),
-        (
-            "new-terminal",
-            crate::i18n::message("ui.new_terminal"),
-            "square-terminal.svg",
-            SidebarMenuAction::NewTerminal(scope),
-        ),
-    ]
-    .into_iter()
-    .map(|(id, label, icon, action)| {
-        let mut item = UiMenuItem::new(label).icon(icon);
-        if let Some(combo) = keymap::effective_binding(id, overrides) {
-            item = item.shortcut(keymap::format_combo(&combo));
-        }
-        (item, action)
-    })
-    .collect()
+    ];
+    if let Some(chat) = linked {
+        entries.push((
+            UiMenuItem::new(crate::i18n::messagef(
+                "format.unlink_from_chat",
+                &[("chat", chat.title.clone())],
+            ))
+            .icon("link-2-off.svg"),
+            SidebarMenuAction::UnlinkMission(mission_id.to_owned()),
+        ));
+    }
+    entries.push((
+        UiMenuItem::new(crate::i18n::message("ui.archive"))
+            .icon("archive.svg")
+            .destructive(true),
+        SidebarMenuAction::ArchiveMission(mission_id.to_owned()),
+    ));
+    entries
 }
 
 pub(super) fn project_menu_entries(

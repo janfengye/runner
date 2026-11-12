@@ -5,22 +5,22 @@ Start a chat to work with one agent in its own terminal. You can choose the agen
 ## Start and finish a small task
 
 1. [Install and sign in to an agent](install.md), then open Runner.
-2. Press **⌘N** / **Ctrl+N** to focus the launcher in an empty pane, or open it in a new tab.
-3. Check the folder below **Search agents and roles**. On the default page, choose a project or **No project**; use **Change** to pick another folder. In a split pane, the project stays with its tab and the folder starts from a neighbouring session.
+2. Press **⌘N** / **Ctrl+N** to show the launcher page. A dashed **New tab** row marks it in the sidebar; no tab is saved until you start.
+3. Check the folder. On the default page it sits below **Search agents and roles**: choose a project or **No project**, and use **Change** to pick another folder. A split pane has no folder control: its chat uses the tab’s project and starts in a neighbouring session’s folder. A short split pane shows fewer recent entries; type to find the others.
 4. Type an agent or role name, then press **Enter** or click its row. With the search empty, **1–4** start the corresponding recent entry. Agent rows use the agent’s own configuration; roles use their saved settings. A role’s own directory takes precedence unless you used **Change**.
-5. The chat starts immediately, without a form. Rename it from the pane menu when needed.
-6. In the terminal, send a small prompt such as: “List the top-level files in this folder and explain what each is for. Do not change any files.” Complete any sign-in, trust or approval prompts in the agent's own terminal.
-7. Wait for the agent's reply. Its terminal remains available for follow-up questions. When finished, click the **Stop chat** icon at the right of the pane’s header, before ⋯, or **⇧⌘X** / **Ctrl+Shift+X** with that session focused.
+5. The chat starts immediately, without a form. Rename it when needed from the menu that opens when you click its name in the pane header, or double-click the name.
+6. In the terminal, send a small prompt such as: “List the top-level files in this folder and explain what each is for. Do not change any files.” Complete any sign-in or approval prompts in the agent's own terminal. Runner normally accepts folder trust for Claude Code, Codex, Copilot and Antigravity when starting them; other agents may ask you to trust the folder.
+7. Wait for the agent's reply. Its terminal remains available for follow-up questions. When finished, click the **Stop chat** icon right after the status at the right of the pane’s header, or **⇧⌘X** / **Ctrl+Shift+X** with that session focused.
 
 A stopped chat remains in Runner. Its centered **Chat stopped** card has a **Resume** button with the current shortcut; use × to archive. Short panes hide the badge and reason first so Resume stays reachable. The **Resume chat** icon beside its status, or **⇧⌘R** / **Ctrl+Shift+R**, continues its saved conversation when the runtime supports it. [Sessions](../concepts/sessions.md) explains the difference between stopping, resuming and closing.
 
 ## Add another pane
 
-Press **⌘D** / **Ctrl+D** to split right, or **⇧⌘D** / **Ctrl+Shift+D** to split down. Use the launcher in the empty pane to search for and start another agent or role. Each pane holds a separate session; splitting does not copy the first agent's conversation or create a mission.
+Press **⌘D** / **Ctrl+Shift+D** to split right, or **⇧⌘D** / **Alt+Shift+D** to split down. Use the launcher in the empty pane to search for and start another agent or role. Each pane holds a separate session; splitting does not copy the first agent's conversation or create a mission.
 
 ## Open a shell
 
-Press **⌘T** / **Ctrl+Shift+T** to open a terminal. Split a chat pane first to place a shell beside the agent. Chat and terminal tabs have no terminal drawer; **⌥F12** / **Alt+F12** remains a mission-workspace shortcut. A terminal has no Stop or Restart: use Ctrl+C to interrupt a command, and × or `exit` to close its pane. From a chat tab, **New terminal** in the command palette fills an available empty pane or opens a terminal tab; in a mission workspace it adds a drawer shell.
+Press **⌘T** / **Ctrl+Shift+T** to open a terminal. Split a chat pane first to place a shell beside the agent. Chat and terminal tabs have no terminal drawer; **⌥F12** / **Alt+F12** remains a mission-workspace shortcut. A terminal has no Stop or Restart: use Ctrl+C to interrupt a command, and × or `exit` to close its pane. From a chat tab, **New terminal** in the command palette fills an available empty pane or opens a terminal tab; in a mission workspace it adds a drawer shell. Unless the program running in a terminal reports its own status, the terminal's status dot in the sidebar shows the shell's activity: Working while a command runs, including a program left open such as `vim` or `ssh`, and Idle at the prompt. zsh, and bash 4.4 or later, on macOS and Linux mark where each command starts and ends, so the dot changes as soon as a command does; other shells, including macOS's built-in bash 3.2, fish and every shell on Windows, show Working while the terminal prints output and Idle after two seconds without output.
 
 ## Close and return later
 

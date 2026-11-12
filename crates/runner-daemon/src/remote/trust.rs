@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use runner_core::remote::{encode_key, fingerprint, PairedDevice};
+use runner_core::remote::{encode_key, fingerprint, DeviceKind, PairedDevice};
 use serde::{Deserialize, Serialize};
 use std::{io::Write, path::Path};
 
@@ -70,9 +70,20 @@ impl Trust {
         file.as_file()
             .sync_all()
             .map_err(|_| "Could not sync remote trust")?;
-        file.persist(root.join("remote-trust.json"))
-            .map_err(|_| "Could not replace remote trust")?;
-        Ok(())
+        // Windows refuses to replace a file while anything holds it open, as a
+        // reader or a virus scanner checking the last write briefly does.
+        let mut attempts = if cfg!(windows) { 50 } else { 1 };
+        loop {
+            attempts -= 1;
+            match file.persist(root.join("remote-trust.json")) {
+                Ok(_) => return Ok(()),
+                Err(error) if attempts > 0 => {
+                    file = error.file;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(_) => return Err("Could not replace remote trust"),
+            }
+        }
     }
     pub fn record_failed_pin(&mut self) {
         self.failed_pins = (self.failed_pins + 1).min(5);
@@ -110,6 +121,7 @@ impl Trust {
                 paired_at: now,
                 last_seen_at: now,
                 connected: false,
+                kind: DeviceKind::Unknown,
             });
         }
         self.failed_pins = 0;
@@ -182,6 +194,31 @@ mod tests {
         assert!(Trust::load(root.path()).unwrap().devices.is_empty());
     }
     #[test]
+    fn kinds_survive_a_restart_and_a_trust_file_from_before_them_loads_as_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        let mut trust = Trust::default();
+        trust
+            .record_paired(&[3; 32], "Phone".into(), Utc::now())
+            .unwrap();
+        assert_eq!(trust.devices[0].kind, DeviceKind::Unknown);
+        trust.devices[0].kind = DeviceKind::Phone;
+        trust.save(root.path()).unwrap();
+        let restored = Trust::load(root.path()).unwrap();
+        assert_eq!(restored.devices[0].kind, DeviceKind::Phone);
+        trust
+            .record_paired(&[3; 32], "Renamed".into(), Utc::now())
+            .unwrap();
+        assert_eq!(trust.devices[0].kind, DeviceKind::Phone);
+
+        let mut value = serde_json::to_value(&restored).unwrap();
+        value["devices"][0].as_object_mut().unwrap().remove("kind");
+        std::fs::write(root.path().join("remote-trust.json"), value.to_string()).unwrap();
+        let legacy = Trust::load(root.path()).unwrap();
+        assert_eq!(legacy.devices.len(), 1);
+        assert_eq!(legacy.devices[0].kind, DeviceKind::Unknown);
+        assert!(!root.path().join("remote-trust.json.bad").exists());
+    }
+    #[test]
     fn trust_file_is_replaced_privately_and_bad_data_preserved() {
         let root = tempfile::tempdir().unwrap();
         let mut trust = Trust::default();
@@ -213,5 +250,21 @@ mod tests {
                 bad
             );
         }
+    }
+
+    #[test]
+    fn save_replaces_the_file_once_a_reader_lets_go() {
+        let root = tempfile::tempdir().unwrap();
+        let mut trust = Trust::default();
+        trust.save(root.path()).unwrap();
+        let reader = std::fs::File::open(root.path().join("remote-trust.json")).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(reader);
+        });
+        trust.failed_pins = 1;
+        trust.save(root.path()).unwrap();
+        release.join().unwrap();
+        assert_eq!(Trust::load(root.path()).unwrap().failed_pins, 1);
     }
 }

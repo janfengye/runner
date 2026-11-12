@@ -4,12 +4,13 @@ mod launch;
 pub(crate) mod launcher;
 pub(crate) mod launcher_model;
 mod modal;
+mod project_field;
 mod render;
 mod role_setup;
 mod terminal;
 
+use self::project_field::{ProjectChoice, ProjectField};
 use super::profile_page::{column_text, section_label, text_action};
-use super::project_field::{ProjectChoice, ProjectField};
 use super::*;
 use crate::chat_icon::runtime_mark;
 use crate::surfaces::front_page::model::{RoleChoice, RuntimeChoice};
@@ -241,7 +242,7 @@ enum ResetKind {
 
 impl NativeRoot {
     pub(crate) fn create_modal_open(&self) -> bool {
-        self.start_chat_modal.is_some() || self.start_mission_modal.is_some()
+        self.start_chat_modal.is_some()
     }
     fn confirm_start_chat(
         &mut self,
@@ -400,7 +401,14 @@ pub(super) mod tests {
             runtime_discovery,
         );
         let mut cx = TestAppContext::single();
-        cx.update(|cx| keymap::install_bindings(cx, &keymap::KeymapOverrides::new(), false));
+        cx.update(|cx| {
+            keymap::install_bindings(
+                cx,
+                &keymap::KeymapOverrides::new(),
+                crate::keymap::TerminalCtrlKeys::RunnerFirst,
+                false,
+            )
+        });
         #[cfg(target_os = "macos")]
         let updater = cx.new(|cx| Updater::new(false, cx));
         #[cfg(any(windows, target_os = "linux"))]
@@ -490,7 +498,19 @@ pub(super) mod tests {
                 .unwrap()
         }
 
-        fn bounds(&mut self, selector: &str) -> Option<gpui::Bounds<gpui::Pixels>> {
+        pub(in crate::surfaces) fn read_root<R>(
+            &self,
+            f: impl FnOnce(&NativeRoot, &App) -> R,
+        ) -> R {
+            self.host
+                .read_with(&self.visual, |host, cx| f(host.0.read(cx), cx))
+                .unwrap()
+        }
+
+        pub(in crate::surfaces) fn bounds(
+            &mut self,
+            selector: &str,
+        ) -> Option<gpui::Bounds<gpui::Pixels>> {
             self.visual
                 .debug_bounds(Box::leak(selector.to_owned().into_boxed_str()))
         }
@@ -606,6 +626,10 @@ pub(super) mod tests {
 
     fn runtime(name: &str, efforts: &[&str]) -> RuntimeCatalogEntry {
         RuntimeCatalogEntry {
+            installed_version: None,
+            available_version: None,
+            min_version: None,
+            below_minimum: false,
             name: Runtime::parse(name).unwrap(),
             capabilities: runner_core::protocol::runtime::RuntimeCatalogEntry::for_runtime(
                 Runtime::parse(name).unwrap(),

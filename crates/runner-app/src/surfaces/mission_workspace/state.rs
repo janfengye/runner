@@ -9,10 +9,10 @@ use runner_core::protocol::model::{Event, EventKind, SessionStatus};
 use runner_core::protocol::window::Subject;
 
 use super::*;
-use crate::surfaces::mission_composer::{
+use crate::surfaces::mission_workspace::composer_model::{
     key_down as composer_key_down, update_draft as update_composer_draft, ComposerState,
 };
-use crate::surfaces::mission_feed::{
+use crate::surfaces::mission_workspace::feed_model::{
     append_feed_block, group_feed_blocks, is_human_authored, project_asks,
 };
 use crate::*;
@@ -32,7 +32,7 @@ impl MissionWorkspace {
     ) -> Self {
         let settings = &app_store.read(cx).settings;
         let sidebar_collapsed = settings.sidebar_collapsed;
-        let rail_visibility = SidebarVisibilityTransition::new(settings.mission_rail_open);
+        let rail_visibility = SidebarVisibilityTransition::new(settings.mission_rail_shown());
         let root_focus = cx.focus_handle();
         let drawer_focus = cx.focus_handle();
         let drawer_focus_subscriptions = vec![
@@ -269,9 +269,14 @@ impl MissionWorkspace {
             secondary: false,
             duplicate_dismissed: false,
             primary_label: None,
-            rail_view: MissionRailView::default(),
+            rail_surfaces: crate::surfaces::side_panel::PanelSurfaces::new(Default::default(), cx),
+            rail_open: None,
+            rail_switched: false,
+            rails_by_mission: HashMap::new(),
+            rail_files: Default::default(),
             action_menu,
             menu_actions: Vec::new(),
+            menu_pinned: false,
             rename_modal: None,
             mission_id_copy,
             session_key_copies: HashMap::new(),
@@ -282,14 +287,30 @@ impl MissionWorkspace {
         }
     }
 
-    pub(super) fn prepare_mission(
-        &mut self,
-        mission_id: String,
-        rail_view: MissionRailView,
-    ) -> u64 {
+    pub(super) fn prepare_mission(&mut self, mission_id: String) -> u64 {
         self.generation += 1;
         self.refresh_generation += 1;
         self.event_resync_generation += 1;
+        if !self.presentation.is_remote() {
+            if let Some(previous) = self.mission_id.as_ref() {
+                self.rails_by_mission.insert(
+                    previous.clone(),
+                    crate::surfaces::side_panel::SavedPanel {
+                        surfaces: self.rail_surfaces.open.clone(),
+                        open: self.rail_open,
+                    },
+                );
+            }
+            let saved = self
+                .rails_by_mission
+                .remove(&mission_id)
+                .unwrap_or_default();
+            self.rail_surfaces.reset(saved.surfaces);
+            self.rail_open = saved.open;
+            self.rail_switched = true;
+        } else {
+            self.rail_surfaces.reset(Default::default());
+        }
         self.mission_id = Some(mission_id);
         self.attached.clear();
         self.mission_node_id = None;
@@ -345,7 +366,6 @@ impl MissionWorkspace {
         self.secondary = false;
         self.duplicate_dismissed = false;
         self.primary_label = None;
-        self.rail_view = rail_view;
         self.rename_modal = None;
         self.session_key_copies.clear();
         self.generation
@@ -353,6 +373,7 @@ impl MissionWorkspace {
 
     pub(crate) fn release_window(&mut self, cx: &mut Context<Self>) {
         self.active = false;
+        self.rail_files.release(cx);
         if self.presentation.release_feed() {
             self.generation += 1;
         }
@@ -786,13 +807,13 @@ impl MissionWorkspace {
     }
 
     pub(super) fn terminal_style(&self, cx: &App) -> crate::terminal::element::TerminalStyle {
-        self.presentation.terminal_style(self.settings(cx))
+        self.presentation.terminal_style(self.settings(cx), cx)
     }
 
     pub(crate) fn apply_terminal_settings(&self, cx: &App) {
         for chat in self.attached.values() {
             chat.terminal.set_palette(
-                crate::surfaces::app_shell::terminal_style_for(self.settings(cx)).palette,
+                crate::surfaces::app_shell::terminal_style_for(self.settings(cx), cx).palette,
             );
             app_settings::configure_terminal(&chat.terminal, self.settings(cx));
         }
@@ -805,6 +826,11 @@ impl MissionWorkspace {
         self.store_revisions = revisions;
         if revisions.settings != previous.settings || revisions.locale != previous.locale {
             self.presentation.refresh_settings(&self.app_store, cx);
+            let settings = self.settings(cx).clone();
+            self.rail_surfaces.open.close_off(&settings, true);
+            for panel in self.rails_by_mission.values_mut() {
+                panel.surfaces.close_off(&settings, true);
+            }
             let count = self.feed_list.item_count();
             self.feed_empty_panel_min_height.set(px(0.));
             self.splice_feed_items(0..count, count);
@@ -824,9 +850,13 @@ impl MissionWorkspace {
                 self.error = Some(error.to_string().into());
             }
         }
+        let pin_moved = self
+            .mission_view()
+            .is_some_and(|mission| self.mission_pinned(&mission, cx) != self.menu_pinned);
         if revisions.locale != previous.locale
             || revisions.settings != previous.settings
             || (reactions.terminal_wake && self.is_active(cx))
+            || pin_moved
         {
             cx.notify();
         }

@@ -82,29 +82,56 @@ struct ReportedState {
 }
 
 pub struct InputTracker {
+    session_id: String,
     state: TrackerState,
     composing: bool,
     reported: Option<ReportedState>,
     public_since: Instant,
     input_revision: u64,
     delivery_revision: Option<u64>,
+    delivery_text: String,
+    /// The router's latest line has been held here as its own since it was typed.
+    delivery_held: bool,
+    /// When text was last typed or pasted since the last Enter, so an empty editor before its
+    /// echo releases nothing.
+    content_at: Option<Instant>,
 }
 
 impl InputTracker {
     pub fn new(now: Instant) -> Self {
+        Self::for_session(String::new(), now)
+    }
+
+    pub fn for_session(session_id: String, now: Instant) -> Self {
         Self {
+            session_id,
             state: TrackerState::Idle,
             composing: false,
             reported: None,
             public_since: now,
             input_revision: 0,
             delivery_revision: None,
+            delivery_text: String::new(),
+            delivery_held: false,
+            content_at: None,
         }
     }
 
     pub fn initial_observation(&mut self, now: Instant) -> InputObservation {
-        self.emit_if_changed(now)
+        self.emit_if_changed(now, "start")
             .expect("a new tracker must report its initial idle state")
+    }
+
+    pub fn latest_observation(&self) -> InputObservation {
+        let reported = self
+            .reported
+            .expect("a tracker reports its initial observation first");
+        InputObservation {
+            state: reported.state,
+            since: self.public_since,
+            composing: reported.composing,
+            composer_visible: reported.composer_visible,
+        }
     }
 
     pub fn observe_input<T>(
@@ -113,7 +140,11 @@ impl InputTracker {
         now: Instant,
         term: &Term<T>,
     ) -> Option<InputObservation> {
-        self.input_revision = self.input_revision.wrapping_add(1);
+        // The app ends a composition before every typed key and whenever the IME unmarks, as on
+        // a focus change; ending one that never started changes nothing a delivery holds (#1225).
+        if !matches!(event, InputEvent::Composing { composing: false } if !self.composing) {
+            self.input_revision = self.input_revision.wrapping_add(1);
+        }
         self.expire_probe(now);
         match event {
             InputEvent::Composing { composing } => self.composing = *composing,
@@ -138,7 +169,7 @@ impl InputTracker {
                 InputKind::Navigate | InputKind::Submit => {}
             },
         }
-        let observation = self.emit_if_changed(now);
+        let observation = self.emit_if_changed(now, "person input");
         if matches!(event, InputEvent::Composing { composing: true }) {
             observation.or_else(|| {
                 let current = self.current_reported_state();
@@ -156,8 +187,13 @@ impl InputTracker {
 
     pub fn track_delivery_input<T>(&mut self, text: &str, now: Instant, term: &Term<T>) {
         self.expire_probe(now);
-        if matches!(self.state, TrackerState::Idle) || self.delivery_owned() {
+        self.delivery_held = false;
+        if matches!(self.state, TrackerState::Idle) {
             self.delivery_revision = Some(self.input_revision);
+            self.delivery_text = text.to_owned();
+        } else if self.delivery_owned() {
+            self.delivery_revision = Some(self.input_revision);
+            self.delivery_text.push_str(text);
         }
         self.observe_content(text, true, now, term);
     }
@@ -185,6 +221,57 @@ impl InputTracker {
 
     pub fn track_delivery_submit<T>(&mut self, now: Instant, term: &Term<T>) {
         self.submit(now, term, SubmitOrigin::Delivery);
+        self.delivery_held |= self.delivery_owned();
+    }
+
+    /// The router's latest line was held here as its own after its Enter, even if it has since
+    /// been let go of, which tells a line that left the composer from one never located (#1225).
+    pub fn delivery_held(&self) -> bool {
+        self.delivery_held
+    }
+
+    fn content_pending(&self, now: Instant) -> bool {
+        self.content_at
+            .is_some_and(|at| now.saturating_duration_since(at) <= ECHO_WINDOW)
+    }
+
+    /// The router saw its notice submitted, so a row that still repeats it is history. Input
+    /// observed after the router's `revision` keeps the composer as the person left it.
+    pub fn confirm_delivery(&mut self, revision: u64, now: Instant) -> Option<InputObservation> {
+        if self.input_revision != revision {
+            return None;
+        }
+        if self.delivery_owned() {
+            self.state = TrackerState::Idle;
+        }
+        self.delivery_revision = None;
+        self.emit_if_changed(now, "ownership cleared")
+    }
+
+    /// With no router attempt pending, keep the notice only where the input cursor still
+    /// sits on it or on the rows it wrapped onto, or once a person has used the terminal since.
+    /// A notice or draft is dropped wherever the input cursor sits at an empty composer instead.
+    pub fn recheck_delivery<T>(
+        &mut self,
+        now: Instant,
+        term: &Term<T>,
+    ) -> Option<InputObservation> {
+        let (live, editor_empty) = match &self.state {
+            TrackerState::Drafting(composer) | TrackerState::Submitted(composer) => (
+                composer.visible
+                    && self.unsent_notice(term)
+                    && cursor_in_notice(term, composer, &self.delivery_text),
+                composer.visible && cursor_at_empty_composer(term, composer),
+            ),
+            _ => (false, false),
+        };
+        if (self.delivery_owned() && self.delivery_revision == Some(self.input_revision) && !live)
+            || (editor_empty && !self.composing && !self.content_pending(now))
+        {
+            self.state = TrackerState::Idle;
+            self.delivery_revision = None;
+        }
+        self.emit_if_changed(now, "re-check")
     }
 
     pub fn observe_output<T>(&mut self, now: Instant, term: &Term<T>) -> Option<InputObservation> {
@@ -274,21 +361,25 @@ impl InputTracker {
                 } else if now.duration_since(probe.started) <= ECHO_WINDOW {
                     TrackerState::Reprobing { probe, composer }
                 } else {
-                    self.observe_composer(term, composer, true)
+                    self.observe_composer(now, term, composer, true)
                 }
             }
-            TrackerState::Drafting(composer) => self.observe_composer(term, composer, false),
-            TrackerState::Submitted(composer) => self.observe_composer(term, composer, true),
+            TrackerState::Drafting(composer) => self.observe_composer(now, term, composer, false),
+            TrackerState::Submitted(composer) => self.observe_composer(now, term, composer, true),
         };
-        // Submitted text can remain in history with the same prefix as the live composer.
-        if matches!(
-            &self.state,
-            TrackerState::Submitted(composer) | TrackerState::Drafting(composer)
-                if composer.submitted_form.is_some() && cursor_at_empty_composer(term, composer)
-        ) {
+        self.delivery_held |= self.delivery_owned();
+        // Submitted text can remain in history with the same prefix as the live composer; text
+        // typed since the Enter may not have reached that composer yet.
+        if !self.content_pending(now)
+            && matches!(
+                &self.state,
+                TrackerState::Submitted(composer) | TrackerState::Drafting(composer)
+                    if composer.submitted_form.is_some() && cursor_at_empty_composer(term, composer)
+            )
+        {
             self.state = TrackerState::Idle;
         }
-        self.emit_if_changed(now)
+        self.emit_if_changed(now, "composer changed")
     }
 
     pub fn reset_guard(&self) -> u64 {
@@ -302,13 +393,14 @@ impl InputTracker {
         self.state = TrackerState::Idle;
         self.composing = false;
         self.input_revision = self.input_revision.wrapping_add(1);
-        self.emit_if_changed(now)
+        self.emit_if_changed(now, "reset")
     }
 
     fn observe_content<T>(&mut self, text: &str, pasted: bool, now: Instant, term: &Term<T>) {
         if text.is_empty() {
             return;
         }
+        self.content_at = Some(now);
         let state = std::mem::replace(&mut self.state, TrackerState::Idle);
         self.state = match state {
             TrackerState::Idle => TrackerState::Probing(new_probe(text, pasted, now, term)),
@@ -346,6 +438,7 @@ impl InputTracker {
     }
 
     fn submit<T>(&mut self, _now: Instant, term: &Term<T>, origin: SubmitOrigin) {
+        self.content_at = None;
         if origin == SubmitOrigin::Native && !self.delivery_owned() {
             self.delivery_revision = None;
         }
@@ -378,6 +471,7 @@ impl InputTracker {
 
     fn observe_composer<T>(
         &self,
+        now: Instant,
         term: &Term<T>,
         mut composer: Composer,
         submitted: bool,
@@ -441,9 +535,12 @@ impl InputTracker {
             if current == *submitted_form {
                 return TrackerState::Drafting(composer);
             }
+            // The person's input reaches the editor under the cursor: while that one is empty and
+            // nothing typed awaits its echo, the changed row is transcript, not their draft (#1225).
             if self
                 .delivery_revision
                 .is_some_and(|revision| revision != self.input_revision)
+                && (self.content_pending(now) || !cursor_at_empty_composer(term, &composer))
             {
                 composer.submitted_form = None;
                 composer.last_form = current;
@@ -464,10 +561,30 @@ impl InputTracker {
         }
     }
 
-    fn emit_if_changed(&mut self, now: Instant) -> Option<InputObservation> {
+    fn emit_if_changed(&mut self, now: Instant, released_by: &str) -> Option<InputObservation> {
         let current = self.current_reported_state();
         if self.reported == Some(current) {
             return None;
+        }
+        let was_unsent = self
+            .reported
+            .is_some_and(|previous| previous.state == InputState::Unsent);
+        if current.state == InputState::Unsent && !was_unsent {
+            let reason = if current.composer_visible {
+                "row match"
+            } else {
+                "composer hidden"
+            };
+            log::info!(
+                "input tracker reports unsent session={} reason={reason}",
+                self.session_id
+            );
+        } else if was_unsent && current.state != InputState::Unsent {
+            log::info!(
+                "input tracker stopped reporting unsent session={} reason={released_by} state={:?}",
+                self.session_id,
+                current.state
+            );
         }
         if self
             .reported
@@ -788,6 +905,19 @@ fn cursor_at_empty_composer<T>(term: &Term<T>, composer: &Composer) -> bool {
         && composer_is_empty(term, row, &current, composer)
 }
 
+/// The cursor is on the composer row, or below it on rows that only continue the notice.
+fn cursor_in_notice<T>(term: &Term<T>, composer: &Composer, notice: &str) -> bool {
+    let Ok(cursor) = usize::try_from(term.grid().cursor.point.line.0) else {
+        return false;
+    };
+    cursor >= composer.row
+        && (composer.row + 1..=cursor).all(|row| {
+            let text = row_to_string(term, row as i32);
+            let text = text.trim();
+            !text.is_empty() && notice.contains(text)
+        })
+}
+
 fn composer_frame_border(rows: &[String], row: usize) -> Option<char> {
     let border = rows.get(row.checked_sub(1)?)?;
     let glyph = border.chars().next()?;
@@ -848,1343 +978,4 @@ fn weak_paste_match(text: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::replay::{feed, new_term};
-
-    #[test]
-    fn matcher_requires_a_prompt_prefix_and_prefers_the_empty_form() {
-        let before = vec!["assistant ".into(), "❯ Try a task".into(), "$ ".into()];
-        let after = vec!["assistant h".into(), "❯ h".into(), "$ h".into()];
-        assert_eq!(
-            locate_echo(&before, &after, "h", false, 40),
-            Some(EchoMatch {
-                row: 2,
-                before_row: 2,
-                prefix: "$ ".into(),
-                empty_before: true,
-                kind: EchoMatchKind::Exact,
-            })
-        );
-    }
-
-    #[test]
-    fn matcher_accepts_stable_right_side_composer_decorations() {
-        for (before, after) in [
-            (
-                "> Try a task            <ret> send",
-                "> h                     <ret> send",
-            ),
-            ("| > Ask Codex           |", "| > h                   |"),
-        ] {
-            assert!(locate_echo(&[before.into()], &[after.into()], "h", false, 40).is_some());
-        }
-
-        let before = vec!["  └ ".into(), "> Try a task            <ret> send".into()];
-        let after = vec![
-            "  └ hooked 12 files".into(),
-            "> h                     <ret> send".into(),
-        ];
-        assert_eq!(locate_echo(&before, &after, "h", false, 40).unwrap().row, 1);
-    }
-
-    #[test]
-    fn a_transcript_echo_cannot_reuse_an_unchanged_prompt_on_another_row() {
-        let before = vec!["old output".into(), "› Ask Codex".into()];
-        let after = vec!["› hello".into(), "› Ask Codex".into()];
-        assert!(locate_echo(&before, &after, "hello", false, 40).is_none());
-    }
-
-    #[test]
-    fn coalesced_native_input_holds_across_the_prompt_wrap_boundary() {
-        use crate::replay::screen_snapshot;
-
-        for (prefix, prompt_width) in [("› ", 2), ("界› ", 4)] {
-            let available = 12 - prompt_width;
-            for length in [available, available + 1, 12, 13] {
-                let start = Instant::now();
-                let mut term = new_term(12, 4);
-                feed(&mut term, format!("{prefix}Ask").as_bytes());
-                let mut tracker = InputTracker::new(start);
-                tracker.initial_observation(start);
-                let text = &"abcdefghijklm"[..length];
-                for (ms, character) in text.chars().enumerate() {
-                    tracker.observe_input(
-                        &InputEvent::Key {
-                            kind: InputKind::Content {
-                                text: character.to_string(),
-                            },
-                        },
-                        start + Duration::from_millis(ms as u64),
-                        &term,
-                    );
-                }
-                let split = text.len().min(available);
-                feed(
-                    &mut term,
-                    format!("\x1b[H\x1b[J{prefix}{}", &text[..split]).as_bytes(),
-                );
-                if split < text.len() {
-                    feed(
-                        &mut term,
-                        format!("\r\n{}{}", " ".repeat(prompt_width), &text[split..]).as_bytes(),
-                    );
-                }
-                tracker.observe_output(start + Duration::from_millis(30), &term);
-                tracker.observe_output(start + Duration::from_secs(3), &term);
-                assert_eq!(
-                    tracker.current_reported_state().state,
-                    InputState::Drafting,
-                    "prefix={prefix:?} length={length}\n{}",
-                    screen_snapshot(&term)
-                );
-                feed(&mut term, format!("\x1b[H\x1b[J{prefix}Ask").as_bytes());
-                assert_eq!(
-                    tracker
-                        .observe_output(start + Duration::from_secs(4), &term)
-                        .unwrap()
-                        .state,
-                    InputState::Idle
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn transcript_repaint_cannot_steal_the_composer_echo() {
-        let start = Instant::now();
-        let mut term = new_term(40, 5);
-        feed(
-            &mut term,
-            b"\x1b[2;1H\xe2\x9d\xaf Try a task\x1b[4;1H  \xe2\x94\x94 ",
-        );
-        let mut tracker = InputTracker::new(start);
-        tracker.initial_observation(start);
-        tracker.observe_input(
-            &InputEvent::Key {
-                kind: InputKind::Content { text: "h".into() },
-            },
-            start,
-            &term,
-        );
-        feed(
-            &mut term,
-            b"\x1b[2;1H\x1b[K\xe2\x9d\xaf h\x1b[4;1H\x1b[K  \xe2\x94\x94 hooked 12 files",
-        );
-        assert_eq!(
-            tracker
-                .observe_output(start + Duration::from_millis(1), &term)
-                .unwrap()
-                .state,
-            InputState::Drafting
-        );
-        feed(&mut term, b"\x1b[2;1H\x1b[K\xe2\x9d\xaf Try a task");
-        assert_eq!(
-            tracker
-                .observe_output(start + Duration::from_millis(2), &term)
-                .unwrap()
-                .state,
-            InputState::Idle
-        );
-    }
-
-    #[test]
-    fn coalesced_composer_echo_and_clear_stays_idle() {
-        let start = Instant::now();
-        let mut term = new_term(40, 5);
-        feed(
-            &mut term,
-            b"\x1b[2;1H\xe2\x9d\xaf Try a task\x1b[4;1H  \xe2\x94\x94 ",
-        );
-        let mut tracker = InputTracker::new(start);
-        tracker.initial_observation(start);
-        tracker.observe_input(
-            &InputEvent::Key {
-                kind: InputKind::Content { text: "h".into() },
-            },
-            start,
-            &term,
-        );
-        let burst = [
-            b"\x1b[2;1H\x1b[K\xe2\x9d\xaf h\x1b[4;1H\x1b[K  \xe2\x94\x94 hooked 12 files"
-                .as_slice(),
-            b"\x1b[2;1H\x1b[K\xe2\x9d\xaf Try a task",
-        ]
-        .concat();
-        feed(&mut term, &burst);
-        assert!(tracker
-            .observe_output(start + Duration::from_millis(2), &term)
-            .is_none());
-        assert_eq!(tracker.current_reported_state().state, InputState::Idle);
-    }
-
-    #[test]
-    fn matcher_accepts_collapsed_multiline_paste_but_not_a_transcript_row() {
-        assert_eq!(
-            match_prompt_prefix(
-                "❯ Try a task",
-                "❯ [Pasted text #1 +19 lines]",
-                "line one",
-                true,
-                40,
-            ),
-            Some(("❯ ".into(), EchoMatchKind::Weak))
-        );
-        assert_eq!(
-            match_prompt_prefix("assistant ", "assistant [Pasted text]", "line", true, 40),
-            None
-        );
-    }
-
-    #[test]
-    fn typed_then_deleted_returns_to_idle_from_the_grid() {
-        let start = Instant::now();
-        let mut term = new_term(40, 4);
-        feed(&mut term, b"\x1b[2;1H\xe2\x9d\xaf Try a task");
-        let mut tracker = InputTracker::new(start);
-        assert_eq!(tracker.initial_observation(start).state, InputState::Idle);
-        assert!(tracker
-            .observe_input(
-                &InputEvent::Key {
-                    kind: InputKind::Content { text: "h".into() }
-                },
-                start,
-                &term,
-            )
-            .is_none());
-        feed(&mut term, b"\r\x1b[K\xe2\x9d\xaf h");
-        let drafting = tracker
-            .observe_output(start + Duration::from_millis(5), &term)
-            .unwrap();
-        assert_eq!(drafting.state, InputState::Drafting);
-        feed(&mut term, b"\r\x1b[K\xe2\x9d\xaf Try a task");
-        let idle = tracker
-            .observe_output(start + Duration::from_millis(10), &term)
-            .unwrap();
-        assert_eq!(idle.state, InputState::Idle);
-    }
-
-    #[test]
-    fn claude_styled_rotated_placeholder_returns_drafting_to_idle() {
-        let start = Instant::now();
-        let mut term = new_term(50, 4);
-        feed(
-            &mut term,
-            b"\x1b[2;1H\xe2\x9d\xaf \x1b[2mTry refactoring this file\x1b[22m",
-        );
-        let mut tracker = InputTracker::new(start);
-        tracker.initial_observation(start);
-        tracker.observe_input(
-            &InputEvent::Key {
-                kind: InputKind::Content { text: "h".into() },
-            },
-            start,
-            &term,
-        );
-        feed(&mut term, b"\r\x1b[K\xe2\x9d\xaf h");
-        assert_eq!(
-            tracker
-                .observe_output(start + Duration::from_millis(1), &term)
-                .unwrap()
-                .state,
-            InputState::Drafting
-        );
-
-        feed(
-            &mut term,
-            b"\r\x1b[K\xe2\x9d\xaf \x1b[2mTry writing a test\x1b[22m",
-        );
-        assert_eq!(
-            tracker
-                .observe_output(start + Duration::from_millis(2), &term)
-                .unwrap()
-                .state,
-            InputState::Idle
-        );
-    }
-
-    #[test]
-    fn restyled_live_draft_stays_drafting() {
-        let start = Instant::now();
-        let mut term = new_term(50, 4);
-        feed(
-            &mut term,
-            b"\x1b[2;1H\xe2\x9d\xaf \x1b[2mTry refactoring this file\x1b[22m",
-        );
-        let mut tracker = InputTracker::new(start);
-        tracker.initial_observation(start);
-        tracker.observe_input(
-            &InputEvent::Key {
-                kind: InputKind::Content {
-                    text: "hello world".into(),
-                },
-            },
-            start,
-            &term,
-        );
-        feed(&mut term, b"\r\x1b[K\xe2\x9d\xaf hello world");
-        assert_eq!(
-            tracker
-                .observe_output(start + Duration::from_millis(1), &term)
-                .unwrap()
-                .state,
-            InputState::Drafting
-        );
-
-        feed(
-            &mut term,
-            b"\r\x1b[K\xe2\x9d\xaf \x1b[2mhello world\x1b[22m",
-        );
-        assert!(tracker
-            .observe_output(start + Duration::from_millis(2), &term)
-            .is_none());
-        assert_eq!(tracker.current_reported_state().state, InputState::Drafting);
-    }
-
-    #[test]
-    fn codex_styled_rotated_placeholder_returns_drafting_to_idle() {
-        let start = Instant::now();
-        let mut term = new_term(50, 4);
-        feed(
-            &mut term,
-            b"\x1b[2;1H\xe2\x94\x82 \xe2\x80\xba \x1b[38;5;8mAsk Codex\x1b[39m             \xe2\x94\x82",
-        );
-        let mut tracker = InputTracker::new(start);
-        tracker.initial_observation(start);
-        tracker.observe_input(
-            &InputEvent::Key {
-                kind: InputKind::Content { text: "h".into() },
-            },
-            start,
-            &term,
-        );
-        feed(
-            &mut term,
-            b"\r\x1b[K\xe2\x94\x82 \xe2\x80\xba h                     \xe2\x94\x82",
-        );
-        assert_eq!(
-            tracker
-                .observe_output(start + Duration::from_millis(1), &term)
-                .unwrap()
-                .state,
-            InputState::Drafting
-        );
-
-        feed(
-            &mut term,
-            b"\r\x1b[K\xe2\x94\x82 \xe2\x80\xba \x1b[38;5;8mReview this repository\x1b[39m\xe2\x94\x82",
-        );
-        assert_eq!(
-            tracker
-                .observe_output(start + Duration::from_millis(2), &term)
-                .unwrap()
-                .state,
-            InputState::Idle
-        );
-    }
-
-    #[test]
-    fn clearing_a_draft_after_a_rollback_redraw_releases_the_hold() {
-        for kind in [InputKind::Edit, InputKind::Cancel] {
-            let start = Instant::now();
-            let mut term = new_term(60, 12);
-            feed(
-                &mut term,
-                "\x1b[4;1H› \x1b[90mAsk Codex to do anything\x1b[39m\x1b[4;3H".as_bytes(),
-            );
-            let mut tracker = InputTracker::new(start);
-            tracker.initial_observation(start);
-            tracker.observe_input(
-                &InputEvent::Key {
-                    kind: InputKind::Content {
-                        text: "fix it".into(),
-                    },
-                },
-                start,
-                &term,
-            );
-            feed(&mut term, "\x1b[4;1H\x1b[K› fix it".as_bytes());
-            assert_eq!(
-                tracker
-                    .observe_output(start + Duration::from_millis(1), &term)
-                    .unwrap()
-                    .state,
-                InputState::Drafting
-            );
-
-            // Codex redraws the trimmed transcript; a user row now sits at the tracked row.
-            feed(
-                &mut term,
-                "\x1b[H\x1b[2J› first question\r\n\r\n• answer one\r\n› second question\r\n\r\n• answer two\x1b[10;1H› fix it".as_bytes(),
-            );
-            tracker.observe_output(start + Duration::from_millis(2), &term);
-            assert_eq!(tracker.current_reported_state().state, InputState::Drafting);
-
-            tracker.observe_input(&InputEvent::Key { kind: kind.clone() }, start, &term);
-            if kind == InputKind::Edit {
-                feed(&mut term, "\x1b[10;1H\x1b[K› fix".as_bytes());
-                tracker.observe_output(start + Duration::from_millis(3), &term);
-                assert_eq!(tracker.current_reported_state().state, InputState::Drafting);
-                tracker.observe_input(&InputEvent::Key { kind: kind.clone() }, start, &term);
-            }
-            feed(
-                &mut term,
-                "\x1b[10;1H\x1b[K› \x1b[90mAsk Codex to do anything\x1b[39m\x1b[10;3H".as_bytes(),
-            );
-            tracker.observe_output(start + Duration::from_millis(4), &term);
-            assert_eq!(
-                tracker.current_reported_state().state,
-                InputState::Idle,
-                "{kind:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn explicit_reset_forces_a_draft_idle_once() {
-        let start = Instant::now();
-        let mut term = new_term(40, 4);
-        feed(&mut term, b"\x1b[2;1H\xe2\x9d\xaf Try a task");
-        let mut tracker = InputTracker::new(start);
-        tracker.initial_observation(start);
-        tracker.observe_input(
-            &InputEvent::Key {
-                kind: InputKind::Content { text: "h".into() },
-            },
-            start,
-            &term,
-        );
-        feed(&mut term, b"\r\x1b[K\xe2\x9d\xaf h");
-        assert_eq!(
-            tracker
-                .observe_output(start + Duration::from_millis(1), &term)
-                .unwrap()
-                .state,
-            InputState::Drafting
-        );
-
-        let guard = tracker.reset_guard();
-        let reset = tracker
-            .reset_if_unchanged(guard, start + Duration::from_millis(2))
-            .unwrap();
-        assert_eq!(reset.state, InputState::Idle);
-        assert!(!reset.composing);
-        assert!(tracker
-            .reset_if_unchanged(guard, start + Duration::from_millis(3))
-            .is_none());
-    }
-
-    #[test]
-    fn explicit_reset_does_not_clear_input_observed_after_the_guard() {
-        let start = Instant::now();
-        let mut term = new_term(40, 4);
-        feed(&mut term, b"\x1b[2;1H\xe2\x9d\xaf Try a task");
-        let mut tracker = InputTracker::new(start);
-        tracker.initial_observation(start);
-        tracker.observe_input(
-            &InputEvent::Key {
-                kind: InputKind::Content { text: "h".into() },
-            },
-            start,
-            &term,
-        );
-        feed(&mut term, b"\r\x1b[K\xe2\x9d\xaf h");
-        tracker.observe_output(start + Duration::from_millis(1), &term);
-        let guard = tracker.reset_guard();
-        tracker.observe_input(
-            &InputEvent::Key {
-                kind: InputKind::Content { text: "i".into() },
-            },
-            start + Duration::from_millis(2),
-            &term,
-        );
-
-        assert!(tracker
-            .reset_if_unchanged(guard, start + Duration::from_millis(3))
-            .is_none());
-        assert_eq!(tracker.current_reported_state().state, InputState::Drafting);
-    }
-
-    #[test]
-    fn antigravity_submitted_history_does_not_hold_the_empty_composer() {
-        use crate::fixtures::{decode_chunk, Fixture, FixtureEvent};
-
-        for injected in [false, true] {
-            let start = Instant::now();
-            let mut term = new_term(110, 36);
-            let border = "─".repeat(110);
-            feed(
-                &mut term,
-                format!("\x1b[?1049h\x1b[8;1H{border}\r\n> \r\n{border}").as_bytes(),
-            );
-            let mut tracker = InputTracker::new(start);
-            tracker.initial_observation(start);
-            let text = "Reply with exactly OK.";
-            if injected {
-                tracker.track_delivery_input(text, start, &term);
-            } else {
-                tracker.observe_input(
-                    &InputEvent::Key {
-                        kind: InputKind::Content { text: text.into() },
-                    },
-                    start,
-                    &term,
-                );
-            }
-            feed(&mut term, format!("\x1b[9;1H> {text}").as_bytes());
-            assert_eq!(
-                tracker
-                    .observe_output(start + Duration::from_millis(1), &term)
-                    .unwrap()
-                    .state,
-                InputState::Drafting
-            );
-            if injected {
-                tracker.track_delivery_submit(start + Duration::from_millis(2), &term);
-            } else {
-                tracker.observe_input(
-                    &InputEvent::Key {
-                        kind: InputKind::Submit,
-                    },
-                    start + Duration::from_millis(2),
-                    &term,
-                );
-            }
-
-            let fixture = Fixture::load(
-                &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("fixtures/agy-first-turn.ndjson"),
-            )
-            .unwrap();
-            for event in fixture.events {
-                if let FixtureEvent::Data { data, .. } = event {
-                    feed(&mut term, &decode_chunk(&data).unwrap());
-                }
-            }
-            assert_eq!(row_to_string(&term, 8), "> Reply with exactly OK.");
-            assert_eq!(row_to_string(&term, 13), ">");
-            tracker.observe_output(start + Duration::from_millis(3), &term);
-            assert_eq!(
-                tracker.current_reported_state().state,
-                InputState::Idle,
-                "injected={injected}"
-            );
-        }
-    }
-
-    #[test]
-    fn framed_composer_relocation_keeps_a_live_draft_held() {
-        let start = Instant::now();
-        let mut term = new_term(40, 12);
-        let border = "─".repeat(40);
-        feed(
-            &mut term,
-            format!("\x1b[2;1H{border}\r\n> \r\n{border}").as_bytes(),
-        );
-        let mut tracker = InputTracker::new(start);
-        tracker.initial_observation(start);
-        tracker.observe_input(
-            &InputEvent::Key {
-                kind: InputKind::Content {
-                    text: "draft".into(),
-                },
-            },
-            start,
-            &term,
-        );
-        feed(&mut term, b"\x1b[3;1H> draft");
-        tracker.observe_output(start + Duration::from_millis(1), &term);
-        feed(
-            &mut term,
-            format!("\x1b[4;1H\x1b[K\x1b[7;1H{border}\r\n> draft\r\n{border}\x1b[8;8H").as_bytes(),
-        );
-        tracker.observe_output(start + Duration::from_millis(2), &term);
-        assert_eq!(tracker.current_reported_state().state, InputState::Drafting);
-        feed(&mut term, b"\x1b[8;1H> \x1b[K");
-        tracker.observe_output(start + Duration::from_millis(3), &term);
-        assert_eq!(tracker.current_reported_state().state, InputState::Idle);
-    }
-
-    #[test]
-    fn framed_composer_keeps_multiline_drafts_held_and_releases_after_resize() {
-        use alacritty_terminal::term::test::TermSize;
-
-        let start = Instant::now();
-        let mut term = new_term(40, 12);
-        let border = "─".repeat(40);
-        feed(
-            &mut term,
-            format!("\x1b[2;1H{border}\r\n> \r\n{border}").as_bytes(),
-        );
-        let mut tracker = InputTracker::new(start);
-        tracker.initial_observation(start);
-        tracker.observe_input(
-            &InputEvent::Paste {
-                text: "first\nsecond".into(),
-            },
-            start,
-            &term,
-        );
-        feed(
-            &mut term,
-            format!("\x1b[3;1H> first\r\nsecond\r\n{border}").as_bytes(),
-        );
-        tracker.observe_output(start + Duration::from_millis(1), &term);
-        assert_eq!(tracker.current_reported_state().state, InputState::Drafting);
-
-        term.resize(TermSize::new(30, 12));
-        let border = "─".repeat(30);
-        feed(
-            &mut term,
-            format!(
-                "\x1b[H\x1b[J> first\r\nsecond\x1b[7;1H{border}\r\n> first\r\nsecond\r\n{border}"
-            )
-            .as_bytes(),
-        );
-        tracker.observe_output(start + Duration::from_millis(2), &term);
-        assert_eq!(tracker.current_reported_state().state, InputState::Drafting);
-        feed(
-            &mut term,
-            format!("\x1b[8;1H> \x1b[K\r\n{border}\r\n\x1b[K\x1b[8;3H").as_bytes(),
-        );
-        tracker.observe_output(start + Duration::from_millis(3), &term);
-        assert_eq!(tracker.current_reported_state().state, InputState::Idle);
-    }
-
-    #[test]
-    fn an_unrelated_frame_cannot_release_a_multiline_or_hidden_draft() {
-        for hidden in [false, true] {
-            let start = Instant::now();
-            let mut term = new_term(40, 12);
-            let border = "─".repeat(40);
-            feed(
-                &mut term,
-                format!("\x1b[2;1H{border}\r\n> Ask\r\n{border}").as_bytes(),
-            );
-            let mut tracker = InputTracker::new(start);
-            tracker.initial_observation(start);
-            tracker.observe_input(
-                &InputEvent::Paste {
-                    text: "first\nsecond".into(),
-                },
-                start,
-                &term,
-            );
-            feed(
-                &mut term,
-                format!("\x1b[3;1H> first\r\nsecond\r\n{border}").as_bytes(),
-            );
-            tracker.observe_output(start + Duration::from_millis(1), &term);
-            if hidden {
-                feed(&mut term, b"\x1b[3;1Hmenu\x1b[K\r\nchoice\x1b[K");
-            }
-            feed(
-                &mut term,
-                format!("\x1b[8;1H{border}\r\n> Ask\r\n{border}\x1b[4;7H").as_bytes(),
-            );
-            tracker.observe_output(start + Duration::from_millis(2), &term);
-            assert_eq!(
-                tracker.current_reported_state().state,
-                InputState::Drafting,
-                "hidden={hidden}"
-            );
-        }
-    }
-
-    #[test]
-    fn ambiguous_framed_prompts_cannot_release_a_live_draft() {
-        let start = Instant::now();
-        let mut term = new_term(40, 12);
-        let border = "─".repeat(40);
-        feed(
-            &mut term,
-            format!("\x1b[2;1H{border}\r\n> \r\n{border}").as_bytes(),
-        );
-        let mut tracker = InputTracker::new(start);
-        tracker.initial_observation(start);
-        tracker.observe_input(
-            &InputEvent::Key {
-                kind: InputKind::Content {
-                    text: "draft".into(),
-                },
-            },
-            start,
-            &term,
-        );
-        feed(&mut term, b"\x1b[3;1H> draft");
-        tracker.observe_output(start + Duration::from_millis(1), &term);
-        feed(
-            &mut term,
-            format!("\x1b[7;1H{border}\r\n> \r\n{border}").as_bytes(),
-        );
-        tracker.observe_output(start + Duration::from_millis(2), &term);
-        assert_eq!(tracker.current_reported_state().state, InputState::Drafting);
-    }
-
-    #[test]
-    fn claude_framed_composer_releases_after_output_moves_it() {
-        let start = Instant::now();
-        let mut term = new_term(40, 12);
-        let border = "─".repeat(40);
-        feed(
-            &mut term,
-            format!("\x1b[2;1H{border}\r\n❯ \r\n{border}").as_bytes(),
-        );
-        let mut tracker = InputTracker::new(start);
-        tracker.initial_observation(start);
-        tracker.observe_input(
-            &InputEvent::Key {
-                kind: InputKind::Content {
-                    text: "draft".into(),
-                },
-            },
-            start,
-            &term,
-        );
-        feed(&mut term, "\x1b[3;1H❯ draft".as_bytes());
-        tracker.observe_output(start + Duration::from_millis(1), &term);
-        feed(
-            &mut term,
-            format!(
-                "\x1b[2;1H● working\x1b[K\r\n\x1b[K\r\n\x1b[K\x1b[5;1H{border}\r\n❯ draft\r\n{border}\x1b[6;8H"
-            )
-            .as_bytes(),
-        );
-        tracker.observe_output(start + Duration::from_millis(2), &term);
-        assert_eq!(tracker.current_reported_state().state, InputState::Drafting);
-        feed(&mut term, "\x1b[6;1H❯ \x1b[K\x1b[6;3H".as_bytes());
-        tracker.observe_output(start + Duration::from_millis(3), &term);
-        assert_eq!(tracker.current_reported_state().state, InputState::Idle);
-    }
-
-    #[test]
-    fn a_reshaped_frame_still_releases_the_cleared_composer_under_the_cursor() {
-        let start = Instant::now();
-        let mut term = new_term(40, 12);
-        let border = "─".repeat(40);
-        feed(
-            &mut term,
-            format!("\x1b[2;1H{border}\r\n> \r\n{border}").as_bytes(),
-        );
-        let mut tracker = InputTracker::new(start);
-        tracker.initial_observation(start);
-        tracker.observe_input(
-            &InputEvent::Key {
-                kind: InputKind::Content {
-                    text: "draft".into(),
-                },
-            },
-            start,
-            &term,
-        );
-        feed(&mut term, b"\x1b[3;1H> draft");
-        tracker.observe_output(start + Duration::from_millis(1), &term);
-        feed(
-            &mut term,
-            format!(
-                "\x1b[2;1H\x1b[K\r\n\x1b[K\r\n\x1b[K\x1b[7;1H── plan ──\x1b[K\r\n> \x1b[K\r\n{border}\x1b[8;3H"
-            )
-            .as_bytes(),
-        );
-        tracker.observe_output(start + Duration::from_millis(2), &term);
-        assert_eq!(tracker.current_reported_state().state, InputState::Idle);
-    }
-
-    #[test]
-    fn submitted_accepts_a_rotated_empty_form() {
-        let start = Instant::now();
-        let mut term = new_term(40, 4);
-        feed(&mut term, b"\x1b[2;1H\xe2\x9d\xaf First placeholder");
-        let mut tracker = InputTracker::new(start);
-        tracker.initial_observation(start);
-        tracker.observe_input(
-            &InputEvent::Key {
-                kind: InputKind::Content {
-                    text: "hello".into(),
-                },
-            },
-            start,
-            &term,
-        );
-        feed(&mut term, b"\r\x1b[K\xe2\x9d\xaf hello");
-        tracker.observe_output(start + Duration::from_millis(5), &term);
-        let submitted = tracker
-            .observe_input(
-                &InputEvent::Key {
-                    kind: InputKind::Submit,
-                },
-                start + Duration::from_millis(6),
-                &term,
-            )
-            .unwrap();
-        assert_eq!(submitted.state, InputState::Submitted);
-        feed(&mut term, b"\r\x1b[K\xe2\x9d\xaf Different placeholder");
-        let idle = tracker
-            .observe_output(start + Duration::from_millis(9), &term)
-            .unwrap();
-        assert_eq!(idle.state, InputState::Idle);
-    }
-
-    #[test]
-    fn delivery_submit_before_echo_accepts_a_rotated_empty_form_without_local_input() {
-        let start = Instant::now();
-        let mut term = new_term(80, 4);
-        feed(&mut term, "\x1b[2;1H❯ First placeholder".as_bytes());
-        let mut tracker = InputTracker::new(start);
-        tracker.initial_observation(start);
-        tracker.track_delivery_input("[inbox] task", start, &term);
-        tracker.track_delivery_submit(start, &term);
-        feed(&mut term, "\r\x1b[K❯ [inbox] task".as_bytes());
-        assert_eq!(
-            tracker
-                .observe_output(start + Duration::from_millis(5), &term)
-                .unwrap()
-                .state,
-            InputState::Unsent
-        );
-        // An ignored Enter with no later output leaves the notice where the guard can resubmit it.
-        assert!(tracker.unsent_notice(&term));
-        feed(&mut term, "\r\x1b[K❯ Different placeholder".as_bytes());
-        assert_eq!(
-            tracker
-                .observe_output(start + Duration::from_millis(9), &term)
-                .unwrap()
-                .state,
-            InputState::Idle
-        );
-        assert_eq!(tracker.reset_guard(), 0);
-    }
-
-    #[test]
-    fn local_content_after_a_generated_submit_remains_a_draft() {
-        let start = Instant::now();
-        let mut term = new_term(80, 4);
-        feed(&mut term, "\x1b[2;1H❯ First placeholder".as_bytes());
-        let mut tracker = InputTracker::new(start);
-        tracker.initial_observation(start);
-        tracker.track_delivery_input("[inbox] task", start, &term);
-        tracker.track_delivery_submit(start, &term);
-        tracker.observe_input(
-            &InputEvent::Key {
-                kind: InputKind::Content {
-                    text: " draft".into(),
-                },
-            },
-            start,
-            &term,
-        );
-        feed(&mut term, "\r\x1b[K❯ [inbox] task draft".as_bytes());
-        assert_eq!(
-            tracker
-                .observe_output(start + Duration::from_millis(5), &term)
-                .unwrap()
-                .state,
-            InputState::Drafting
-        );
-    }
-
-    #[test]
-    fn an_ignored_delivery_enter_leaves_the_routers_notice_until_a_person_types() {
-        let text = "[inbox] 1 new messages — run `runner msg read` to view.";
-        for person in [false, true] {
-            let start = Instant::now();
-            let mut term = new_term(80, 4);
-            feed(&mut term, "\x1b[2;1H› Ask Codex".as_bytes());
-            let mut tracker = InputTracker::new(start);
-            tracker.initial_observation(start);
-            if person {
-                tracker.observe_input(&InputEvent::Paste { text: text.into() }, start, &term);
-            } else {
-                tracker.track_delivery_input(text, start, &term);
-            }
-            feed(&mut term, format!("\r\x1b[K› {text}").as_bytes());
-            tracker.observe_output(start + Duration::from_millis(5), &term);
-            if person {
-                tracker.observe_input(
-                    &InputEvent::Key {
-                        kind: InputKind::Submit,
-                    },
-                    start + Duration::from_millis(300),
-                    &term,
-                );
-            } else {
-                tracker.track_delivery_submit(start + Duration::from_millis(300), &term);
-            }
-            feed(&mut term, format!("\r\x1b[K› {text}").as_bytes());
-            tracker.observe_output(start + Duration::from_millis(400), &term);
-            tracker.observe_output(start + Duration::from_secs(26 * 60), &term);
-            assert_eq!(
-                tracker.current_reported_state().state,
-                if person {
-                    InputState::Drafting
-                } else {
-                    InputState::Unsent
-                },
-                "person={person}"
-            );
-            assert_eq!(tracker.unsent_notice(&term), !person, "person={person}");
-            if person {
-                continue;
-            }
-            tracker.observe_input(
-                &InputEvent::Key {
-                    kind: InputKind::Content { text: "!".into() },
-                },
-                start + Duration::from_secs(26 * 60 + 1),
-                &term,
-            );
-            feed(&mut term, format!("\r\x1b[K› {text}!").as_bytes());
-            let observation = tracker
-                .observe_output(start + Duration::from_secs(26 * 60 + 2), &term)
-                .unwrap();
-            assert_eq!(observation.state, InputState::Drafting);
-            assert!(!tracker.unsent_notice(&term));
-        }
-    }
-
-    #[test]
-    fn delivery_typed_over_person_text_keeps_it_a_draft() {
-        // The trailing space defeats the echo match, so that person text is still probing.
-        for typed in ["draft", "draft "] {
-            let start = Instant::now();
-            let mut term = new_term(80, 4);
-            feed(&mut term, "\x1b[2;1H❯ Try a task".as_bytes());
-            let mut tracker = InputTracker::new(start);
-            tracker.initial_observation(start);
-            tracker.observe_input(
-                &InputEvent::Key {
-                    kind: InputKind::Content { text: typed.into() },
-                },
-                start,
-                &term,
-            );
-            feed(&mut term, format!("\r\x1b[K❯ {typed}").as_bytes());
-            tracker.observe_output(start + Duration::from_millis(5), &term);
-            tracker.track_delivery_input("[inbox] task", start + Duration::from_millis(6), &term);
-            feed(
-                &mut term,
-                format!("\r\x1b[K❯ {typed}[inbox] task").as_bytes(),
-            );
-            tracker.observe_output(start + Duration::from_millis(9), &term);
-            assert_eq!(
-                tracker.current_reported_state().state,
-                InputState::Drafting,
-                "{typed:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn hidden_composer_stays_drafting_until_the_grid_restores_it() {
-        let start = Instant::now();
-        let mut term = new_term(30, 3);
-        feed(&mut term, b"\x1b[2;1H$ ");
-        let mut tracker = InputTracker::new(start);
-        tracker.initial_observation(start);
-        tracker.observe_input(
-            &InputEvent::Key {
-                kind: InputKind::Content { text: "x".into() },
-            },
-            start,
-            &term,
-        );
-        feed(&mut term, b"\r\x1b[K$ x");
-        let drafting = tracker
-            .observe_output(start + Duration::from_millis(1), &term)
-            .unwrap();
-        assert_eq!(drafting.state, InputState::Drafting);
-        feed(&mut term, b"\r\x1b[Kmenu");
-        let hidden = tracker
-            .observe_output(start + Duration::from_millis(2), &term)
-            .unwrap();
-        assert_eq!(hidden.state, InputState::Drafting);
-        assert!(!hidden.composer_visible);
-        feed(&mut term, b"\x1b[1;1H\x1b[K$ x");
-        let visible = tracker
-            .observe_output(start + Duration::from_millis(3), &term)
-            .unwrap();
-        assert!(visible.composer_visible);
-        feed(&mut term, b"\r\x1b[K$ ");
-        assert_eq!(
-            tracker
-                .observe_output(start + Duration::from_millis(4), &term)
-                .unwrap()
-                .state,
-            InputState::Idle
-        );
-    }
-
-    #[test]
-    fn resize_below_the_tracked_row_relocates_and_observes_the_clear() {
-        use alacritty_terminal::term::test::TermSize;
-
-        let start = Instant::now();
-        let mut term = new_term(30, 30);
-        feed(&mut term, b"\x1b[25;1H$ ");
-        let mut tracker = InputTracker::new(start);
-        tracker.initial_observation(start);
-        tracker.observe_input(
-            &InputEvent::Key {
-                kind: InputKind::Content { text: "x".into() },
-            },
-            start,
-            &term,
-        );
-        feed(&mut term, b"\r\x1b[K$ x");
-        tracker.observe_output(start + Duration::from_millis(1), &term);
-
-        term.resize(TermSize::new(30, 10));
-        feed(&mut term, b"\x1b[2J\x1b[8;1H$ x");
-        assert!(tracker
-            .observe_output(start + Duration::from_millis(2), &term)
-            .is_none());
-        feed(&mut term, b"\r\x1b[K$ ");
-        assert_eq!(
-            tracker
-                .observe_output(start + Duration::from_millis(3), &term)
-                .unwrap()
-                .state,
-            InputState::Idle
-        );
-    }
-
-    #[test]
-    fn enter_over_a_hidden_composer_does_not_replace_the_submitted_form() {
-        let start = Instant::now();
-        let mut term = new_term(30, 3);
-        feed(&mut term, b"\x1b[2;1H$ ");
-        let mut tracker = InputTracker::new(start);
-        tracker.initial_observation(start);
-        tracker.observe_input(
-            &InputEvent::Key {
-                kind: InputKind::Content { text: "x".into() },
-            },
-            start,
-            &term,
-        );
-        feed(&mut term, b"\r\x1b[K$ x");
-        tracker.observe_output(start + Duration::from_millis(1), &term);
-        feed(&mut term, b"\r\x1b[Kmenu");
-        tracker.observe_output(start + Duration::from_millis(2), &term);
-        assert_eq!(
-            tracker
-                .observe_input(
-                    &InputEvent::Key {
-                        kind: InputKind::Submit,
-                    },
-                    start + Duration::from_millis(3),
-                    &term,
-                )
-                .unwrap()
-                .state,
-            InputState::Submitted
-        );
-        feed(&mut term, b"\r\x1b[K$ x");
-        assert_eq!(
-            tracker
-                .observe_output(start + Duration::from_millis(4), &term)
-                .unwrap()
-                .state,
-            InputState::Drafting
-        );
-    }
-
-    #[test]
-    fn content_before_submit_redraw_rearms_drafting_without_an_idle_transition() {
-        let start = Instant::now();
-        let mut term = new_term(40, 4);
-        feed(&mut term, b"\x1b[2;1H\xe2\x9d\xaf Try a task");
-        let mut tracker = InputTracker::new(start);
-        tracker.initial_observation(start);
-        tracker.observe_input(
-            &InputEvent::Key {
-                kind: InputKind::Content {
-                    text: "hello".into(),
-                },
-            },
-            start,
-            &term,
-        );
-        feed(&mut term, b"\r\x1b[K\xe2\x9d\xaf hello");
-        tracker.observe_output(start + Duration::from_millis(1), &term);
-        assert_eq!(
-            tracker
-                .observe_input(
-                    &InputEvent::Key {
-                        kind: InputKind::Submit,
-                    },
-                    start + Duration::from_millis(2),
-                    &term,
-                )
-                .unwrap()
-                .state,
-            InputState::Submitted
-        );
-        assert!(tracker
-            .observe_input(
-                &InputEvent::Key {
-                    kind: InputKind::Content { text: "n".into() },
-                },
-                start + Duration::from_millis(3),
-                &term,
-            )
-            .is_none());
-        feed(&mut term, b"\r\x1b[K\xe2\x9d\xaf n");
-        assert_eq!(
-            tracker
-                .observe_output(start + Duration::from_millis(4), &term)
-                .unwrap()
-                .state,
-            InputState::Drafting
-        );
-    }
-
-    #[test]
-    fn submit_redraw_before_the_next_echo_keeps_the_reprobe_armed() {
-        let start = Instant::now();
-        let mut term = new_term(40, 4);
-        feed(&mut term, b"\x1b[2;1H\xe2\x9d\xaf Try a task");
-        let mut tracker = InputTracker::new(start);
-        tracker.initial_observation(start);
-        tracker.observe_input(
-            &InputEvent::Key {
-                kind: InputKind::Content {
-                    text: "hello".into(),
-                },
-            },
-            start,
-            &term,
-        );
-        feed(&mut term, b"\r\x1b[K\xe2\x9d\xaf hello");
-        tracker.observe_output(start + Duration::from_millis(1), &term);
-        tracker.observe_input(
-            &InputEvent::Key {
-                kind: InputKind::Submit,
-            },
-            start + Duration::from_millis(2),
-            &term,
-        );
-        tracker.observe_input(
-            &InputEvent::Key {
-                kind: InputKind::Content { text: "w".into() },
-            },
-            start + Duration::from_millis(3),
-            &term,
-        );
-
-        feed(&mut term, b"\r\x1b[K\xe2\x9d\xaf Try a task");
-        assert!(tracker
-            .observe_output(start + Duration::from_millis(4), &term)
-            .is_none());
-        feed(&mut term, b"\r\x1b[K\xe2\x9d\xaf w");
-        assert_eq!(
-            tracker
-                .observe_output(start + Duration::from_millis(5), &term)
-                .unwrap()
-                .state,
-            InputState::Drafting
-        );
-    }
-
-    #[test]
-    fn submit_while_probing_holds_a_nonempty_first_echo() {
-        let start = Instant::now();
-        let mut term = new_term(30, 3);
-        feed(&mut term, b"\x1b[2;1H$ ");
-        let mut tracker = InputTracker::new(start);
-        tracker.initial_observation(start);
-        tracker.observe_input(
-            &InputEvent::Key {
-                kind: InputKind::Content { text: "x".into() },
-            },
-            start,
-            &term,
-        );
-        assert!(tracker
-            .observe_input(
-                &InputEvent::Key {
-                    kind: InputKind::Submit,
-                },
-                start + Duration::from_millis(1),
-                &term,
-            )
-            .is_none());
-        feed(&mut term, b"\r\x1b[K$ x");
-        assert_eq!(
-            tracker
-                .observe_output(start + Duration::from_millis(2), &term)
-                .unwrap()
-                .state,
-            InputState::Drafting
-        );
-    }
-
-    #[test]
-    fn relocation_tracks_the_nearest_prompt_row_then_observes_its_clear() {
-        let start = Instant::now();
-        let mut term = new_term(30, 4);
-        feed(&mut term, b"\x1b[2;1H$ ");
-        let mut tracker = InputTracker::new(start);
-        tracker.initial_observation(start);
-        tracker.observe_input(
-            &InputEvent::Key {
-                kind: InputKind::Content { text: "x".into() },
-            },
-            start,
-            &term,
-        );
-        feed(&mut term, b"\r\x1b[K$ x");
-        tracker.observe_output(start + Duration::from_millis(1), &term);
-        feed(&mut term, b"\r\x1b[Kpopup\x1b[3;1H$ x");
-        assert!(tracker
-            .observe_output(start + Duration::from_millis(2), &term)
-            .is_none());
-        feed(&mut term, b"\r\x1b[K$ ");
-        assert_eq!(
-            tracker
-                .observe_output(start + Duration::from_millis(3), &term)
-                .unwrap()
-                .state,
-            InputState::Idle
-        );
-    }
-
-    #[test]
-    fn composition_reports_drafting_and_masks_enter_submission() {
-        let start = Instant::now();
-        let term = new_term(30, 3);
-        let mut tracker = InputTracker::new(start);
-        tracker.initial_observation(start);
-        let composing = tracker
-            .observe_input(
-                &InputEvent::Composing { composing: true },
-                start + Duration::from_millis(1),
-                &term,
-            )
-            .unwrap();
-        assert_eq!(composing.state, InputState::Drafting);
-        assert!(composing.composing);
-        assert!(tracker
-            .observe_input(
-                &InputEvent::Key {
-                    kind: InputKind::Submit,
-                },
-                start + Duration::from_millis(2),
-                &term,
-            )
-            .is_none());
-        let idle = tracker
-            .observe_input(
-                &InputEvent::Composing { composing: false },
-                start + Duration::from_millis(3),
-                &term,
-            )
-            .unwrap();
-        assert_eq!(idle.state, InputState::Idle);
-    }
-
-    #[test]
-    fn every_preedit_update_reports_activity_even_when_the_state_is_unchanged() {
-        let start = Instant::now();
-        let term = new_term(30, 3);
-        let mut tracker = InputTracker::new(start);
-        tracker.initial_observation(start);
-        for seconds in [600, 601] {
-            let observation = tracker
-                .observe_input(
-                    &InputEvent::Composing { composing: true },
-                    start + Duration::from_secs(seconds),
-                    &term,
-                )
-                .unwrap();
-            assert!(observation.composing);
-            assert_eq!(observation.state, InputState::Drafting);
-        }
-    }
-
-    #[test]
-    fn person_keys_keep_notice_ownership_until_the_composer_text_changes() {
-        for kind in [
-            InputKind::Navigate,
-            InputKind::Edit,
-            InputKind::Cancel,
-            InputKind::Submit,
-        ] {
-            let start = Instant::now();
-            let mut term = new_term(80, 4);
-            feed(&mut term, "\x1b[2;1H› Ask Codex".as_bytes());
-            let mut tracker = InputTracker::new(start);
-            tracker.initial_observation(start);
-            tracker.track_delivery_input("[inbox] task", start, &term);
-            feed(&mut term, "\r\x1b[K› [inbox] task".as_bytes());
-            tracker.observe_output(start, &term);
-            tracker.track_delivery_submit(start, &term);
-            tracker.observe_output(start, &term);
-            let revision = tracker.reset_guard();
-            tracker.observe_input(&InputEvent::Key { kind }, start, &term);
-            feed(&mut term, b"\x1b[D");
-            tracker.observe_output(start + Duration::from_secs(11 * 60), &term);
-            assert_eq!(tracker.current_reported_state().state, InputState::Unsent);
-            assert!(tracker.unsent_notice(&term));
-            assert_ne!(tracker.reset_guard(), revision);
-            assert!(tracker.reset_if_unchanged(revision, start).is_none());
-            feed(&mut term, "\r\x1b[K› recalled prompt".as_bytes());
-            assert_eq!(
-                tracker
-                    .observe_output(start + Duration::from_secs(11 * 60 + 1), &term)
-                    .unwrap()
-                    .state,
-                InputState::Drafting
-            );
-            assert!(!tracker.unsent_notice(&term));
-        }
-    }
-
-    #[test]
-    #[ignore = "manual M6.1 handoff measurement"]
-    fn measure_tracker_cost_on_a_200_by_60_grid() {
-        const ITERATIONS: u32 = 20_000;
-        let start = Instant::now();
-        let mut term = new_term(200, 60);
-        feed(&mut term, b"\x1b[59;1H\xe2\x9d\xaf Placeholder");
-        let mut idle = InputTracker::new(start);
-        idle.initial_observation(start);
-        let measured_at = Instant::now();
-        for _ in 0..ITERATIONS {
-            std::hint::black_box(idle.observe_output(Instant::now(), &term));
-        }
-        let idle_us = measured_at.elapsed().as_secs_f64() * 1_000_000. / ITERATIONS as f64;
-
-        let mut drafting = InputTracker::new(start);
-        drafting.initial_observation(start);
-        drafting.observe_input(
-            &InputEvent::Key {
-                kind: InputKind::Content { text: "x".into() },
-            },
-            start,
-            &term,
-        );
-        feed(&mut term, b"\r\x1b[K\xe2\x9d\xaf x");
-        drafting.observe_output(start + Duration::from_millis(1), &term);
-        let measured_at = Instant::now();
-        for _ in 0..ITERATIONS {
-            std::hint::black_box(drafting.observe_output(Instant::now(), &term));
-        }
-        let drafting_us = measured_at.elapsed().as_secs_f64() * 1_000_000. / ITERATIONS as f64;
-
-        let measured_at = Instant::now();
-        for _ in 0..ITERATIONS {
-            std::hint::black_box(relocate_row(&term, "missing-prefix ", 30, None));
-        }
-        let relocation_us = measured_at.elapsed().as_secs_f64() * 1_000_000. / ITERATIONS as f64;
-
-        let measured_at = Instant::now();
-        for _ in 0..ITERATIONS {
-            std::hint::black_box(relocate_row(&term, "missing-prefix ", 30, Some('─')));
-        }
-        let framed_us = measured_at.elapsed().as_secs_f64() * 1_000_000. / ITERATIONS as f64;
-        eprintln!(
-            "input tracker µs/chunk: idle={idle_us:.3} drafting={drafting_us:.3} relocation={relocation_us:.3} framed={framed_us:.3}"
-        );
-    }
-}
+mod tests;

@@ -6,7 +6,9 @@ A plan is written on its feature's branch and lands in the pull request with the
 
 ## Active
 
-The remaining post-0.17 cleanup is tracked in [#977](https://github.com/yicheng47/runner/issues/977). Its [workspace-client](977-workspace-client.md), [remote-root](977-remote-root.md), [app-layout](977-app-layout.md) and [CLI/daemon](977-cli-daemon-splits.md) plans and test records remain while the multi-PR issue is open. Their merged mission briefs are pruned.
+No program is active. File preview ([#634](https://github.com/yicheng47/runner/issues/634)) landed from its umbrella branch in [#1157](https://github.com/yicheng47/runner/pull/1157) and shipped in 0.19.5; its [program record](archive/634-file-preview/README.md), [plan](archive/634-file-preview/plan.md) and [log](archive/634-file-preview/impl_log.md) are archived.
+
+The post-0.17 cleanup ([#977](https://github.com/yicheng47/runner/issues/977)) closed on 2026-10-29; its four plans were deleted in the 0.19.0 sweep, with their outcomes in the [maintenance history](archive/maintenance-history.md#977--post-017-cleanup-outcomes) and their validation records in the [test archive](../tests/README.md).
 
 Remote control's [program record](archive/836-web-remote-control/README.md) shipped in 0.18.0. Linux shipped as a beta in 0.18.2; its [integration record](archive/982-linux-remote-compat.md) is archived, and the [brief](briefs/823-linux.md) remains as the large example.
 

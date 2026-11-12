@@ -157,9 +157,6 @@ pub(super) struct RoleFields {
     /// Read the system prompt from a file, or - for stdin.
     #[arg(long, conflicts_with = "prompt")]
     pub(super) prompt_file: Option<PathBuf>,
-    /// Append one runtime argument; repeat for multiple arguments.
-    #[arg(long = "arg")]
-    pub(super) args: Vec<String>,
     /// Set one KEY=VALUE environment entry; repeat as needed.
     #[arg(long = "env")]
     pub(super) env: Vec<String>,
@@ -299,8 +296,11 @@ pub(super) enum MissionCommand {
     /// List active missions.
     List {
         /// Filter by crew ID or exact name.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "linked_here")]
         crew: Option<String>,
+        /// List the missions linked to this chat.
+        #[arg(long)]
+        linked_here: bool,
     },
     /// Show an operational mission snapshot.
     Show { mission: Option<String> },
@@ -315,15 +315,18 @@ pub(super) enum MissionCommand {
         /// Read the mission goal from a file, or - for stdin.
         #[arg(long, conflicts_with = "goal")]
         goal_file: Option<PathBuf>,
-        /// Mission title; defaults from the goal or crew name.
+        /// Mission title.
         #[arg(long)]
-        title: Option<String>,
+        title: String,
         /// Project ID or exact name whose directory the mission uses.
         #[arg(long, conflicts_with = "cwd")]
         project: Option<String>,
         /// Mission directory; defaults to the current directory.
         #[arg(long, conflicts_with = "project")]
         cwd: Option<PathBuf>,
+        /// Link the mission to this chat without typing reports into it.
+        #[arg(long)]
+        no_report: bool,
     },
     /// Add a configured worker role to a running mission (person only).
     AddRole {
@@ -370,6 +373,18 @@ pub(super) enum MissionCommand {
         #[arg(long, conflicts_with = "project")]
         unfile: bool,
     },
+    /// Link a mission to a chat, which Runner then tells when it needs you, fails or settles.
+    Link {
+        mission: String,
+        /// Direct chat session ID or unique prefix; defaults to this chat.
+        #[arg(long)]
+        chat: Option<String>,
+        /// Link without typing reports into the chat.
+        #[arg(long)]
+        no_report: bool,
+    },
+    /// Remove a mission's link to its chat.
+    Unlink { mission: String },
     /// Print a window from the mission event feed.
     Feed {
         mission: Option<String>,
@@ -400,6 +415,12 @@ pub(super) enum MissionCommand {
         mission: String,
         question_id: String,
         choice: String,
+        /// A condition the choice does not carry, delivered with the answer.
+        #[arg(long, conflicts_with = "note_file")]
+        note: Option<String>,
+        /// Read the note from a file, or from stdin with `-`.
+        #[arg(long, conflicts_with = "note")]
+        note_file: Option<PathBuf>,
     },
 }
 

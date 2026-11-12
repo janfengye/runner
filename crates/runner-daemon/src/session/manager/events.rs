@@ -151,6 +151,14 @@ pub(super) fn drop_streak_is_loggable(streak: u64) -> bool {
 /// a no-op or a channel-capture impl.
 pub trait SessionEvents: Send + Sync + 'static {
     fn input_error(&self, _id: &str, _message: &str) {}
+    /// An OSC 52 write; the text stays in memory and out of logs.
+    fn clipboard(
+        &self,
+        _id: &str,
+        _target: runner_terminal::terminal::ClipboardTarget,
+        _text: &str,
+    ) {
+    }
     fn terminal_metadata_changed(&self, _id: &str) {}
     fn spawned(&self, _ev: &SessionSpawnedEvent) {}
     fn fork_started(&self, _ev: &SessionForkStartedEvent) {}
@@ -276,6 +284,12 @@ impl SessionEvents for CoreSessionEvents {
             &serde_json::json!({ "session_id": id, "message": message }),
         );
     }
+    fn clipboard(&self, id: &str, target: runner_terminal::terminal::ClipboardTarget, text: &str) {
+        self.events.emit(
+            "session/clipboard",
+            &serde_json::json!({ "session_id": id, "target": target.as_str(), "text": text }),
+        );
+    }
     fn spawned(&self, ev: &SessionSpawnedEvent) {
         if let Some(observer) = self.observer.observer() {
             observer.spawned(ev);
@@ -392,11 +406,10 @@ pub struct SessionUpdatedEvent {
 }
 
 /// Non-fatal advisory the UI can render as a banner. Emitted on
-/// `session/warning`. Today the only producer is the resume-fallback path:
-/// when the runtime adapter asked the agent CLI to resume a prior
-/// conversation but the child exited fast and unsuccessfully, we treat that
-/// as a resume failure, wipe the bad key, and tell the user the next spawn
-/// will start fresh.
+/// `session/warning`. When a resumed child exits fast and unsuccessfully,
+/// `resume_failed` says its conversation was confirmed missing and the
+/// next spawn starts fresh; `resume_exited` says the key was kept for a
+/// retry because nothing confirmed the conversation was gone.
 #[derive(Debug, Clone, Serialize)]
 pub struct WarningEvent {
     pub session_id: String,

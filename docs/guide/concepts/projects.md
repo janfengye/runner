@@ -6,16 +6,16 @@ The sidebar defaults to Projects. The list-filter button beside Search switches 
 
 Create a project from the sidebar and choose its directory. New chats and missions started in that project use its directory. You can still supply a different working directory when starting work.
 
-The default chat launcher and **Start mission** start with the active project, or **No project**. A project’s **+ → New chat** opens a new launcher tab with that project selected. On the launcher’s default page, the inline project picker and **Change** set the folder for the next start. In a split pane, the tab’s project stays locked and the initial folder follows its neighbour.
+**⌘N** / **Ctrl+N** and **New tab** start the launcher page with the recent tab’s project in an editable picker and that project’s folder, for chats, terminals and missions alike. While the page already shows, they use the tab the page opened from, or the most recently viewed tab if that tab is gone. A tab in Recents, or no tab, gives **No project**; the **+** beside Recents always starts with **No project**. The dashed row stays in Recents, without selecting or expanding the preselected project in the sidebar. Remote computers use their own tabs and projects. **⇧⌘M** / **Ctrl+Shift+M** and starting from a crew start it with the active project. A project’s **+** shows that page locked to the project, expanding the project if it is collapsed: the picker is disabled, and a folder chosen with **Change** stays filed under the project. If that project is deleted while the page is open, the page goes back to **No project**, unlocked. While the launcher shows, a dashed **New tab** row marks it, under the project whose **+** opened it, otherwise in Recents. It stays there whatever the picker or **Change** then do, and what you start files under the project the picker shows. The row is not a saved tab: starting replaces it with the new tab’s row, and leaving the launcher removes it. A real empty pane inside a split has no project/folder control: its chat uses the tab’s project and a neighbouring session’s folder, and its × closes that pane.
 
-Choosing a project fills its folder unless the current folder is already inside it, such as a worktree. **No project** keeps the current folder. Choosing a folder inside another project follows the deepest matching project on the default page; a split pane keeps its tab’s project. A role with its own working directory uses it unless you explicitly choose a folder with **Change**. Start mission retains its directory field and project hints.
+Choosing a project fills its folder unless the current folder is already inside it, such as a worktree. **No project** keeps the current folder. On a page that is not locked, choosing a folder inside another project follows the deepest matching project. A role with its own working directory uses it unless you explicitly choose a folder with **Change**. A mission's members start in the launcher's folder. After choosing a project or dismissing its menu with Esc, focus returns to the launcher’s search so ↑/↓ move through the rows.
 
 The CLI can create the same association:
 
 ```sh
 runner project create "My app" --path /absolute/path/to/my-app
 runner chat start --runtime codex --project "My app"
-runner mission start --crew "Pair coding crew" --project "My app" --goal "Review the README for accuracy."
+runner mission start --crew "Pair coding crew" --project "My app" --title "README review" --goal "Review the README for accuracy."
 ```
 
 On Windows, use an absolute Windows path such as `C:\Users\you\src\my-app`. Quote paths containing spaces.

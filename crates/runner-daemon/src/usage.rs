@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
+use crate::db::UsageLkg;
 use crate::model::Runtime;
 use crate::runtime_status::RuntimeCommandSource;
 use crate::shell_path::LoginShellEnv;
@@ -12,6 +13,7 @@ use crate::AppCore;
 
 pub(crate) const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 const MIN_REFRESH_VISIBLE: Duration = Duration::from_millis(400);
+#[cfg(test)]
 const SCHEDULE_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const OPEN_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
@@ -37,12 +39,42 @@ struct UsageState {
     claude_denied: std::collections::HashSet<String>,
     active_claude: Option<String>,
     account_refresh_pending: bool,
+    lkg_seq: u64,
+}
+
+impl UsageState {
+    fn show_claude_account(&mut self, id: &str) {
+        let value = self.claude_accounts.get(id).cloned().unwrap_or_default();
+        self.snapshot.runtimes.insert(Runtime::ClaudeCode, value);
+    }
+
+    /// Claude Code's snapshot entry only shows the selected account's cached
+    /// usage, so the account cache is what is saved.
+    fn lkg(&self) -> UsageLkg {
+        UsageLkg {
+            runtimes: self
+                .snapshot
+                .runtimes
+                .iter()
+                .filter(|(runtime, _)| **runtime != Runtime::ClaudeCode)
+                .filter_map(|(runtime, usage)| Some((*runtime, usage.value.clone()?)))
+                .collect(),
+            claude_accounts: self
+                .claude_accounts
+                .iter()
+                .filter_map(|(id, usage)| Some((id.clone(), usage.value.clone()?)))
+                .collect(),
+        }
+    }
 }
 
 pub struct UsageService {
     state: Mutex<UsageState>,
+    saved_seq: Mutex<u64>,
+    interval: std::sync::atomic::AtomicU64,
     wake_scheduler: Condvar,
     enabled: RwLock<Vec<Runtime>>,
+    checked: RwLock<Option<Vec<Runtime>>>,
     polling_enabled: std::sync::atomic::AtomicBool,
     clients: std::sync::atomic::AtomicUsize,
     transport_lifetime: std::sync::atomic::AtomicBool,
@@ -55,8 +87,11 @@ impl Default for UsageService {
     fn default() -> Self {
         Self {
             state: Mutex::new(UsageState::default()),
+            saved_seq: Mutex::new(0),
+            interval: std::sync::atomic::AtomicU64::new(900),
             wake_scheduler: Condvar::new(),
             enabled: RwLock::new(Vec::new()),
+            checked: RwLock::new(None),
             polling_enabled: std::sync::atomic::AtomicBool::new(true),
             clients: std::sync::atomic::AtomicUsize::new(0),
             transport_lifetime: std::sync::atomic::AtomicBool::new(false),
@@ -134,6 +169,21 @@ impl UsageService {
         self.wake_scheduler.notify_all();
     }
 
+    pub fn interval(&self) -> u64 {
+        self.interval.load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub fn set_interval(&self, pool: &crate::db::DbPool, seconds: u64) -> crate::error::Result<()> {
+        if ![300, 900, 1800, 3600].contains(&seconds) {
+            return Err(crate::error::Error::msg("invalid usage interval"));
+        }
+        let conn = pool.get()?;
+        crate::db::app_state_set(&conn, "usage_interval", &seconds.to_string())?;
+        self.interval
+            .store(seconds, std::sync::atomic::Ordering::Release);
+        self.wake_scheduler.notify_all();
+        Ok(())
+    }
+
     pub fn snapshot(&self) -> UsageSnapshot {
         self.state.lock().unwrap().snapshot.clone()
     }
@@ -148,8 +198,54 @@ impl UsageService {
         if !multiple && state.claude_denied.contains(id) {
             state.keychain_denied = true;
         }
-        let value = state.claude_accounts.get(id).cloned().unwrap_or_default();
-        state.snapshot.runtimes.insert(Runtime::ClaudeCode, value);
+        state.show_claude_account(id);
+    }
+
+    pub fn restore(&self, pool: &crate::db::DbPool) {
+        if let Ok(conn) = pool.get() {
+            if let Ok(Some(value)) = crate::db::app_state_get(&conn, "usage_interval") {
+                if let Ok(seconds) = value.parse::<u64>() {
+                    if [300, 900, 1800, 3600].contains(&seconds) {
+                        self.interval
+                            .store(seconds, std::sync::atomic::Ordering::Release);
+                    }
+                }
+            }
+        }
+
+        let lkg = match crate::db::usage_lkg(pool) {
+            Ok(Some(lkg)) => lkg,
+            Ok(None) => return,
+            Err(error) => {
+                log::warn!("saved agent usage unreadable, starting empty: {error}");
+                return;
+            }
+        };
+        let active = crate::claude_accounts::load(pool)
+            .ok()
+            .map(|state| state.active_id);
+        self.restore_lkg(lkg, active.as_deref(), Utc::now());
+    }
+
+    fn restore_lkg(&self, lkg: UsageLkg, active_claude: Option<&str>, now: DateTime<Utc>) {
+        let restored = |usage| RuntimeUsage {
+            value: Some(usage),
+            error: None,
+        };
+        let mut state = self.state.lock().unwrap();
+        for (runtime, usage) in lkg.runtimes {
+            if let Some(usage) = unexpired(usage, now) {
+                state.snapshot.runtimes.insert(runtime, restored(usage));
+            }
+        }
+        for (id, usage) in lkg.claude_accounts {
+            if let Some(usage) = unexpired(usage, now) {
+                state.claude_accounts.insert(id, restored(usage));
+            }
+        }
+        if let Some(id) = active_claude {
+            state.show_claude_account(id);
+        }
     }
 
     pub fn set_enabled(&self, runtimes: Vec<Runtime>) -> bool {
@@ -161,13 +257,29 @@ impl UsageService {
         true
     }
 
+    pub fn set_checked(&self, runtimes: Vec<Runtime>) {
+        let mut checked = self.checked.write().unwrap();
+        if checked.as_ref() == Some(&runtimes) {
+            return;
+        }
+        *checked = Some(runtimes);
+        self.wake_scheduler.notify_all();
+    }
+
     pub fn enabled(&self) -> Vec<Runtime> {
         self.enabled.read().unwrap().clone()
     }
 
     fn begin_refresh(&self, reason: RefreshReason, now: DateTime<Utc>) -> bool {
         let mut state = self.state.lock().unwrap();
-        if state.snapshot.refreshing || !refresh_due(state.last_attempt_at, reason, now) {
+        if state.snapshot.refreshing
+            || !refresh_due_with_interval(
+                state.last_attempt_at,
+                reason,
+                now,
+                Duration::from_secs(self.interval()),
+            )
+        {
             return false;
         }
         state.last_attempt_at = Some(now);
@@ -188,13 +300,17 @@ impl UsageService {
     }
 
     pub fn request_refresh(self: &Arc<Self>, core: AppCore, reason: RefreshReason) {
-        if !self.fetch || !self.begin_refresh(reason, Utc::now()) {
+        let force = matches!(reason, RefreshReason::Open | RefreshReason::Button);
+        if (!force && self.fetch_runtimes(false).is_empty())
+            || !self.fetch
+            || !self.begin_refresh(reason, Utc::now())
+        {
             return;
         }
         core.events.emit("usage/updated", &());
         let service = Arc::clone(self);
         thread::spawn(move || {
-            service.fetch(&core);
+            service.fetch(&core, force);
             core.events.emit("usage/updated", &());
             let pending =
                 std::mem::take(&mut service.state.lock().unwrap().account_refresh_pending);
@@ -226,7 +342,10 @@ impl UsageService {
                         .unwrap(),
                 );
             }
-            if crate::claude_accounts::load(&core.db).is_ok_and(|state| state.accounts.len() > 1) {
+            if service.fetch_runtimes(false).contains(&Runtime::ClaudeCode)
+                && crate::claude_accounts::load(&core.db)
+                    .is_ok_and(|state| state.accounts.len() > 1)
+            {
                 crate::claude_accounts::refresh(&core);
             }
             service.request_refresh(core.clone(), RefreshReason::Launch);
@@ -235,6 +354,7 @@ impl UsageService {
                 if !service
                     .polling_enabled
                     .load(std::sync::atomic::Ordering::Acquire)
+                    || service.fetch_runtimes(false).is_empty()
                 {
                     state = service
                         .wake_scheduler
@@ -243,7 +363,11 @@ impl UsageService {
                         .0;
                     continue;
                 }
-                let wait = schedule_wait(state.last_attempt_at, Utc::now());
+                let wait = schedule_wait_with_interval(
+                    state.last_attempt_at,
+                    Utc::now(),
+                    Duration::from_secs(service.interval()),
+                );
                 if wait.is_zero() && !state.snapshot.refreshing {
                     drop(state);
                     service.request_refresh(core.clone(), RefreshReason::Schedule);
@@ -259,20 +383,31 @@ impl UsageService {
         });
     }
 
-    fn fetch(&self, core: &AppCore) {
+    fn fetch_runtimes(&self, force: bool) -> Vec<Runtime> {
+        let mut enabled = self.enabled();
+        if !force {
+            if let Some(checked) = self.checked.read().unwrap().as_ref() {
+                enabled.retain(|runtime| checked.contains(runtime));
+            }
+        }
+        enabled
+    }
+
+    fn fetch(&self, core: &AppCore, force: bool) {
         let statuses = crate::runtime_status::status_list(
             &core.db,
             &core.runtime_shell_env,
             &core.runtime_discovery,
         );
         let env = core.runtime_shell_env.read().unwrap().clone();
-        let enabled = self.enabled();
+        let enabled = self.fetch_runtimes(force);
         let mut results = Vec::new();
-        let accounts = crate::claude_accounts::load(&core.db)
-            .ok()
+        let account_state = crate::claude_accounts::load(&core.db).ok();
+        let accounts = account_state
+            .as_ref()
             .filter(|state| state.accounts.len() > 1);
         let mut account_results = Vec::new();
-        if accounts.is_some() {
+        if accounts.is_some() && enabled.contains(&Runtime::ClaudeCode) {
             crate::claude_accounts::refresh_for_usage(core);
         }
         if let Ok(statuses) = statuses {
@@ -289,7 +424,7 @@ impl UsageService {
                     continue;
                 };
                 if status.name == Runtime::ClaudeCode {
-                    if let Some(accounts) = &accounts {
+                    if let Some(accounts) = accounts {
                         let statuses = crate::claude_accounts::snapshot(core).ok();
                         for account in &accounts.accounts {
                             if !statuses
@@ -329,13 +464,45 @@ impl UsageService {
         if !remaining.is_zero() {
             thread::sleep(remaining);
         }
-        let now = Utc::now();
+        let active = account_state.as_ref().map(|state| state.active_id.as_str());
+        if let Some((seq, lkg)) = self.finish_fetch(results, account_results, active, Utc::now()) {
+            self.save_lkg(&core.db, seq, &lkg);
+        }
+    }
+
+    /// Writes outside the state lock; a write overtaken by a newer fetch's
+    /// write is dropped, so the saved usage never goes back in time.
+    fn save_lkg(&self, pool: &crate::db::DbPool, seq: u64, lkg: &UsageLkg) {
+        let mut saved = self.saved_seq.lock().unwrap();
+        if seq <= *saved {
+            return;
+        }
+        match crate::db::set_usage_lkg(pool, lkg) {
+            Ok(()) => *saved = seq,
+            Err(error) => log::warn!("saving agent usage failed: {error}"),
+        }
+    }
+
+    fn finish_fetch(
+        &self,
+        results: Vec<(Runtime, Result<Vec<UsageWindow>, UnavailableReason>)>,
+        account_results: Vec<(String, Result<Vec<UsageWindow>, UnavailableReason>)>,
+        fetched_claude: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Option<(u64, UsageLkg)> {
+        let good = results.iter().any(|(_, result)| result.is_ok())
+            || account_results.iter().any(|(_, result)| result.is_ok());
         let mut state = self.state.lock().unwrap();
         for (runtime, result) in results {
             if result == Err(UnavailableReason::KeychainDenied) {
                 state.keychain_denied = true;
             }
-            let entry = state.snapshot.runtimes.entry(runtime).or_default();
+            let entry = match fetched_claude {
+                Some(id) if runtime == Runtime::ClaudeCode => {
+                    state.claude_accounts.entry(id.to_owned()).or_default()
+                }
+                _ => state.snapshot.runtimes.entry(runtime).or_default(),
+            };
             apply_result(&mut entry.value, &mut entry.error, result, now);
         }
         for (id, result) in account_results {
@@ -345,42 +512,67 @@ impl UsageService {
             let entry = state.claude_accounts.entry(id).or_default();
             apply_result(&mut entry.value, &mut entry.error, result, now);
         }
-        if accounts.is_some() {
-            let id = state
-                .active_claude
-                .as_ref()
-                .or_else(|| accounts.as_ref().map(|accounts| &accounts.active_id));
-            let entry = id
-                .and_then(|id| state.claude_accounts.get(id))
-                .cloned()
-                .unwrap_or_default();
-            state.snapshot.runtimes.insert(Runtime::ClaudeCode, entry);
+        if let Some(id) = state
+            .active_claude
+            .clone()
+            .or_else(|| fetched_claude.map(str::to_owned))
+        {
+            state.show_claude_account(&id);
         }
         state.snapshot.last_fetch_at = Some(now);
         state.snapshot.refreshing = false;
         state.refresh_started_at = None;
         self.wake_scheduler.notify_one();
+        good.then(|| {
+            state.lkg_seq += 1;
+            (state.lkg_seq, state.lkg())
+        })
     }
+}
+
+fn unexpired(mut usage: AgentUsage, now: DateTime<Utc>) -> Option<AgentUsage> {
+    usage
+        .windows
+        .retain(|window| window.resets_at.is_none_or(|resets_at| resets_at > now));
+    (!usage.windows.is_empty()).then_some(usage)
 }
 
 fn refresh_visible_remaining(started: Instant, now: Instant) -> Duration {
     MIN_REFRESH_VISIBLE.saturating_sub(now.saturating_duration_since(started))
 }
 
+#[cfg(test)]
 fn schedule_wait(last: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Duration {
+    schedule_wait_with_interval(last, now, SCHEDULE_INTERVAL)
+}
+
+fn schedule_wait_with_interval(
+    last: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    interval: Duration,
+) -> Duration {
     last.and_then(|last| {
-        (last + chrono::TimeDelta::seconds(SCHEDULE_INTERVAL.as_secs() as i64) - now)
+        (last + chrono::TimeDelta::seconds(interval.as_secs() as i64) - now)
             .to_std()
             .ok()
     })
     .unwrap_or(Duration::ZERO)
 }
 
+#[cfg(test)]
 fn refresh_due(last: Option<DateTime<Utc>>, reason: RefreshReason, now: DateTime<Utc>) -> bool {
+    refresh_due_with_interval(last, reason, now, SCHEDULE_INTERVAL)
+}
+fn refresh_due_with_interval(
+    last: Option<DateTime<Utc>>,
+    reason: RefreshReason,
+    now: DateTime<Utc>,
+    scheduled: Duration,
+) -> bool {
     let interval = match reason {
         RefreshReason::Button => return true,
         RefreshReason::Launch => Duration::ZERO,
-        RefreshReason::Schedule => SCHEDULE_INTERVAL,
+        RefreshReason::Schedule => scheduled,
         RefreshReason::Open => OPEN_INTERVAL,
     };
     last.is_none_or(|last| {
@@ -472,17 +664,16 @@ pub(crate) fn http_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::runtimes::{
-        antigravity::usage::parse_antigravity,
+        claude_code::usage::read_claude_credentials_with, codex::usage::fetch_codex_with_timeout,
+    };
+    use crate::runtimes::{
         claude_code::usage::{
             claude_response, keychain_account, keychain_error_reason, parse_claude,
             parse_credentials, read_claude_credentials_file,
         },
         codex::usage::parse_codex,
-    };
-    #[cfg(unix)]
-    use crate::runtimes::{
-        claude_code::usage::read_claude_credentials_with, codex::usage::fetch_codex_with_timeout,
     };
     use chrono::TimeDelta;
 
@@ -527,28 +718,6 @@ mod tests {
         assert_eq!(windows.len(), 3);
         assert_eq!(windows[2].name, "Fable · week");
         assert_eq!(windows[2].used_percent, 80.);
-    }
-
-    #[test]
-    fn antigravity_remaining_fraction_becomes_used_percent() {
-        let output = serde_json::json!({"status":"SUCCESS","command":{"name":"usage","data":{"groups":[
-            {"name":"Gemini Models","buckets":[{"window":"weekly","remaining_fraction":0.75,"reset_time":"2026-10-05T11:56:44Z"},{"window":"5h","remaining_fraction":0.25,"reset_time":"2026-09-28T16:56:44Z"}]},
-            {"name":"Claude and GPT models","buckets":[{"window":"5h","remaining_fraction":1.0}]}
-        ]}}});
-        let windows = parse_antigravity(&output).unwrap();
-        assert_eq!(windows[0].name, "Gemini Models · Week used");
-        assert_eq!(windows[0].used_percent, 25.);
-        assert_eq!(windows[1].used_percent, 75.);
-        assert_eq!(windows[2].used_percent, 0.);
-        assert!(windows[0].resets_at.is_some());
-        let mut invalid = output.clone();
-        invalid["command"]["data"]["groups"][0]["buckets"][0]["remaining_fraction"] = 2.0.into();
-        invalid["command"]["data"]["groups"][0]["buckets"][1]["remaining_fraction"] = (-1.0).into();
-        invalid["command"]["data"]["groups"][1]["buckets"] = serde_json::json!([]);
-        assert_eq!(
-            parse_antigravity(&invalid),
-            Err(UnavailableReason::InvalidResponse)
-        );
     }
 
     #[test]
@@ -891,5 +1060,420 @@ mod account_cache_tests {
         assert_eq!(service.claude_account_usage().len(), 2);
         service.select_claude_account("work", false);
         assert!(service.state.lock().unwrap().keychain_denied);
+    }
+}
+
+#[cfg(test)]
+mod lkg_tests {
+    use super::*;
+    use chrono::TimeDelta;
+
+    fn window(name: &str, percent: f64, resets_at: Option<DateTime<Utc>>) -> UsageWindow {
+        UsageWindow {
+            name: name.into(),
+            used_percent: percent,
+            resets_at,
+        }
+    }
+
+    fn usage(windows: Vec<UsageWindow>, updated_at: DateTime<Utc>) -> AgentUsage {
+        AgentUsage {
+            windows,
+            updated_at,
+        }
+    }
+
+    #[test]
+    fn restore_reads_saved_usage_and_drops_expired_windows_and_empty_agents() {
+        let core = crate::test_support::test_core();
+        let now = Utc::now();
+        let updated = now - TimeDelta::minutes(40);
+        let lkg = UsageLkg {
+            runtimes: [(
+                Runtime::Codex,
+                usage(
+                    vec![
+                        window("5 hours", 90., Some(now - TimeDelta::minutes(1))),
+                        window("Week", 27., Some(now + TimeDelta::days(3))),
+                        window("Credits", 5., None),
+                    ],
+                    updated,
+                ),
+            )]
+            .into(),
+            claude_accounts: [(
+                "native".into(),
+                usage(
+                    vec![window("Week", 70., Some(now - TimeDelta::hours(1)))],
+                    updated,
+                ),
+            )]
+            .into(),
+        };
+        crate::db::set_usage_lkg(&core.db, &lkg).unwrap();
+        let service = UsageService::without_fetch();
+        service.restore(&core.db);
+        let snapshot = service.snapshot();
+        let codex = snapshot.get(Runtime::Codex).unwrap();
+        assert_eq!(codex.updated_at, updated);
+        assert_eq!(
+            codex
+                .windows
+                .iter()
+                .map(|window| window.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Week", "Credits"]
+        );
+        assert_eq!(snapshot.get(Runtime::ClaudeCode), None);
+        assert_eq!(snapshot.last_fetch_at, None);
+        assert!(service.state.lock().unwrap().last_attempt_at.is_none());
+    }
+
+    #[test]
+    fn unreadable_saved_usage_starts_empty() {
+        let core = crate::test_support::test_core();
+        crate::db::app_state_set(&core.db.get().unwrap(), "usage_lkg", "{not json").unwrap();
+        let service = UsageService::without_fetch();
+        service.restore(&core.db);
+        assert!(service.snapshot().runtimes.is_empty());
+    }
+
+    fn week(percent: f64, updated_at: DateTime<Utc>) -> AgentUsage {
+        usage(vec![window("Week", percent, None)], updated_at)
+    }
+
+    fn claude_percent(service: &UsageService) -> Option<f64> {
+        Some(service.snapshot().get(Runtime::ClaudeCode)?.windows[0].used_percent)
+    }
+
+    fn save_accounts(core: &AppCore, ids: &[&str], active: &str) {
+        let accounts: Vec<_> = ids
+            .iter()
+            .map(|id| serde_json::json!({"id": id, "name": id, "folder": format!("/tmp/{id}"), "native": *id == "native"}))
+            .collect();
+        let state =
+            serde_json::json!({"accounts": accounts, "main_id": "native", "active_id": active});
+        crate::db::app_state_set(
+            &core.db.get().unwrap(),
+            "claude_accounts",
+            &state.to_string(),
+        )
+        .unwrap();
+    }
+
+    fn fetch_and_save(
+        core: &AppCore,
+        service: &UsageService,
+        results: Vec<(Runtime, Result<Vec<UsageWindow>, UnavailableReason>)>,
+        account_results: Vec<(String, Result<Vec<UsageWindow>, UnavailableReason>)>,
+        now: DateTime<Utc>,
+    ) {
+        let accounts = crate::claude_accounts::load(&core.db).unwrap();
+        let (seq, lkg) = service
+            .finish_fetch(results, account_results, Some(&accounts.active_id), now)
+            .unwrap();
+        service.save_lkg(&core.db, seq, &lkg);
+    }
+
+    fn restarted(core: &AppCore) -> UsageService {
+        let service = UsageService::without_fetch();
+        service.restore(&core.db);
+        service
+    }
+
+    #[test]
+    fn failed_first_fetch_keeps_restored_numbers() {
+        let core = crate::test_support::test_core();
+        let now = Utc::now();
+        let restored_at = now - TimeDelta::minutes(30);
+        let windows = |percent| vec![window("Week", percent, None)];
+        fetch_and_save(
+            &core,
+            &UsageService::without_fetch(),
+            vec![
+                (Runtime::Codex, Ok(windows(27.))),
+                (Runtime::ClaudeCode, Ok(windows(55.))),
+            ],
+            Vec::new(),
+            restored_at,
+        );
+        let service = restarted(&core);
+        assert_eq!(claude_percent(&service), Some(55.));
+        assert_eq!(
+            service.finish_fetch(
+                vec![
+                    (Runtime::Codex, Err(UnavailableReason::CodexNoAnswer)),
+                    (
+                        Runtime::ClaudeCode,
+                        Err(UnavailableReason::ClaudeUnreachable)
+                    ),
+                ],
+                Vec::new(),
+                Some("native"),
+                now,
+            ),
+            None
+        );
+        let snapshot = service.snapshot();
+        assert_eq!(
+            snapshot.get(Runtime::Codex).unwrap().updated_at,
+            restored_at
+        );
+        assert_eq!(snapshot.error(Runtime::Codex), None);
+        assert_eq!(snapshot.error(Runtime::ClaudeCode), None);
+
+        fetch_and_save(
+            &core,
+            &service,
+            vec![
+                (Runtime::Codex, Ok(windows(31.))),
+                (
+                    Runtime::ClaudeCode,
+                    Err(UnavailableReason::ClaudeUnreachable),
+                ),
+            ],
+            Vec::new(),
+            now,
+        );
+        let lkg = crate::db::usage_lkg(&core.db).unwrap().unwrap();
+        assert_eq!(lkg.runtimes[&Runtime::Codex], week(31., now));
+        assert_eq!(lkg.claude_accounts["native"], week(55., restored_at));
+    }
+
+    #[test]
+    fn restored_account_usage_follows_the_active_account() {
+        let core = crate::test_support::test_core();
+        let now = Utc::now();
+        save_accounts(&core, &["native", "work"], "work");
+        let windows = |percent| vec![window("Week", percent, None)];
+        fetch_and_save(
+            &core,
+            &UsageService::without_fetch(),
+            Vec::new(),
+            vec![
+                ("native".into(), Ok(windows(82.))),
+                ("work".into(), Ok(windows(24.))),
+            ],
+            now,
+        );
+        let service = restarted(&core);
+        assert_eq!(claude_percent(&service), Some(24.));
+        assert_eq!(service.claude_account_usage().len(), 2);
+        service.finish_fetch(
+            Vec::new(),
+            vec![("work".into(), Err(UnavailableReason::ClaudeUnreachable))],
+            Some("work"),
+            now,
+        );
+        assert_eq!(claude_percent(&service), Some(24.));
+        service.select_claude_account("native", true);
+        assert_eq!(claude_percent(&service), Some(82.));
+    }
+
+    #[test]
+    fn removed_account_usage_is_not_restored_for_the_remaining_account() {
+        let core = crate::test_support::test_core();
+        let now = Utc::now();
+        let earlier = now - TimeDelta::minutes(20);
+        save_accounts(&core, &["native", "work"], "work");
+        let service = UsageService::without_fetch();
+        let resets = Some(now + TimeDelta::minutes(5));
+        fetch_and_save(
+            &core,
+            &service,
+            Vec::new(),
+            vec![
+                ("native".into(), Ok(vec![window("5 hours", 82., resets)])),
+                ("work".into(), Ok(vec![window("5 hours", 24., None)])),
+            ],
+            earlier,
+        );
+        service.select_claude_account("native", true);
+        save_accounts(&core, &["native"], "native");
+        service.select_claude_account("native", false);
+
+        assert_eq!(claude_percent(&restarted(&core)), Some(82.));
+        assert_eq!(
+            claude_percent(&{
+                let service = UsageService::without_fetch();
+                service.restore_lkg(
+                    crate::db::usage_lkg(&core.db).unwrap().unwrap(),
+                    Some("native"),
+                    now + TimeDelta::minutes(6),
+                );
+                service
+            }),
+            None
+        );
+
+        fetch_and_save(
+            &core,
+            &service,
+            vec![(Runtime::ClaudeCode, Ok(vec![window("Week", 50., None)]))],
+            Vec::new(),
+            now,
+        );
+        assert_eq!(claude_percent(&restarted(&core)), Some(50.));
+    }
+
+    #[test]
+    fn single_account_results_update_that_accounts_cache() {
+        let core = crate::test_support::test_core();
+        let now = Utc::now();
+        let earlier = now - TimeDelta::minutes(20);
+        let windows = |percent| vec![window("Week", percent, None)];
+        fetch_and_save(
+            &core,
+            &UsageService::without_fetch(),
+            vec![(Runtime::ClaudeCode, Ok(windows(82.)))],
+            Vec::new(),
+            earlier - TimeDelta::minutes(20),
+        );
+        let service = restarted(&core);
+        assert_eq!(claude_percent(&service), Some(82.));
+        fetch_and_save(
+            &core,
+            &service,
+            vec![(Runtime::ClaudeCode, Ok(windows(50.)))],
+            Vec::new(),
+            earlier,
+        );
+        save_accounts(&core, &["native", "work"], "native");
+        service.select_claude_account("native", true);
+        assert_eq!(claude_percent(&service), Some(50.));
+        fetch_and_save(
+            &core,
+            &service,
+            vec![(Runtime::Codex, Ok(windows(10.)))],
+            vec![
+                ("native".into(), Err(UnavailableReason::ClaudeUnreachable)),
+                ("work".into(), Ok(windows(24.))),
+            ],
+            now,
+        );
+        let restored = restarted(&core);
+        assert_eq!(claude_percent(&restored), Some(50.));
+        assert_eq!(
+            restored.claude_account_usage()["native"].value,
+            Some(week(50., earlier))
+        );
+    }
+
+    #[test]
+    fn a_result_finishing_after_an_account_switch_stays_with_its_account() {
+        let service = UsageService::without_fetch();
+        let now = Utc::now();
+        let windows = |percent| vec![window("Week", percent, None)];
+        service.select_claude_account("work", true);
+        let (_, lkg) = service
+            .finish_fetch(
+                vec![(Runtime::ClaudeCode, Ok(windows(50.)))],
+                Vec::new(),
+                Some("native"),
+                now,
+            )
+            .unwrap();
+        assert_eq!(claude_percent(&service), None);
+        assert_eq!(lkg.claude_accounts.keys().collect::<Vec<_>>(), ["native"]);
+        assert!(!lkg.runtimes.contains_key(&Runtime::ClaudeCode));
+        service.finish_fetch(
+            Vec::new(),
+            vec![("work".into(), Err(UnavailableReason::ClaudeUnreachable))],
+            Some("native"),
+            now,
+        );
+        assert_eq!(claude_percent(&service), None);
+        assert_eq!(
+            service.snapshot().error(Runtime::ClaudeCode),
+            Some(UnavailableReason::ClaudeUnreachable)
+        );
+        service.select_claude_account("native", true);
+        assert_eq!(claude_percent(&service), Some(50.));
+    }
+
+    #[test]
+    fn an_overtaken_save_does_not_replace_newer_usage() {
+        let core = crate::test_support::test_core();
+        let service = UsageService::without_fetch();
+        let now = Utc::now();
+        let fetch = |percent, at| {
+            service
+                .finish_fetch(
+                    vec![(Runtime::Codex, Ok(vec![window("Week", percent, None)]))],
+                    Vec::new(),
+                    Some("native"),
+                    at,
+                )
+                .unwrap()
+        };
+        let (first_seq, first) = fetch(20., now - TimeDelta::minutes(1));
+        let (second_seq, second) = fetch(30., now);
+        service.save_lkg(&core.db, second_seq, &second);
+        service.save_lkg(&core.db, first_seq, &first);
+        assert_eq!(
+            crate::db::usage_lkg(&core.db).unwrap().unwrap().runtimes[&Runtime::Codex],
+            week(30., now)
+        );
+    }
+}
+
+#[test]
+fn configured_interval_is_persisted_and_drives_scheduled_refresh() {
+    let pool = crate::db::open_in_memory().unwrap();
+    let service = UsageService::without_fetch();
+    assert_eq!(service.interval(), 900);
+    for seconds in [300, 900, 1800, 3600] {
+        service.set_interval(&pool, seconds).unwrap();
+        let restored = UsageService::without_fetch();
+        restored.restore(&pool);
+        assert_eq!(restored.interval(), seconds);
+        let now = Utc::now();
+        let interval = Duration::from_secs(seconds);
+        assert_eq!(
+            schedule_wait_with_interval(Some(now), now, interval),
+            interval
+        );
+        assert!(!refresh_due_with_interval(
+            Some(now),
+            RefreshReason::Schedule,
+            now + chrono::TimeDelta::seconds(seconds as i64 - 1),
+            interval
+        ));
+        assert!(refresh_due_with_interval(
+            Some(now),
+            RefreshReason::Schedule,
+            now + chrono::TimeDelta::seconds(seconds as i64),
+            interval
+        ));
+        assert!(refresh_due_with_interval(
+            Some(now),
+            RefreshReason::Open,
+            now + chrono::TimeDelta::minutes(6),
+            interval
+        ));
+    }
+    assert!(service.set_interval(&pool, 1).is_err());
+    assert_eq!(service.interval(), 3600);
+}
+
+#[test]
+fn scheduled_usage_selection_preserves_agent_discovery_and_open_loads_enabled_agents() {
+    let service = Arc::new(UsageService::default());
+    let agents = vec![Runtime::Codex, Runtime::ClaudeCode, Runtime::Pi];
+    service.set_enabled(agents.clone());
+    service.set_checked(vec![Runtime::ClaudeCode]);
+    assert_eq!(service.enabled(), agents);
+    assert_eq!(service.fetch_runtimes(false), [Runtime::ClaudeCode]);
+    service.set_checked(Vec::new());
+    assert!(service.fetch_runtimes(false).is_empty());
+    assert_eq!(service.fetch_runtimes(true), agents);
+    let temp = tempfile::tempdir().unwrap();
+    let core = crate::test_support::test_core_in(temp.path().join("data"));
+    for reason in [RefreshReason::Launch, RefreshReason::Schedule] {
+        service.request_refresh(core.clone(), reason);
+        let state = service.state.lock().unwrap();
+        assert!(!state.snapshot.refreshing);
+        assert!(state.last_attempt_at.is_none());
+        assert!(state.snapshot.last_fetch_at.is_none());
     }
 }

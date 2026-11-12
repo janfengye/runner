@@ -83,8 +83,6 @@ impl SessionManager {
             crate::session::launch_definition::to_role(definition, effective_runtime, identity);
         let mut role = self.resolve_role_executable(&role, &pool)?;
 
-        // A fork is still an attended chat, so strip permission flags
-        // and leave every other arg alone.
         role.args = crate::runtimes::for_key(&role.runtime)
             .permissions()
             .strip(&role.args);
@@ -181,6 +179,13 @@ impl SessionManager {
             direct_env,
         );
 
+        if crate::db::runtime_launch_options(&pool)?
+            .get(&role.runtime)
+            .is_some_and(|options| !options.remote_plugin_catalog)
+        {
+            spec.env
+                .insert(crate::runtimes::REMOTE_PLUGIN_ENV.into(), "false".into());
+        }
         let assigned_key = match &plan {
             router::runtime::ForkPlan::Direct(plan) => plan.assigned_key.clone(),
             router::runtime::ForkPlan::Headless { .. } => None,
@@ -284,11 +289,19 @@ impl SessionManager {
                     });
                     return Err(error);
                 }
+                self.seed_runtime_project_trust(
+                    &session_id,
+                    &role.runtime,
+                    spec.cwd.as_deref(),
+                    role.env.get("COPILOT_HOME").map(String::as_str),
+                    crate::runtimes::claude_code::spawned_config_dir(&spec.env),
+                );
                 let direct_spawn_started_at = Instant::now();
                 let spawning = self.shutdown.read().unwrap();
                 if *spawning {
                     return Err(Error::msg("runnerd is stopping"));
                 }
+                let status_hooks_enabled = crate::runtimes::status_hooks_enabled(&spec.env);
                 let (rt_session, output) = match self.spawn_runtime(spec) {
                     Ok(spawned) => spawned,
                     Err(error) => {
@@ -344,7 +357,16 @@ impl SessionManager {
                 self.install_handle(
                     &session_id,
                     SessionHandle {
-                        startup: None,
+                        // A report to the chat waits until the agent is ready (#748).
+                        startup: (!Runtime::parse(&role.runtime).is_some_and(Runtime::is_shell))
+                            .then(|| {
+                                startup::StartupDelivery::for_trusted_reports(
+                                    &role.runtime,
+                                    false,
+                                    super::super::clock::now(),
+                                )
+                                .with_status_hooks(status_hooks_enabled)
+                            }),
                         #[cfg(windows)]
                         pending_first_turn: None,
                         id: session_id.clone(),
@@ -366,6 +388,28 @@ impl SessionManager {
                     StatusSource::Fork,
                     events.as_ref(),
                 );
+                let resume_check = plan
+                    .assigned_key
+                    .clone()
+                    .filter(|_| plan.resuming)
+                    .map(|key| {
+                        let runtime = role.runtime.clone();
+                        let account_folder = fork_definition
+                            .claude_account
+                            .as_ref()
+                            .map(|account| account.origin_folder.clone());
+                        let cwd = resolved_cwd.clone();
+                        let env = self.probe_env(crate::runtimes::for_key(&runtime), &role.env);
+                        Box::new(move || {
+                            super::output::conversation_exists(
+                                crate::runtimes::for_key(&runtime),
+                                account_folder.as_deref(),
+                                cwd.as_deref(),
+                                &env,
+                                &key,
+                            )
+                        }) as super::output::ConversationCheck
+                    });
                 let forwarder = self.start_forwarder_thread(
                     session_id.clone(),
                     started_at,
@@ -375,7 +419,7 @@ impl SessionManager {
                     Arc::clone(&pool),
                     Arc::clone(&events),
                     role.clone(),
-                    plan.resuming,
+                    resume_check,
                     source.role_id.is_some(),
                     None,
                     app_data_dir.to_path_buf(),
@@ -405,6 +449,7 @@ impl SessionManager {
                     &role.runtime,
                     spec.cwd.as_deref(),
                     role.env.get("COPILOT_HOME").map(String::as_str),
+                    crate::runtimes::claude_code::spawned_config_dir(&spec.env),
                 );
                 let materialize_started_at = Instant::now();
                 let fork_key = match run_headless_fork(&spec, &headless, FORK_MATERIALIZE_TIMEOUT) {

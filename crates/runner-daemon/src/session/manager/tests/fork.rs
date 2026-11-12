@@ -217,6 +217,18 @@ fn claude_direct_chat_fork_spawns_tui_directly_with_copied_row() {
         spec.env.get("FORK_TEST_ENV").map(String::as_str),
         Some("same-env")
     );
+    assert_eq!(
+        spec.env.get("RUNNER_SESSION_ID"),
+        Some(&spawned.id),
+        "a fork addresses itself, not its source"
+    );
+    assert_eq!(
+        spec.env
+            .get(runner_core::protocol::SESSION_CLI_ENV)
+            .map(PathBuf::from),
+        Some(Path::new("/tmp/bin").join(runner_core::cli_install::AGENT_DEST_BIN_NAME)),
+        "a fork gets the bundled CLI (#1149)"
+    );
     assert!(!spec.args.contains(&"-p".to_string()));
     assert!(!spec.args.iter().any(|arg| arg.contains("forked from")));
     assert!(!spec.args.iter().any(|arg| arg.contains("Forker persona")));
@@ -626,4 +638,39 @@ fn headless_fork_timeout_kills_batch_descendant_and_closes_pipes() {
         ),
         "headless descendant {pid} survived the kill grace"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_headless_fork_honors_catalog_switch() {
+    for enabled in [false, true] {
+        let source = uuid::Uuid::new_v4().to_string();
+        let fork = uuid::Uuid::new_v4().to_string();
+        let (_root, command, capture, home) = codex_fork_materializer(&source, &fork, true);
+        let spec = SpawnSpec {
+            command,
+            agent_runtime: Some(Runtime::Codex),
+            env: BTreeMap::from([
+                ("CODEX_HOME".into(), home.display().to_string()),
+                (
+                    crate::runtimes::REMOTE_PLUGIN_ENV.into(),
+                    enabled.to_string(),
+                ),
+            ]),
+            ..Default::default()
+        };
+        let plan = crate::runtimes::adapter(Runtime::Codex)
+            .fork_plan(&source, "source")
+            .unwrap();
+        assert_eq!(
+            super::super::fork::run_headless_fork(&spec, &plan, Duration::from_secs(5)).unwrap(),
+            fork
+        );
+        assert_eq!(
+            std::fs::read_to_string(capture)
+                .unwrap()
+                .contains("arg=features.remote_plugin=false"),
+            !enabled
+        );
+    }
 }

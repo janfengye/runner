@@ -205,6 +205,7 @@ async fn serve_with_listener(
     if !config.isolated {
         core.usage.start_scheduler(core.clone());
     }
+    crate::ops::mission::report::Reports::start(core.clone());
     let (resume_tx, resume_rx) = tokio::sync::watch::channel(None);
     let resume_consumer = Arc::new(super::resume::ResumeConsumer::default());
     let consumer = resume_consumer.clone();
@@ -231,9 +232,11 @@ async fn serve_with_listener(
         exe_sha256: hash,
         pid: std::process::id(),
         started_at: chrono::Utc::now().to_rfc3339(),
+        app_clients: 0,
     };
     let mut connections = tokio::task::JoinSet::new();
     let window_owners = Arc::new(Mutex::new(HashMap::new()));
+    let apps = Arc::new(AppGate::default());
     let mut next_connection = 0;
     let mut ownership = tokio::time::interval(Duration::from_secs(2));
     let signal = os_shutdown(
@@ -252,12 +255,12 @@ async fn serve_with_listener(
             accepted = sentinel.accept() => discard_sentinel_connection(accepted).await,
             accepted = listener.accept() => {
                 if let Some(stream) = accept_client_connection(accepted).await {
-                    let core = core.clone(); let welcome = welcome.clone(); let cancel = cancel.clone();
+                    let core = core.clone(); let welcome = welcome.clone(); let apps = apps.clone(); let cancel = cancel.clone();
                     let isolated = config.isolated;
                     let resume_report = resume_rx.clone();
                     next_connection += 1;
                     let windows = Arc::new(ConnectionWindows { core: core.clone(), owners: window_owners.clone(), id: next_connection, closed: CancellationToken::new() });
-                    connections.spawn(async move { if let Err(error) = connection(stream, core, welcome, cancel, isolated, windows, resume_report).await { log::debug!("runnerd client: {error}"); } });
+                    connections.spawn(async move { if let Err(error) = connection(stream, core, welcome, apps, cancel, isolated, windows, resume_report).await { log::debug!("runnerd client: {error}"); } });
                 }
             }
         }
@@ -401,6 +404,42 @@ async fn discard_sentinel_connection(accepted: std::io::Result<IpcStream>) {
 struct Connected {
     core: AppCore,
 }
+/// Connected app clients. Admission and a replacing app's takeover share one
+/// lock, so a takeover never disconnects an app it did not count.
+#[derive(Default)]
+struct AppGate(Mutex<AppCount>);
+#[derive(Default)]
+struct AppCount {
+    connected: u32,
+    closing: bool,
+}
+impl AppGate {
+    fn connected(&self) -> u32 {
+        self.0.lock().unwrap().connected
+    }
+    fn admit(self: &Arc<Self>) -> Option<AppClient> {
+        let mut count = self.0.lock().unwrap();
+        if count.closing {
+            return None;
+        }
+        count.connected += 1;
+        Some(AppClient(self.clone()))
+    }
+    fn take_over(&self) -> Result<(), u32> {
+        let mut count = self.0.lock().unwrap();
+        if count.connected > 0 {
+            return Err(count.connected);
+        }
+        count.closing = true;
+        Ok(())
+    }
+}
+struct AppClient(Arc<AppGate>);
+impl Drop for AppClient {
+    fn drop(&mut self) {
+        self.0 .0.lock().unwrap().connected -= 1;
+    }
+}
 impl Drop for Connected {
     fn drop(&mut self) {
         self.core.usage.client_disconnected();
@@ -508,6 +547,24 @@ impl ConnectionWindows {
                 }
                 _ => unreachable!(),
             });
+        }
+        if let Request::files_watch { root } = request {
+            // Before the owners lock, since typing in any window waits on it.
+            let prepared = self.core.files.prepare_watch(&root);
+            // Under it, so a watch in flight cannot outlive `remove`.
+            let _owners = self.owners.lock().unwrap();
+            if self.closed.is_cancelled() {
+                return None;
+            }
+            return Some(Response::files_watch(
+                prepared
+                    .and_then(|prepared| self.core.files.subscribe(self.id, root, prepared))
+                    .map_err(|error| ClientError::msg(error.to_string())),
+            ));
+        }
+        if let Request::files_unwatch { root } = request {
+            self.core.files.unwatch(self.id, &root);
+            return Some(Response::files_unwatch(Ok(())));
         }
         if let Request::remote_follow { computer, follow } = request {
             return Some(Response::remote_follow(
@@ -644,6 +701,7 @@ impl ConnectionWindows {
     fn remove(&self) {
         self.core.remote.owner_gone(self.id);
         let mut owners = self.owners.lock().unwrap();
+        self.core.files.client_gone(self.id);
         self.core.sessions.clear_connection_compositions(self.id);
         owners.retain(|label, owner| {
             if *owner != self.id {
@@ -689,10 +747,31 @@ fn response_frame(id: u64, response: Response) -> std::io::Result<Frame> {
         ),
     }
 }
+/// An event too large for a frame cannot reach the client, which hears that
+/// it missed one, as when it lags, and keeps its connection.
+fn event_frame(event: &wire::Event) -> std::io::Result<Frame> {
+    let frame = Frame::json(wire::EVENT, event)?;
+    match frame.check_size() {
+        Ok(_) => Ok(frame),
+        Err(error) => {
+            let name = event.event.as_ref().map_or("", |event| event.name.as_str());
+            log::warn!("dropping event {name}: {error}");
+            Frame::json(
+                wire::EVENT,
+                &wire::Event {
+                    event: None,
+                    lagged: Some(1),
+                },
+            )
+        }
+    }
+}
+#[allow(clippy::too_many_arguments)]
 async fn connection(
     stream: IpcStream,
     core: AppCore,
     welcome: wire::Welcome,
+    apps: Arc<AppGate>,
     shutdown: CancellationToken,
     _isolated: bool,
     windows: Arc<ConnectionWindows>,
@@ -706,7 +785,21 @@ async fn connection(
         anyhow::bail!("expected Hello");
     }
     let hello: wire::Hello = hello.decode()?;
+    // The listener can still accept once a stop has begun; an app welcomed then would
+    // reconnect to a daemon about to exit instead of meeting the one that replaces it.
+    if shutdown.is_cancelled() {
+        return Ok(());
+    }
     let matches = hello.exe_sha256.is_empty() || hello.exe_sha256 == welcome.exe_sha256;
+    // An app is counted before its welcome, so a takeover cannot slip in between.
+    let _app = match (matches && hello.client == "app").then(|| apps.admit()) {
+        Some(None) => return Ok(()),
+        admitted => admitted.flatten(),
+    };
+    let welcome = wire::Welcome {
+        app_clients: apps.connected(),
+        ..welcome
+    };
     write_frame(
         &mut write,
         Frame::json(
@@ -862,12 +955,24 @@ async fn connection(
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => wire::Event { event: None, lagged: Some(count) },
                         Err(_) => break,
                     };
-                    write_frame(&mut write, Frame::json(wire::EVENT, &event)?).await?;
+                    write_frame(&mut write, event_frame(&event)?).await?;
                 }
                 received = incoming.recv() => {
                     let frame = received.context("client reader closed")??;
                     match frame.kind {
-                        wire::SHUTDOWN => { if frame.decode::<wire::Shutdown>()?.stop_sessions { shutdown.cancel(); break; } }
+                        wire::SHUTDOWN => {
+                            let request: wire::Shutdown = frame.decode()?;
+                            if !request.stop_sessions { continue; }
+                            if request.takeover {
+                                if let Err(connected) = apps.take_over() {
+                                    let refused = wire::Event { event: Some(runner_core::protocol::ClientEvent { name: wire::TAKEOVER_REFUSED.into(), payload: serde_json::json!({"app_clients":connected}) }), lagged: None };
+                                    write_frame(&mut write, Frame::json(wire::EVENT, &refused)?).await?;
+                                    continue;
+                                }
+                            }
+                            shutdown.cancel();
+                            break;
+                        }
                         wire::REQUEST => {
                             let call: wire::Call = match frame.decode() {
                                 Ok(call) => call,
@@ -1079,7 +1184,9 @@ pub(crate) async fn remote_test_connection(
             exe_sha256: "remote-test".into(),
             pid: 1,
             started_at: "now".into(),
+            app_clients: 0,
         },
+        Default::default(),
         cancel,
         true,
         windows,
@@ -1091,6 +1198,27 @@ pub(crate) async fn remote_test_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_oversized_event_tells_the_client_it_missed_one() {
+        let event = |size: usize| wire::Event {
+            event: Some(runner_core::protocol::ClientEvent {
+                name: "files/status".into(),
+                payload: serde_json::Value::String("x".repeat(size)),
+            }),
+            lagged: None,
+        };
+        let frame = event_frame(&event(1024)).unwrap();
+        let decoded: wire::Event = frame.decode().unwrap();
+        assert!(decoded.event.is_some());
+        assert_eq!(decoded.lagged, None);
+
+        let frame = event_frame(&event(wire::MAX_FRAME)).unwrap();
+        frame.encode().unwrap();
+        let decoded: wire::Event = frame.decode().unwrap();
+        assert!(decoded.event.is_none());
+        assert_eq!(decoded.lagged, Some(1));
+    }
 
     #[test]
     fn connection_cleanup_and_desktop_takeback_release_owned_compositions() {
@@ -1205,7 +1333,9 @@ mod tests {
                     exe_sha256: "hash".into(),
                     pid: 1,
                     started_at: "now".into(),
+                    app_clients: 0,
                 },
+                Default::default(),
                 server_shutdown,
                 true,
                 windows,
@@ -1327,7 +1457,9 @@ mod tests {
                     exe_sha256: "hash".into(),
                     pid: 1,
                     started_at: "now".into(),
+                    app_clients: 0,
                 },
+                Default::default(),
                 server_shutdown,
                 true,
                 windows,
@@ -1364,6 +1496,50 @@ mod tests {
         })
         .await
         .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_stopping_daemon_welcomes_no_new_client() {
+        let root = tempfile::tempdir().unwrap();
+        let core = crate::test_support::test_core_in(root.path().to_owned());
+        #[cfg(unix)]
+        let endpoint = IpcEndpoint(root.path().join("runnerd.sock"));
+        #[cfg(windows)]
+        let endpoint = IpcEndpoint(std::path::PathBuf::from(format!(
+            r"\\.\pipe\runner-stopping-welcome-test-{}",
+            root.path().file_name().unwrap().to_string_lossy()
+        )));
+        let mut listener = IpcListener::bind(&endpoint).unwrap();
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.unwrap();
+            remote_test_connection(stream, core, 1, shutdown).await
+        });
+        let connected = tokio::task::spawn_blocking(move || {
+            runner_core::protocol::socket::SocketTransport::connect(
+                &endpoint,
+                wire::Hello {
+                    exe_sha256: "remote-test".into(),
+                    client: "app".into(),
+                },
+            )
+            .map(|socket| socket.welcome.pid)
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                connected,
+                Err(runner_core::protocol::socket::ConnectError::NotRunning)
+            ),
+            "{connected:?}"
+        );
         tokio::time::timeout(Duration::from_secs(5), server)
             .await
             .unwrap()
@@ -1514,6 +1690,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_served_daemon_tracks_mission_states_for_reports() {
+        let root = tempfile::tempdir().unwrap();
+        let core = crate::test_support::test_core_in(root.path().to_owned());
+        let mission = {
+            let mut conn = core.db.get().unwrap();
+            let crew = crate::ops::crew::create(
+                &conn,
+                crate::ops::crew::CreateCrewInput {
+                    name: "Crew".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .id;
+            crate::test_support::insert_test_role(&conn, "role", "worker", "codex", "codex");
+            crate::test_support::insert_test_slot(&conn, "slot", &crew, "role", "worker", 0, false);
+            crate::ops::mission::start(
+                &mut conn,
+                &core.app_data_dir,
+                runner_core::protocol::MissionStart {
+                    crew_id: Some(crew),
+                    scope: runner_core::protocol::ProjectScope::Root,
+                    title: "Tracked".into(),
+                    goal_override: None,
+                    cwd: Some(root.path().to_string_lossy().into_owned()),
+                    started_by_session_id: None,
+                    no_report: false,
+                },
+            )
+            .unwrap()
+            .mission
+            .id
+        };
+        #[cfg(unix)]
+        let endpoint = IpcEndpoint(root.path().join("runnerd.sock"));
+        #[cfg(windows)]
+        let endpoint = IpcEndpoint(std::path::PathBuf::from(format!(
+            r"\\.\pipe\runner-reports-test-{}",
+            root.path().file_name().unwrap().to_string_lossy()
+        )));
+        #[cfg(unix)]
+        let mcp_endpoint = IpcEndpoint(root.path().join("mcp.sock"));
+        #[cfg(windows)]
+        let mcp_endpoint = IpcEndpoint(std::path::PathBuf::from(format!(
+            r"\\.\pipe\runner-reports-mcp-test-{}",
+            root.path().file_name().unwrap().to_string_lossy()
+        )));
+        let config = Config {
+            paths: NativePaths::new(root.path().to_owned(), root.path().join("logs")),
+            endpoint: endpoint.clone(),
+            mcp_endpoint,
+            isolated: true,
+        };
+        let server = tokio::spawn(serve_with_listener(
+            config,
+            core.clone(),
+            "hash".into(),
+            Settings {
+                resume_on_launch: false,
+                ..Settings::default()
+            },
+            IpcListener::bind(&endpoint).unwrap(),
+            #[cfg(windows)]
+            Err(std::io::Error::other("no shutdown window in tests")),
+        ));
+        let client = tokio::task::spawn_blocking(move || {
+            runner_core::protocol::socket::SocketTransport::connect(
+                &endpoint,
+                wire::Hello {
+                    exe_sha256: "hash".into(),
+                    client: "test".into(),
+                },
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        // The report service derives the state; without it the daemon never reports.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while core.reports.phase(&mission).is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the served daemon must run the report service"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        client.shutdown(true).unwrap();
+        tokio::time::timeout(SHUTDOWN_TIMEOUT * 2, server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn sentinel_accept_errors_back_off_and_return_to_serving() {
         #[cfg(unix)]
         let raw_error = libc::EMFILE;
@@ -1559,6 +1830,100 @@ mod tests {
             }
             response => panic!("unexpected response: {response:?}"),
         }
+    }
+
+    #[test]
+    fn a_disconnect_releases_the_connection_s_file_watches() {
+        let core = crate::test_support::test_core();
+        let root = tempfile::tempdir().unwrap();
+        let connection = |id| ConnectionWindows {
+            core: core.clone(),
+            owners: Arc::new(Mutex::default()),
+            id,
+            closed: CancellationToken::new(),
+        };
+        let (first, second) = (connection(1), connection(2));
+        let watch = |windows: &ConnectionWindows| {
+            windows.dispatch(Request::files_watch {
+                root: root.path().to_path_buf(),
+            })
+        };
+        assert!(matches!(watch(&first), Some(Response::files_watch(Ok(())))));
+        assert!(matches!(
+            watch(&second),
+            Some(Response::files_watch(Ok(())))
+        ));
+        first.closed.cancel();
+        first.remove();
+        assert!(watch(&first).is_none());
+        assert_eq!(core.files.watched_roots(), [root.path().to_path_buf()]);
+        second.closed.cancel();
+        second.remove();
+        assert!(core.files.watched_roots().is_empty());
+    }
+
+    #[test]
+    fn a_watch_preparing_on_a_slow_disk_holds_up_no_other_connection() {
+        use runner_core::protocol::terminal::InputEvent;
+        let core = crate::test_support::test_core();
+        let root = tempfile::tempdir().unwrap();
+        let owners = Arc::new(Mutex::default());
+        let connection = |id| {
+            Arc::new(ConnectionWindows {
+                core: core.clone(),
+                owners: Arc::clone(&owners),
+                id,
+                closed: CancellationToken::new(),
+            })
+        };
+        let (watching, typing) = (connection(1), connection(2));
+        let (entered, release) = core.files.hold_next_watch();
+        let path = root.path().to_path_buf();
+        let worker =
+            std::thread::spawn(move || watching.dispatch(Request::files_watch { root: path }));
+        entered.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            typing.dispatch(Request::terminal_observe_input {
+                session_id: "elsewhere".into(),
+                input: InputEvent::Composing { composing: false },
+            });
+            typing.dispatch(Request::window_register {
+                label: "other".into(),
+            });
+            done_tx.send(()).unwrap();
+        });
+        let passed = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        release.send(()).unwrap();
+        assert!(matches!(
+            worker.join().unwrap(),
+            Some(Response::files_watch(Ok(())))
+        ));
+        assert!(passed, "typing waited on a watch's disk work");
+        assert_eq!(core.files.watched_roots(), [root.path().to_path_buf()]);
+    }
+
+    #[test]
+    fn a_watch_preparing_when_its_connection_closes_never_starts() {
+        let core = crate::test_support::test_core();
+        let root = tempfile::tempdir().unwrap();
+        let windows = Arc::new(ConnectionWindows {
+            core: core.clone(),
+            owners: Arc::new(Mutex::default()),
+            id: 1,
+            closed: CancellationToken::new(),
+        });
+        let (entered, release) = core.files.hold_next_watch();
+        let (queued, path) = (windows.clone(), root.path().to_path_buf());
+        let worker =
+            std::thread::spawn(move || queued.dispatch(Request::files_watch { root: path }));
+        entered.recv_timeout(Duration::from_secs(10)).unwrap();
+        windows.closed.cancel();
+        windows.remove();
+        release.send(()).unwrap();
+        assert!(worker.join().unwrap().is_none());
+        assert!(core.files.watched_roots().is_empty());
     }
 
     #[test]

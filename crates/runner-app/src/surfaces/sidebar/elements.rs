@@ -2,7 +2,7 @@ use runner_core::protocol::model::Runtime;
 use std::path::Path;
 
 use super::*;
-use crate::surfaces::sidebar_logic::AttentionState;
+use crate::surfaces::sidebar::logic::AttentionState;
 use crate::surfaces::*;
 use crate::*;
 use gpui::{radians, svg, FontWeight, Hsla, Transformation};
@@ -87,29 +87,109 @@ pub(crate) struct SidebarItemView {
     pub(crate) pinned: bool,
 }
 
-pub(crate) fn sidebar_item_row(
+/// An item row whose label may carry a second line under its title; `bordered`
+/// as for [`sidebar_row_shell`].
+pub(crate) fn sidebar_item_row_with(
     id: SharedString,
     item: &SidebarItemView,
+    subtitle: Option<AnyElement>,
+    bordered: bool,
 ) -> gpui::Stateful<gpui::Div> {
-    sidebar_row_shell(id, item.selected, false)
-        .children(item.pinned.then(pin_indicator))
-        .child(sidebar_icon(item.icon, item.live))
-        .child(
-            sidebar_row_label(item.title.clone(), item.selected, false).debug_selector({
-                let title = item.title.clone();
-                move || format!("SIDEBAR_ITEM_TITLE:{title}")
-            }),
-        )
+    let pin_id = id.clone();
+    let title = sidebar_row_label(item.title.clone(), item.selected, false).debug_selector({
+        let title = item.title.clone();
+        move || format!("SIDEBAR_ITEM_TITLE:{title}")
+    });
+    sidebar_row_shell(id.clone(), item.selected, false, bordered)
+        .children(item.pinned.then(|| {
+            div()
+                .debug_selector(move || format!("SIDEBAR_PIN {pin_id}"))
+                .flex()
+                .flex_none()
+                .child(pin_indicator())
+        }))
+        .child(sidebar_mark(id, sidebar_icon(item.icon, item.live)))
+        .map(|row| match subtitle {
+            Some(subtitle) => row.child(
+                div()
+                    .min_w(px(0.))
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .child(title)
+                    .child(subtitle),
+            ),
+            None => row.child(title),
+        })
 }
 
-pub(crate) fn workspace_new_chat_row(
+/// A row's leading mark, named for tests that measure where it is drawn.
+pub(super) fn sidebar_mark(row_id: SharedString, icon: AnyElement) -> gpui::Div {
+    div()
+        .debug_selector(move || format!("SIDEBAR_MARK {row_id}"))
+        .flex()
+        .flex_none()
+        .child(icon)
+}
+
+/// The launcher page's place in the tree. It is drawn while the page shows and
+/// never stored, so its only action is the × shown on hover; starting something
+/// replaces it.
+pub(crate) fn launcher_tab_row(close: Option<WeakEntity<NativeRoot>>) -> AnyElement {
+    div()
+        .debug_selector(|| "SIDEBAR_LAUNCHER_TAB".into())
+        .group("sidebar-row-actions")
+        .w_full()
+        .px(rems(10. / 16.))
+        .py(rems(6. / 16.))
+        .flex()
+        .items_center()
+        .gap(rems(6. / 16.))
+        .rounded_sm()
+        .border_1()
+        .border_dashed()
+        .border_color(theme::faint())
+        .bg(theme::chrome_selected())
+        .text_size(theme::text_body())
+        .text_color(theme::muted())
+        .child(
+            svg()
+                .path("app-window.svg")
+                .size(rems(12. / 16.))
+                .flex_none()
+                .text_color(theme::muted()),
+        )
+        .child(sidebar_row_label(
+            crate::i18n::text("ui.new_tab").to_owned(),
+            false,
+            false,
+        ))
+        .children(close.map(|root| {
+            div()
+                .debug_selector(|| "SIDEBAR_LAUNCHER_TAB_CLOSE".into())
+                .flex_none()
+                .child(project_row_action(
+                    "sidebar-launcher-tab-close".into(),
+                    "close.svg",
+                    12.,
+                    crate::i18n::text("keymap.close-pane.title"),
+                    move |_, window, cx| {
+                        let _ = root.update(cx, |root, cx| root.close_launcher_page(window, cx));
+                    },
+                ))
+        }))
+        .into_any_element()
+}
+
+pub(crate) fn workspace_new_tab_row(
     shortcut: Option<String>,
     enabled: bool,
+    selected: bool,
     on_click: impl Fn(&mut Window, &mut gpui::App) + 'static,
 ) -> AnyElement {
     div()
-        .id("workspace-new-chat")
-        .debug_selector(|| "SIDEBAR_WORKSPACE_NEW_CHAT".into())
+        .id("workspace-new-tab")
+        .debug_selector(|| "SIDEBAR_WORKSPACE_NEW_TAB".into())
         .w_full()
         .px(rems(10. / 16.))
         .py(rems(6. / 16.))
@@ -119,6 +199,10 @@ pub(crate) fn workspace_new_chat_row(
         .rounded_sm()
         .border_1()
         .border_color(gpui::transparent_black())
+        .when(selected, |row| {
+            row.bg(theme::chrome_selected())
+                .border_color(theme::chrome_selected_border())
+        })
         .when(!enabled, |row| row.opacity(0.35))
         .when(enabled, |row| {
             row.cursor_pointer().hover(|row| {
@@ -140,7 +224,7 @@ pub(crate) fn workspace_new_chat_row(
                 .text_size(theme::text_title())
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(theme::muted())
-                .child(crate::i18n::text("ui.new_chat")),
+                .child(crate::i18n::text("ui.new_tab")),
         )
         .children(shortcut.map(|shortcut| {
             div()
@@ -307,10 +391,13 @@ pub(crate) fn empty_sidebar_label(label: &'static str) -> AnyElement {
         .into_any_element()
 }
 
+/// `bordered: false` keeps the row's border hidden, selected or hovered: a group
+/// head's outline is its border.
 pub(crate) fn sidebar_row_shell(
     id: SharedString,
     selected: bool,
     accent_bar: bool,
+    bordered: bool,
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .debug_selector(|| format!("SIDEBAR_ROW {id}"))
@@ -325,7 +412,7 @@ pub(crate) fn sidebar_row_shell(
         .gap(rems(6. / 16.))
         .rounded_sm()
         .border_1()
-        .border_color(if selected {
+        .border_color(if selected && bordered {
             theme::chrome_selected_border()
         } else {
             gpui::transparent_black()
@@ -350,10 +437,13 @@ pub(crate) fn sidebar_row_shell(
         } else {
             theme::muted()
         })
-        .hover(|row| {
-            row.border_color(theme::chrome_selected_border())
-                .bg(theme::chrome_hover())
-                .text_color(theme::text())
+        .hover(move |row| {
+            let row = row.bg(theme::chrome_hover()).text_color(theme::text());
+            if bordered {
+                row.border_color(theme::chrome_selected_border())
+            } else {
+                row
+            }
         })
 }
 
@@ -538,18 +628,22 @@ pub(super) fn attention_indicator(attention: AttentionState) -> AnyElement {
                     .bg(theme::accent()),
             )
             .into_any_element(),
-        AttentionState::Unavailable | AttentionState::NeedsYou | AttentionState::Error => slot
+        AttentionState::Unavailable
+        | AttentionState::Interrupted
+        | AttentionState::NeedsYou
+        | AttentionState::Error => slot
             .child(
                 svg()
                     .path(match attention {
                         AttentionState::Error => "circle-alert.svg",
                         AttentionState::NeedsYou => "triangle-alert.svg",
+                        AttentionState::Interrupted => "circle-pause.svg",
                         _ => "circle-question-mark.svg",
                     })
                     .size(px(12.))
                     .text_color(match attention {
                         AttentionState::Error => theme::danger(),
-                        AttentionState::NeedsYou => theme::warning(),
+                        AttentionState::NeedsYou | AttentionState::Interrupted => theme::warning(),
                         _ => theme::muted(),
                     }),
             )

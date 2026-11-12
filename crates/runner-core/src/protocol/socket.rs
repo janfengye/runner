@@ -15,6 +15,8 @@ pub const FORK_REQUEST_TIMEOUT: Duration =
     Duration::from_secs(FORK_MATERIALIZE_TIMEOUT.as_secs() + 30);
 
 pub const REMOTE_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+// Logout and its auth-status refresh each have a 15-second budget.
+const CLAUDE_SIGN_OUT_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 
 pub fn companion_request_timeout(request: &crate::companion::ClientMessage) -> Duration {
     if matches!(
@@ -51,6 +53,9 @@ fn request_timeout(request: &Request, timeout: Duration) -> Option<Duration> {
         | Request::remote_follow { .. }
         | Request::remote_take_control { .. } => Some(timeout.max(REMOTE_REQUEST_TIMEOUT)),
         Request::session_fork { .. } => Some(timeout.max(FORK_REQUEST_TIMEOUT)),
+        Request::claude_account_action {
+            action: ClaudeAccountAction::SignOut { .. },
+        } => Some(timeout.max(CLAUDE_SIGN_OUT_REQUEST_TIMEOUT)),
         _ => Some(timeout),
     }
 }
@@ -68,6 +73,7 @@ pub enum ConnectError {
     NotRunning,
     Blocked,
     Mismatch(wire::Welcome),
+    InUse(wire::Welcome),
     Protocol(String),
 }
 impl std::fmt::Display for ConnectError {
@@ -76,6 +82,11 @@ impl std::fmt::Display for ConnectError {
             Self::NotRunning => f.write_str("runnerd is not running"),
             Self::Blocked => f.write_str("runnerd connection was denied"),
             Self::Mismatch(_) => f.write_str("runnerd build mismatch"),
+            Self::InUse(welcome) => write!(
+                f,
+                "Another Runner build is using this data through runnerd (PID {}). Quit that Runner, then try again.",
+                welcome.pid
+            ),
             Self::Protocol(message) => f.write_str(message),
         }
     }
@@ -398,8 +409,19 @@ impl SocketTransport {
             .map_err(|error| ClientError::msg(format!("runnerd writer: {error}")))
     }
     pub fn shutdown(&self, stop_sessions: bool) -> Result<(), ClientError> {
-        let mut frame =
-            Frame::json(wire::SHUTDOWN, &wire::Shutdown { stop_sessions }).map_err(client_error)?;
+        self.send_shutdown(wire::Shutdown {
+            stop_sessions,
+            takeover: false,
+        })
+    }
+    pub fn take_over(&self) -> Result<(), ClientError> {
+        self.send_shutdown(wire::Shutdown {
+            stop_sessions: true,
+            takeover: true,
+        })
+    }
+    fn send_shutdown(&self, shutdown: wire::Shutdown) -> Result<(), ClientError> {
+        let mut frame = Frame::json(wire::SHUTDOWN, &shutdown).map_err(client_error)?;
         let deadline = Instant::now() + self.timeout;
         loop {
             if self.is_closed() {
@@ -745,6 +767,7 @@ mod tests {
                     exe_sha256: "hash".into(),
                     pid: 1,
                     started_at: "now".into(),
+                    app_clients: 0,
                 },
             )
             .unwrap()
@@ -808,6 +831,7 @@ mod tests {
                         exe_sha256: "hash".into(),
                         pid: 1,
                         started_at: "now".into(),
+                        app_clients: 0,
                     },
                 )
                 .unwrap()
@@ -855,6 +879,7 @@ mod tests {
                     exe_sha256: "hash".into(),
                     pid: 1,
                     started_at: "now".into(),
+                    app_clients: 0,
                 },
             )
             .unwrap()
@@ -913,6 +938,7 @@ mod tests {
                     exe_sha256: "hash".into(),
                     pid: 1,
                     started_at: "now".into(),
+                    app_clients: 0,
                 },
             )
             .unwrap()
@@ -1009,11 +1035,34 @@ mod deadline_tests {
             Some(Duration::from_millis(200))
         );
         assert!(request_timeout(&fork, REQUEST_TIMEOUT).unwrap() > FORK_MATERIALIZE_TIMEOUT);
+        let sign_out = Request::claude_account_action {
+            action: ClaudeAccountAction::SignOut { id: "work".into() },
+        };
+        assert_eq!(
+            request_timeout(&sign_out, REQUEST_TIMEOUT),
+            Some(Duration::from_secs(45))
+        );
+        assert_eq!(
+            request_timeout(&sign_out, Duration::from_secs(60)),
+            Some(Duration::from_secs(60))
+        );
         for ordinary in [
             Request::session_list {
                 mission_id: "mission".into(),
             },
             Request::role_list {},
+            Request::claude_account_action {
+                action: ClaudeAccountAction::Login { id: "work".into() },
+            },
+            Request::claude_account_action {
+                action: ClaudeAccountAction::Cancel { id: "work".into() },
+            },
+            Request::claude_account_action {
+                action: ClaudeAccountAction::Remove { id: "work".into() },
+            },
+            Request::claude_account_action {
+                action: ClaudeAccountAction::Refresh,
+            },
             Request::node_rename {
                 id: "node".into(),
                 name: "renamed".into(),

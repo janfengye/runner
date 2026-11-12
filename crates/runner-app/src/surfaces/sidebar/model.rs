@@ -1,4 +1,3 @@
-use super::menus::sidebar_create_menu_entries;
 use super::*;
 use crate::surfaces::front_page::model::{MissionFields, ProjectDisplay};
 use runner_core::companion::{MissionState, Status};
@@ -12,17 +11,48 @@ impl Sidebar {
         if self.front_page.target != client.target {
             self.dismiss_transients(cx);
         }
-        if client.is_remote() && self.remote_settings.is_none() {
-            let mut settings = self.app_store.read(cx).settings.clone();
-            settings.sidebar_collapsed_projects.clear();
-            settings.sidebar_collapsed_active_groups.clear();
-            settings.sidebar_projects_open = true;
-            settings.sidebar_chats_open = true;
-            settings.sidebar_active_only = false;
-            self.remote_settings = Some(settings);
-        }
         self.front_page = client;
-        self.refresh_create_menu(cx);
+        if let crate::surfaces::front_page::FrontPageTarget::Remote { computer, .. } =
+            &self.front_page.target
+        {
+            let saved = self
+                .app_store
+                .read(cx)
+                .settings
+                .remote_sidebars
+                .get(computer)
+                .cloned();
+            if self.remote_settings.is_none() {
+                let mut settings = self.app_store.read(cx).settings.clone();
+                saved.clone().unwrap_or_default().apply_to(&mut settings);
+                self.remote_settings = Some(settings);
+                self.remote_sidebar_seed_pending = saved.is_none();
+            }
+            if let Some(saved) = saved.filter(|_| self.remote_sidebar_seed_pending) {
+                saved.apply_to(self.remote_settings.as_mut().unwrap());
+                self.remote_sidebar_seed_pending = false;
+            }
+            if self.remote_sidebar_seed_pending && self.remote_overview(cx).is_some() {
+                let nodes = self.source_nodes(cx);
+                let collapsed_projects = self
+                    .source_projects(cx)
+                    .into_iter()
+                    .filter(|project| {
+                        !nodes.iter().any(|node| {
+                            matches!(node.node_type, NodeType::Tab | NodeType::Mission)
+                                && node.pinned_position.is_none()
+                                && node.parent_id.as_deref() == Some(project.id.as_str())
+                        })
+                    })
+                    .map(|project| project.id)
+                    .collect();
+                self.remote_sidebar_seed_pending = false;
+                self.update_app_settings(cx, true, |settings| {
+                    settings.sidebar_collapsed_projects = collapsed_projects;
+                    true
+                });
+            }
+        }
         cx.notify();
     }
 
@@ -198,10 +228,12 @@ impl Sidebar {
                             String::new(),
                             crate::surfaces::remote_client::model::agent_status(
                                 &runner_core::companion::SessionStatus {
+                                    startup_error: None,
                                     status: Status::NeedsYou,
                                     reason: Some(runner_core::companion::NeedsYouReason::Answer),
                                     unread: false,
                                     error_acknowledged: false,
+                                    interrupted_since: None,
                                 },
                             ),
                         ));
@@ -214,15 +246,24 @@ impl Sidebar {
                             project_id: mission.project.clone(),
                             cwd: None,
                             archived_at: None,
+                            linked_chat: mission.linked_chat.clone().map(|chat| {
+                                runner_core::protocol::LinkedChat {
+                                    session_id: chat.session_id,
+                                    title: chat.title,
+                                    archived: chat.archived,
+                                    reports: chat.reports,
+                                }
+                            }),
                         },
                         any_session_live: live,
                         session_statuses: statuses,
+                        phase: mission.phase.as_ref().and_then(|phase| phase.protocol()),
                     };
-                    let rollup = self.mission_status_rollup(&summary);
+                    let attention = self.mission_attention(&summary);
                     Some(SidebarRow::Mission {
                         node,
                         summary,
-                        attention: super::rows::status_attention(rollup.priority_value()),
+                        attention,
                     })
                 }
                 NodeType::Project => None,
@@ -252,13 +293,7 @@ impl Sidebar {
             return true;
         }
         match action {
-            SidebarMenuAction::NewChat(_) => self.front_page.supports(&["catalog", "startChat"]),
-            SidebarMenuAction::NewTerminal(_) => {
-                self.front_page.supports(&["startShell", "layout"])
-            }
-            SidebarMenuAction::NewMission(_) => {
-                self.front_page.supports(&["catalog", "startMission"])
-            }
+            SidebarMenuAction::NewChat(_) => self.front_page.supports(&["layout"]),
             SidebarMenuAction::TogglePin { .. } => self.front_page.supports(&["pin"]),
             SidebarMenuAction::Rename(_) => self.front_page.supports(&["rename"]),
             SidebarMenuAction::ForkChat(id) => {
@@ -286,21 +321,12 @@ impl Sidebar {
                 self.front_page.supports(&["close", "archive", "layout"])
             }
             SidebarMenuAction::ArchiveMission(_) => self.front_page.supports(&["archive"]),
+            // The companion protocol carries the link but no request to change it.
+            SidebarMenuAction::LinkToChat(_) | SidebarMenuAction::UnlinkMission(_) => false,
             SidebarMenuAction::StopMission(_) => self.front_page.supports(&["stopMission"]),
             SidebarMenuAction::ResumeMission(_) => self.front_page.supports(&["resumeMission"]),
             SidebarMenuAction::DeleteProject(_) => self.front_page.supports(&["deleteProject"]),
         }
-    }
-
-    pub(super) fn refresh_create_menu(&mut self, cx: &mut Context<Self>) {
-        let entries = sidebar_create_menu_entries(&self.settings(cx).keymap_overrides)
-            .into_iter()
-            .filter(|(_, action)| self.menu_action_supported(action, cx))
-            .collect::<Vec<_>>();
-        self.create_actions = entries.iter().map(|(_, action)| action.clone()).collect();
-        self.create_menu.update(cx, |menu, cx| {
-            menu.set_items(entries.into_iter().map(|(item, _)| item).collect(), cx)
-        });
     }
 }
 

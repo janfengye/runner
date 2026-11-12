@@ -26,6 +26,9 @@ const CLIENT_FIXTURES: &[&str] = &[
     "layout_split",
     "start_chat_role",
     "catalog",
+    "runtime_task_start",
+    "runtime_task",
+    "usage",
     "folders",
     "start_chat",
     "start_shell",
@@ -59,6 +62,7 @@ const CLIENT_FIXTURES: &[&str] = &[
     "take_control",
     "viewport",
     "detach",
+    "ping",
     "v1_without_later_fields",
     "unknown_request",
     "unknown_control",
@@ -68,6 +72,7 @@ const HOST_FIXTURES: &[&str] = &[
     "result_crew",
     "welcome",
     "result_catalog",
+    "result_usage",
     "result_folders",
     "result_session",
     "result_mission",
@@ -85,6 +90,7 @@ const HOST_FIXTURES: &[&str] = &[
     "error_unknown_request",
     "error_not_running",
     "error_failed",
+    "error_version_gate",
     "unsupported_version",
     "overview_push",
     "overview_without_sidebar",
@@ -105,6 +111,7 @@ const HOST_FIXTURES: &[&str] = &[
     "closed_stopped",
     "closed_archived",
     "closed_unknown",
+    "pong",
     "unknown_status",
     "unknown_reason",
     "unknown_push",
@@ -407,6 +414,29 @@ fn session_cwd_is_nullable_and_defaults_when_missing() {
             .as_deref(),
         Some("/Users/me/runner")
     );
+}
+
+#[test]
+fn a_mission_carries_its_linked_chat_and_phase_and_older_hosts_send_neither() {
+    let HostMessage::Overview(overview) = decode("overview_push") else {
+        panic!()
+    };
+    assert_eq!(
+        overview.missions[0].linked_chat,
+        Some(LinkedChat {
+            session_id: "01M60000000000000000000000".into(),
+            title: "Fix the feed".into(),
+            archived: false,
+            reports: true,
+        })
+    );
+    assert_eq!(overview.missions[0].phase, Some(MissionPhase::NeedsYou));
+    let HostMessage::Result(result) = decode("result_overview") else {
+        panic!()
+    };
+    let older: Overview = serde_json::from_value(result.result).unwrap();
+    assert_eq!(older.missions[0].linked_chat, None);
+    assert_eq!(older.missions[0].phase, None);
 }
 
 #[test]
@@ -734,6 +764,28 @@ fn status_idle_including_shell_and_unavailable_observations() {
 }
 
 #[test]
+fn status_carries_an_interrupted_members_mark_for_idle_members_only() {
+    let mut interrupted = agent(Lifecycle::Running, Activity::Idle, None);
+    interrupted.interrupted_since = Some(5);
+    let status = SessionStatus::from(&interrupted);
+    assert_eq!(status.status, Status::Idle);
+    assert_eq!(status.interrupted_since, Some(5));
+    let wire = serde_json::to_value(&status).unwrap();
+    assert_eq!(wire["interruptedSince"], 5);
+    assert_eq!(
+        serde_json::from_value::<SessionStatus>(wire).unwrap(),
+        status
+    );
+    interrupted.observation.activity = Activity::Working;
+    assert_eq!(SessionStatus::from(&interrupted).interrupted_since, None);
+    let older_host: SessionStatus = serde_json::from_value(
+        serde_json::json!({"status": "idle", "reason": null, "unread": false}),
+    )
+    .unwrap();
+    assert_eq!(older_host.interrupted_since, None);
+}
+
+#[test]
 fn status_starting_and_resuming_precede_interactions() {
     for lifecycle in [Lifecycle::Starting, Lifecycle::Resuming] {
         let status = SessionStatus::from(&agent(
@@ -1023,4 +1075,86 @@ fn retired_set_lead_request_is_unknown_but_retains_its_id() {
         serde_json::to_value(request.response()).unwrap()["code"],
         "unknownRequest"
     );
+}
+
+#[test]
+fn usage_result_has_a_sanitized_wire_type() {
+    let usage: Usage = serde_json::from_value(fixture("result_usage")["result"].clone()).unwrap();
+    assert_eq!(
+        serde_json::to_value(usage).unwrap(),
+        fixture("result_usage")["result"]
+    );
+}
+
+#[test]
+fn an_unknown_usage_error_preserves_the_reply_and_other_agents() {
+    let mut result = fixture("result_usage")["result"].clone();
+    result["agents"][1]["error"] = json!("futureReason");
+    let usage: Usage = serde_json::from_value(result.clone()).unwrap();
+    assert_eq!(
+        usage.agents[0].value.as_ref().unwrap().windows[0].used_percent,
+        41.
+    );
+    let reason = usage.agents[1].error.as_ref().unwrap();
+    assert_eq!(
+        reason,
+        &UsageUnavailableReason::Unrecognized("futureReason".into())
+    );
+    assert_eq!(reason.effective(), UsageUnavailableReason::InvalidResponse);
+    assert_eq!(serde_json::to_value(usage).unwrap(), result);
+}
+
+#[test]
+fn usage_conversions_preserve_values_and_known_errors() {
+    let usage: Usage = serde_json::from_value(fixture("result_usage")["result"].clone()).unwrap();
+    let value = usage.agents[0].value.clone().unwrap();
+    let internal: crate::protocol::usage::AgentUsage = value.clone().into();
+    assert_eq!(UsageValue::from(internal), value);
+    for reason in [
+        UsageUnavailableReason::SignIn,
+        UsageUnavailableReason::KeychainDenied,
+        UsageUnavailableReason::KeychainUnavailable,
+        UsageUnavailableReason::ClaudeUnreachable,
+        UsageUnavailableReason::CodexNoAnswer,
+        UsageUnavailableReason::InvalidResponse,
+    ] {
+        let internal: crate::protocol::usage::UnavailableReason = reason.clone().into();
+        assert_eq!(UsageUnavailableReason::from(internal), reason);
+    }
+    assert_eq!(
+        crate::protocol::usage::UnavailableReason::from(UsageUnavailableReason::Unrecognized(
+            "futureReason".into()
+        )),
+        crate::protocol::usage::UnavailableReason::InvalidResponse
+    );
+}
+
+#[test]
+fn update_recovery_wire_preserves_versions_and_startup_errors() {
+    let HostMessage::Error(error) = decode("error_version_gate") else {
+        panic!()
+    };
+    let gate = error.version_gate.unwrap();
+    assert_eq!(gate.runtime, crate::protocol::Runtime::Codex);
+    assert_eq!(gate.installed_version, "0.147.0");
+    assert_eq!(gate.min_version, "0.149.0");
+    let agent = AgentStatus {
+        lifecycle: Lifecycle::Stopped,
+        startup_error: Some(crate::protocol::StartupError {
+            message: "This Codex does not support Runner's hook type.".into(),
+            runtime: crate::protocol::Runtime::Codex,
+            output: "Error loading config.toml: unknown variant mcp_tool".into(),
+        }),
+        ..Default::default()
+    };
+    let status = SessionStatus::from(&agent);
+    let value = serde_json::to_value(&status).unwrap();
+    let decoded: SessionStatus = serde_json::from_value(value).unwrap();
+    assert_eq!(decoded.startup_error, agent.startup_error);
+    assert_eq!(decoded.status, Status::Stopped);
+    let old: SessionStatus = serde_json::from_value(json!({
+        "status":"stopped", "reason":null, "unread":false
+    }))
+    .unwrap();
+    assert!(old.startup_error.is_none());
 }

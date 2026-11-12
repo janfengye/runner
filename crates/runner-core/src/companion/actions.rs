@@ -88,8 +88,20 @@ pub enum ActionRequest {
         crew: String,
         order: Vec<String>,
     },
+    RuntimeTaskStart {
+        id: u64,
+        runtime: String,
+    },
+    RuntimeTask {
+        id: u64,
+        runtime: String,
+    },
     Catalog {
         id: u64,
+    },
+    Usage {
+        id: u64,
+        popover: bool,
     },
     Folders {
         id: u64,
@@ -219,6 +231,7 @@ impl ActionRequest {
             }};
         }
         match kind {
+            "runtimeTaskStart" | "runtimeTask" => fields!(runtime: String => "a string"),
             "role" => fields!(role: String => "a string"),
             "crew" => fields!(crew: String => "a string"),
             "createRole" => {
@@ -246,6 +259,7 @@ impl ActionRequest {
                 fields!(crew: String => "a string", order: Vec<String> => "an array of strings")
             }
             "catalog" => None,
+            "usage" => fields!(popover: bool => "a boolean"),
             "folders" => fields!(path: Option<String> => "a string or null"),
             "startChat" => {
                 fields!(role: Option<String> => "a string or null", runtime: Option<String> => "a string or null", model: Option<String> => "a string or null", effort: Option<String> => "a string or null", speed: Option<String> => "a string or null", project: Option<String> => "a string or null", cwd: Option<String> => "a string or null", cols: u16 => "an unsigned 16-bit integer", rows: u16 => "an unsigned 16-bit integer")
@@ -297,7 +311,10 @@ impl ActionRequest {
         "updateSlot",
         "removeSlot",
         "reorderSlots",
+        "runtimeTaskStart",
+        "runtimeTask",
         "catalog",
+        "usage",
         "folders",
         "startChat",
         "startShell",
@@ -333,7 +350,9 @@ impl ActionRequest {
             Self::UpdateSlot { id, .. } => *id,
             Self::RemoveSlot { id, .. } => *id,
             Self::ReorderSlots { id, .. } => *id,
+            Self::RuntimeTaskStart { id, .. } | Self::RuntimeTask { id, .. } => *id,
             Self::Catalog { id, .. } => *id,
+            Self::Usage { id, .. } => *id,
             Self::Folders { id, .. } => *id,
             Self::StartChat { id, .. } => *id,
             Self::StartShell { id, .. } => *id,
@@ -370,7 +389,9 @@ impl ActionRequest {
             Self::UpdateSlot { id, .. } => *id = value,
             Self::RemoveSlot { id, .. } => *id = value,
             Self::ReorderSlots { id, .. } => *id = value,
+            Self::RuntimeTaskStart { id, .. } | Self::RuntimeTask { id, .. } => *id = value,
             Self::Catalog { id, .. } => *id = value,
+            Self::Usage { id, .. } => *id = value,
             Self::Folders { id, .. } => *id = value,
             Self::StartChat { id, .. } => *id = value,
             Self::StartShell { id, .. } => *id = value,
@@ -508,6 +529,15 @@ pub struct CatalogRole {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogRuntime {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_version: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub below_minimum: bool,
+
     pub name: String,
     pub label: String,
     pub available: bool,
@@ -583,4 +613,105 @@ pub struct SlotRecord {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub speed: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Usage {
+    pub agents: Vec<UsageAgent>,
+    pub refreshing: bool,
+    pub active_claude_account: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UsageAgent {
+    pub name: String,
+    pub value: Option<UsageValue>,
+    pub error: Option<UsageUnavailableReason>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageValue {
+    pub windows: Vec<UsageWindow>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageWindow {
+    pub name: String,
+    pub used_percent: f64,
+    pub resets_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+super::wire_enum!(UsageUnavailableReason, InvalidResponse, {
+    SignIn => "signIn", KeychainDenied => "keychainDenied",
+    KeychainUnavailable => "keychainUnavailable", ClaudeUnreachable => "claudeUnreachable",
+    CodexNoAnswer => "codexNoAnswer", InvalidResponse => "invalidResponse",
+});
+
+impl From<crate::protocol::usage::AgentUsage> for UsageValue {
+    fn from(usage: crate::protocol::usage::AgentUsage) -> Self {
+        Self {
+            windows: usage.windows.into_iter().map(Into::into).collect(),
+            updated_at: usage.updated_at,
+        }
+    }
+}
+
+impl From<UsageValue> for crate::protocol::usage::AgentUsage {
+    fn from(usage: UsageValue) -> Self {
+        Self {
+            windows: usage.windows.into_iter().map(Into::into).collect(),
+            updated_at: usage.updated_at,
+        }
+    }
+}
+
+impl From<crate::protocol::usage::UsageWindow> for UsageWindow {
+    fn from(window: crate::protocol::usage::UsageWindow) -> Self {
+        Self {
+            name: window.name,
+            used_percent: window.used_percent,
+            resets_at: window.resets_at,
+        }
+    }
+}
+
+impl From<UsageWindow> for crate::protocol::usage::UsageWindow {
+    fn from(window: UsageWindow) -> Self {
+        Self {
+            name: window.name,
+            used_percent: window.used_percent,
+            resets_at: window.resets_at,
+        }
+    }
+}
+
+impl From<crate::protocol::usage::UnavailableReason> for UsageUnavailableReason {
+    fn from(reason: crate::protocol::usage::UnavailableReason) -> Self {
+        use crate::protocol::usage::UnavailableReason as Reason;
+        match reason {
+            Reason::SignIn => Self::SignIn,
+            Reason::KeychainDenied => Self::KeychainDenied,
+            Reason::KeychainUnavailable => Self::KeychainUnavailable,
+            Reason::ClaudeUnreachable => Self::ClaudeUnreachable,
+            Reason::CodexNoAnswer => Self::CodexNoAnswer,
+            Reason::InvalidResponse => Self::InvalidResponse,
+        }
+    }
+}
+
+impl From<UsageUnavailableReason> for crate::protocol::usage::UnavailableReason {
+    fn from(reason: UsageUnavailableReason) -> Self {
+        match reason.effective() {
+            UsageUnavailableReason::SignIn => Self::SignIn,
+            UsageUnavailableReason::KeychainDenied => Self::KeychainDenied,
+            UsageUnavailableReason::KeychainUnavailable => Self::KeychainUnavailable,
+            UsageUnavailableReason::ClaudeUnreachable => Self::ClaudeUnreachable,
+            UsageUnavailableReason::CodexNoAnswer => Self::CodexNoAnswer,
+            _ => Self::InvalidResponse,
+        }
+    }
 }

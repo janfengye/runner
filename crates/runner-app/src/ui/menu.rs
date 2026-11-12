@@ -14,7 +14,16 @@ use crate::ui::scrollbar::Scrollbar;
 use crate::ui::tooltip::tooltip_view;
 
 pub type MenuHandler = Rc<dyn Fn(usize, &mut Window, &mut App)>;
+/// Opens an item's submenu beside the item's row, whose bounds it is given.
+pub type SubmenuHandler = Rc<dyn Fn(usize, Bounds<Pixels>, &mut Window, &mut App)>;
 pub type DismissHandler = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// Text shown in place of a popover's icon trigger, followed by a chevron.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MenuTriggerLabel {
+    pub text: SharedString,
+    pub color: gpui::Hsla,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MenuItem {
@@ -30,6 +39,9 @@ pub struct MenuItem {
     pub accent: bool,
     pub disabled: bool,
     pub separator_before: bool,
+    /// Opens a submenu beside the row instead of acting and closing the menu.
+    pub submenu: bool,
+    header: bool,
 }
 
 impl MenuItem {
@@ -58,6 +70,8 @@ impl MenuItem {
             accent: false,
             disabled: false,
             separator_before: false,
+            submenu: false,
+            header: false,
         }
     }
 
@@ -103,6 +117,21 @@ impl MenuItem {
 
     pub fn separator_before(mut self, separator_before: bool) -> Self {
         self.separator_before = separator_before;
+        self
+    }
+
+    /// The item opens a submenu: a chevron marks it, and choosing it keeps the
+    /// menu open while the submenu shows beside it.
+    pub fn submenu(mut self) -> Self {
+        self.submenu = true;
+        self
+    }
+
+    /// A read-only block: the small label above its description, which is set in the monospace
+    /// font. It is never highlighted, activated or counted by keyboard navigation.
+    pub fn header(mut self) -> Self {
+        self.header = true;
+        self.disabled = true;
         self
     }
 }
@@ -355,6 +384,9 @@ pub struct PopoverMenu {
     trigger_size: IconButtonSize,
     trigger_icon: SharedString,
     trigger_tooltip: Option<crate::i18n::Text>,
+    trigger_label: Option<MenuTriggerLabel>,
+    on_trigger_press: Option<DismissHandler>,
+    on_trigger_double_click: Option<DismissHandler>,
     return_focus: Option<FocusHandle>,
     menu_scroll: ScrollHandle,
     menu_scrollbar: Entity<Scrollbar>,
@@ -384,6 +416,9 @@ impl PopoverMenu {
             trigger_size: IconButtonSize::Md,
             trigger_icon: "more-horizontal.svg".into(),
             trigger_tooltip: Some(crate::i18n::message("ui.more_actions")),
+            trigger_label: None,
+            on_trigger_press: None,
+            on_trigger_double_click: None,
             return_focus: None,
             menu_scroll,
             menu_scrollbar,
@@ -426,6 +461,30 @@ impl PopoverMenu {
         self
     }
 
+    /// A press on a text trigger runs `handler` first; the focus it leaves
+    /// is where the menu returns focus when it closes.
+    pub fn on_trigger_press(mut self, handler: impl Fn(&mut Window, &mut App) + 'static) -> Self {
+        self.on_trigger_press = Some(Rc::new(handler));
+        self
+    }
+
+    /// A double-click on a text trigger runs `handler` instead of opening
+    /// the menu.
+    pub fn on_trigger_double_click(
+        mut self,
+        handler: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_trigger_double_click = Some(Rc::new(handler));
+        self
+    }
+
+    pub fn set_trigger_label(&mut self, label: MenuTriggerLabel, cx: &mut Context<Self>) {
+        if self.trigger_label.as_ref() != Some(&label) {
+            self.trigger_label = Some(label);
+            cx.notify();
+        }
+    }
+
     pub fn set_items_and_handler(
         &mut self,
         items: Vec<MenuItem>,
@@ -452,6 +511,15 @@ impl PopoverMenu {
     pub fn close(&mut self, cx: &mut Context<Self>) {
         self.state.close();
         cx.notify();
+    }
+
+    /// The labels as of the last render, which is when they follow the language.
+    #[cfg(test)]
+    pub(crate) fn labels(&self) -> Vec<String> {
+        self.items
+            .iter()
+            .map(|item| item.label.to_string())
+            .collect()
     }
 
     fn restore_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -515,6 +583,40 @@ impl PopoverMenu {
             .enumerate()
             .map(|(index, mut item)| {
                 item.relocalize();
+                if item.header {
+                    return div().w_full().child(
+                        div()
+                            .w_full()
+                            .px(rems(10. / 16.))
+                            .py(rems(6. / 16.))
+                            .flex()
+                            .flex_col()
+                            .gap(rems(2. / 16.))
+                            .child(
+                                div()
+                                    .when(cfg!(test), |label| {
+                                        label.debug_selector(move || {
+                                            format!("POPOVER_LABEL_{index}")
+                                        })
+                                    })
+                                    .text_size(theme::text_meta())
+                                    .text_color(theme::faint())
+                                    .child(item.label),
+                            )
+                            .children(item.description.map(|value| {
+                                div()
+                                    .when(cfg!(test), |value| {
+                                        value.debug_selector(move || {
+                                            format!("POPOVER_VALUE_{index}")
+                                        })
+                                    })
+                                    .font_family(theme::UI_MONOSPACE_FONT)
+                                    .text_size(rems(12. / 16.))
+                                    .text_color(theme::muted())
+                                    .child(value)
+                            })),
+                    );
+                }
                 let active = self.state.highlighted == index;
                 let click_entity = menu_entity.clone();
                 let hover_entity = menu_entity.clone();
@@ -681,16 +783,79 @@ impl Render for PopoverMenu {
         let zoom = app_zoom(window);
         let entity = cx.entity();
         let click_entity = entity.clone();
-        let trigger = IconButton::new("popover-trigger", self.trigger_icon.clone())
-            .size(self.trigger_size)
-            .focus_handle(self.focus_handle.clone())
-            .keyboard_activation(false)
-            .on_press(move |window, cx| {
-                click_entity.update(cx, |menu, cx| menu.toggle(window, cx));
-            });
-        let trigger = match self.trigger_tooltip.clone() {
-            Some(tooltip) => trigger.tooltip(tooltip.resolve()),
-            None => trigger,
+        let labelled = self.trigger_label.is_some();
+        let trigger = if let Some(label) = self.trigger_label.clone() {
+            let mouse_focus = self.focus_handle.clone();
+            let press = self.on_trigger_press.clone();
+            let press_entity = entity.clone();
+            let double_click = self.on_trigger_double_click.clone();
+            div()
+                .id("popover-trigger")
+                .max_w_full()
+                .h_full()
+                .min_w(px(0.))
+                .flex()
+                .items_center()
+                .gap(rems(4. / 16.))
+                .px(rems(6. / 16.))
+                .rounded(rems(6. / 16.))
+                .cursor_pointer()
+                .when(self.state.open, |trigger| trigger.bg(theme::raised()))
+                .hover(|trigger| trigger.bg(theme::raised()))
+                .child(
+                    div()
+                        .min_w(px(0.))
+                        .truncate()
+                        .text_size(theme::text_ui())
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(label.color)
+                        .child(label.text),
+                )
+                .child(
+                    svg()
+                        .flex_none()
+                        .path("chevron-down.svg")
+                        .size(rems(12. / 16.))
+                        .text_color(theme::faint()),
+                )
+                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                    cx.stop_propagation();
+                    if let Some(press) = &press {
+                        press(window, cx);
+                        let focused = window.focused(cx);
+                        press_entity.update(cx, |menu, _| {
+                            if !menu.state.open {
+                                menu.return_focus = focused;
+                            }
+                        });
+                    }
+                    mouse_focus.focus(window, cx);
+                })
+                .on_click(move |event, window, cx| {
+                    cx.stop_propagation();
+                    if let Some(double_click) =
+                        double_click.as_ref().filter(|_| event.click_count() >= 2)
+                    {
+                        click_entity.update(cx, |menu, cx| menu.close(cx));
+                        double_click(window, cx);
+                        return;
+                    }
+                    click_entity.update(cx, |menu, cx| menu.toggle(window, cx));
+                })
+                .into_any_element()
+        } else {
+            let trigger = IconButton::new("popover-trigger", self.trigger_icon.clone())
+                .size(self.trigger_size)
+                .focus_handle(self.focus_handle.clone())
+                .keyboard_activation(false)
+                .on_press(move |window, cx| {
+                    click_entity.update(cx, |menu, cx| menu.toggle(window, cx));
+                });
+            match self.trigger_tooltip.clone() {
+                Some(tooltip) => trigger.tooltip(tooltip.resolve()),
+                None => trigger,
+            }
+            .into_any_element()
         };
         let capture = cx.entity();
         let mut root = div()
@@ -707,8 +872,18 @@ impl Render for PopoverMenu {
                 trigger.debug_selector(|| "POPOVER_TRIGGER".into())
             })
             .relative()
-            .size(rems(self.trigger_size.button_size() / 16.))
-            .flex_none()
+            .map(|root| {
+                if labelled {
+                    root.w_full()
+                        .min_w(px(0.))
+                        .h(rems(26. / 16.))
+                        .flex()
+                        .items_center()
+                } else {
+                    root.size(rems(self.trigger_size.button_size() / 16.))
+                        .flex_none()
+                }
+            })
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
             .child(trigger)
@@ -762,6 +937,8 @@ pub struct ContextMenu {
     on_activate: MenuHandler,
     on_dismiss: DismissHandler,
     return_focus: Option<FocusHandle>,
+    on_submenu: Option<SubmenuHandler>,
+    row_bounds: Rc<std::cell::RefCell<std::collections::HashMap<usize, Bounds<Pixels>>>>,
 }
 
 impl ContextMenu {
@@ -785,7 +962,15 @@ impl ContextMenu {
             on_activate,
             on_dismiss,
             return_focus: None,
+            on_submenu: None,
+            row_bounds: Default::default(),
         }
+    }
+
+    /// Handles the items marked `submenu`.
+    pub fn on_submenu(mut self, handler: SubmenuHandler) -> Self {
+        self.on_submenu = Some(handler);
+        self
     }
 
     /// Opens under `anchor`, the button that opened the menu, the way a
@@ -827,6 +1012,20 @@ impl ContextMenu {
         if self.items.get(index).is_none_or(|item| item.disabled) {
             return;
         }
+        if self.items[index].submenu {
+            if let Some(handler) = self.on_submenu.clone() {
+                self.state.highlighted = index;
+                let bounds = self
+                    .row_bounds
+                    .borrow()
+                    .get(&index)
+                    .copied()
+                    .unwrap_or_default();
+                handler(index, bounds, window, cx);
+                cx.notify();
+                return;
+            }
+        }
         self.state.close();
         if self.focus_handle.is_focused(window) {
             if let Some(focus) = self.return_focus.take() {
@@ -839,6 +1038,14 @@ impl ContextMenu {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.key == "right" {
+            let index = self.state.highlighted;
+            if self.items.get(index).is_some_and(|item| item.submenu) {
+                cx.stop_propagation();
+                self.activate(index, window, cx);
+            }
+            return;
+        }
         let key = match event.keystroke.key.as_str() {
             "up" => Some(MenuKey::Up),
             "down" => Some(MenuKey::Down),
@@ -882,8 +1089,21 @@ impl ContextMenu {
                     theme::text()
                 };
                 let separator_before = item.separator_before;
+                let submenu = item.submenu;
+                let measured = Rc::clone(&self.row_bounds);
                 let row = div()
                     .id(("context-menu-item", index))
+                    .relative()
+                    .child(
+                        canvas(
+                            move |bounds, _, _| {
+                                measured.borrow_mut().insert(index, bounds);
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .inset_0(),
+                    )
                     .when(cfg!(test), |row| {
                         row.debug_selector(move || format!("CONTEXT_MENU_ITEM_{index}"))
                     })
@@ -949,6 +1169,15 @@ impl ContextMenu {
                             .text_color(theme::faint())
                             .child(shortcut)
                     }))
+                    .when(submenu, |row| {
+                        row.child(
+                            svg()
+                                .flex_none()
+                                .path("chevron-right.svg")
+                                .size(rems(12. / 16.))
+                                .text_color(theme::faint()),
+                        )
+                    })
                     .when_some(item.tooltip, |row, tooltip| {
                         row.tooltip(move |_, cx| tooltip_view(tooltip.clone(), cx))
                     })
@@ -1033,7 +1262,7 @@ fn context_menu_width(zoom: f32) -> (Pixels, Pixels) {
     (px(160. * zoom), px(320. * zoom))
 }
 
-pub(crate) fn context_menu_layer(
+pub fn context_menu_layer(
     position: gpui::Point<Pixels>,
     window: &Window,
     width: Pixels,
@@ -1467,6 +1696,25 @@ mod tests {
             MenuAction::Activate(2)
         );
         assert!(!state.open);
+    }
+
+    #[test]
+    fn a_header_is_never_highlighted_or_activated() {
+        let items = vec![
+            MenuItem::new("Fingerprint").description("ab cd").header(),
+            MenuItem::new("Revoke").separator_before(true),
+        ];
+        let mut state = MenuState::default();
+        assert_eq!(state.handle_key(MenuKey::Up, &items), MenuAction::None);
+        assert_eq!(state.highlighted, 1);
+        state.handle_key(MenuKey::Up, &items);
+        assert_eq!(state.highlighted, 1);
+        state.handle_key(MenuKey::Down, &items);
+        assert_eq!(state.highlighted, 1);
+        assert_eq!(
+            state.handle_key(MenuKey::Enter, &items),
+            MenuAction::Activate(1)
+        );
     }
 
     #[test]

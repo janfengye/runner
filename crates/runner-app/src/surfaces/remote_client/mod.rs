@@ -9,17 +9,18 @@ mod project;
 mod start_chat;
 #[cfg(test)]
 pub(crate) mod tests;
-mod transport;
+pub(crate) mod transport;
+mod usage;
 mod workspace;
 
 use crate::*;
 use gpui::{svg, FontWeight};
 use model::{computer_rows, state, Access, Command, Connection};
-use runner_app::ui::menu::popup_layer;
 use runner_app::ui::ButtonVariant;
-use runner_core::remote::{Computer, RemoteStatus, RemoteTrust};
+use runner_core::remote::{Computer, DeviceKind, PairedDevice, RemoteStatus, RemoteTrust};
 
 pub(crate) use pairing::PairDialog;
+pub(crate) use usage::usage_snapshot;
 pub(crate) use workspace::{sidebar_nodes, Item as RemoteItem, RemoteWindow};
 
 pub(crate) struct RemoteClient {
@@ -27,6 +28,7 @@ pub(crate) struct RemoteClient {
     workspace: Option<RemoteWindow>,
     app_store: Entity<AppStore>,
     root_focus: FocusHandle,
+    usage_popover: Option<usage::UsageWatch>,
     _subscription: Subscription,
 }
 
@@ -41,6 +43,7 @@ impl RemoteClient {
         Self {
             ui: ClientUi::new(cx),
             workspace: None,
+            usage_popover: None,
             app_store,
             root_focus,
             _subscription: subscription,
@@ -63,6 +66,7 @@ impl RemoteClient {
     }
     pub(crate) fn disconnect(&mut self) {
         self.workspace = None;
+        self.usage_popover = None;
     }
     pub(crate) fn client(&self, cx: &App) -> crate::surfaces::front_page::FrontPageClient {
         self.workspace
@@ -79,7 +83,7 @@ impl RemoteClient {
         &self.app_store.read(cx).settings
     }
     fn terminal_style(&self, cx: &App) -> crate::terminal::element::TerminalStyle {
-        let mut style = crate::surfaces::app_shell::terminal_style_for(self.settings(cx));
+        let mut style = crate::surfaces::app_shell::terminal_style_for(self.settings(cx), cx);
         if let Some(palette) = self.remote_terminal_palette(cx) {
             style.palette = palette;
         }
@@ -91,13 +95,15 @@ impl RemoteClient {
 pub(crate) struct RemoteSelection {
     active: Option<RemoteItem>,
     layouts: HashMap<String, PaneLayout>,
-    sidebar_settings: Option<AppSettings>,
 }
 
 pub(crate) struct ClientUi {
     pub(crate) picker_open: bool,
+    pub(crate) picker_signed_in: bool,
     pub(crate) picker_focus: FocusHandle,
+    pub(crate) host_focus: FocusHandle,
     pub(crate) anchor: Option<Bounds<Pixels>>,
+    pub(crate) footer_left: Option<Pixels>,
     pub(crate) pair: Option<PairDialog>,
     menus: std::cell::RefCell<HashMap<String, Entity<PopoverMenu>>>,
     pub(crate) pair_generation: u64,
@@ -108,8 +114,11 @@ impl ClientUi {
     pub(crate) fn new(cx: &mut Context<NativeRoot>) -> Self {
         Self {
             picker_focus: cx.focus_handle(),
+            host_focus: cx.focus_handle(),
             picker_open: false,
+            picker_signed_in: false,
             anchor: None,
+            footer_left: None,
             pair: None,
             menus: Default::default(),
             pair_generation: 0,
@@ -146,6 +155,14 @@ fn status_label(computer: &Computer, connected: bool) -> String {
         .unwrap_or_else(|| crate::i18n::text("client.offline").into())
 }
 
+fn device_status(device: &PairedDevice, connected: bool) -> String {
+    if connected {
+        return crate::i18n::text("client.connected_here").into();
+    }
+    let time = runner_app::text_util::format_relative_time(device.last_seen_at, chrono::Utc::now());
+    crate::i18n::tf("client.offline_seen", &[("time", time)])
+}
+
 fn seen_time(value: &str) -> String {
     let Ok(time) = chrono::DateTime::parse_from_rfc3339(value) else {
         return value.into();
@@ -163,7 +180,7 @@ impl RemoteClient {
     fn computer_menu(
         &self,
         computer: Option<&Computer>,
-        devices: &[&runner_core::remote::PairedDevice],
+        devices: &[&PairedDevice],
         cx: &mut Context<NativeRoot>,
     ) -> Option<Entity<PopoverMenu>> {
         let incoming = devices
@@ -179,12 +196,29 @@ impl RemoteClient {
             .unwrap_or_else(|| incoming.join("-"));
         let menu_key = format!("computer-menu-{key}");
         let owner = cx.weak_entity();
+        // A device with no account computer has no name to tell it apart by but its fingerprint.
+        let fingerprint = computer
+            .is_none()
+            .then(|| incoming.first().cloned())
+            .flatten();
+        let revoke_index = usize::from(fingerprint.is_some());
         let mut items = Vec::new();
+        if let Some(fingerprint) = &fingerprint {
+            items.push(
+                UiMenuItem::new(crate::i18n::message("remote.fingerprint"))
+                    .description(fingerprint.clone())
+                    .header(),
+            );
+        }
         if !incoming.is_empty() {
-            items.push(UiMenuItem::new(crate::i18n::text("remote.revoke")).icon("shield-x.svg"));
+            items.push(
+                UiMenuItem::new(crate::i18n::message("remote.revoke"))
+                    .icon("shield-x.svg")
+                    .separator_before(fingerprint.is_some()),
+            );
         }
         if outgoing.is_some() {
-            items.push(UiMenuItem::new(crate::i18n::text("client.forget")).icon("unplug.svg"));
+            items.push(UiMenuItem::new(crate::i18n::message("client.forget")).icon("unplug.svg"));
         }
         // Key by available actions too, so a successful pair refreshes the menu.
         let key = format!("{key}-{}-{}", incoming.join("-"), outgoing.is_some());
@@ -195,13 +229,13 @@ impl RemoteClient {
                 .entry(key)
                 .or_insert_with(|| {
                     cx.new(|cx| {
-                        PopoverMenu::new(
+                        let menu = PopoverMenu::new(
                             menu_key,
                             cx.focus_handle(),
                             items,
                             Rc::new(move |index, _, cx| {
                                 let _ = owner.update(cx, |root, cx| {
-                                    if !incoming.is_empty() && index == 0 {
+                                    if !incoming.is_empty() && index == revoke_index {
                                         let client = root.core(cx).clone();
                                         let fingerprints = incoming.clone();
                                         let store = root.app_store.clone();
@@ -236,7 +270,12 @@ impl RemoteClient {
                             cx,
                         )
                         .trigger_icon("more-horizontal.svg")
-                        .trigger_size(IconButtonSize::Sm)
+                        .trigger_size(IconButtonSize::Sm);
+                        if fingerprint.is_some() {
+                            menu.min_width(px(240.))
+                        } else {
+                            menu
+                        }
                     })
                 })
                 .clone(),
@@ -256,6 +295,11 @@ impl RemoteClient {
         }
         let rows = computer_rows(&computers, trust);
         let count = rows.len();
+        let this_name = computers
+            .iter()
+            .find(|computer| computer.is_self)
+            .map(|computer| computer.name.clone())
+            .unwrap_or_default();
         let mut table = div()
             .flex()
             .flex_col()
@@ -277,7 +321,7 @@ impl RemoteClient {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .child(crate::i18n::text("remote.computer")),
+                            .child(crate::i18n::text("remote.device")),
                     )
                     .child(
                         div()
@@ -292,9 +336,11 @@ impl RemoteClient {
                     .child(div().w(rems(42. / 16.))),
             );
         for row in rows {
-            let name = row.computer.map(|c| c.name.clone()).unwrap_or_else(|| {
-                format!("{} · {}", row.devices[0].fingerprint, row.devices[0].name)
-            });
+            let device = row.computer.is_none().then(|| row.devices[0]);
+            let name = row
+                .computer
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| model::device_title(row.devices[0]).to_owned());
             let connected = row.devices.iter().any(|d| d.connected);
             let menu = self.computer_menu(row.computer, &row.devices, cx);
             let mut action = div().w(rems(42. / 16.)).flex_none();
@@ -328,17 +374,7 @@ impl RemoteClient {
             let status = row
                 .computer
                 .map(|c| status_label(c, connected))
-                .unwrap_or_else(|| {
-                    if connected {
-                        crate::i18n::text("client.connected_here").into()
-                    } else {
-                        row.devices[0]
-                            .last_seen_at
-                            .with_timezone(&chrono::Local)
-                            .format("%Y-%m-%d %H:%M")
-                            .to_string()
-                    }
-                });
+                .unwrap_or_else(|| device_status(row.devices[0], connected));
             table = table.child(
                 div()
                     .debug_selector(|| "REMOTE_COMPUTER_ROW".into())
@@ -360,7 +396,16 @@ impl RemoteClient {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(icon("monitor.svg", theme::muted()))
+                            .child(
+                                icon(
+                                    device.map_or("monitor.svg", model::device_icon),
+                                    theme::muted(),
+                                )
+                                .when(
+                                    device.is_some_and(|d| d.kind == DeviceKind::Phone),
+                                    |icon| icon.debug_selector(|| "REMOTE_PHONE_ICON".into()),
+                                ),
+                            )
                             .child(div().truncate().child(name))
                             .children((row.access == Access::This).then(|| {
                                 div()
@@ -419,7 +464,10 @@ impl RemoteClient {
                 .py_3()
                 .text_size(theme::text_meta())
                 .text_color(theme::faint())
-                .child(crate::i18n::text("client.list_hint")),
+                .child(crate::i18n::tf(
+                    "client.list_hint",
+                    &[("computer", this_name)],
+                )),
         );
         div()
             .debug_selector(|| "REMOTE_DEVICES".into())

@@ -61,6 +61,8 @@ pub(crate) fn run() -> Result<()> {
                     .collect(),
             )
             .expect("bundled fonts must be valid");
+        #[cfg(target_os = "macos")]
+        crate::terminal::fonts::register_bundled_font_for_fallback();
 
         #[cfg(target_os = "macos")]
         install_app_icon();
@@ -106,15 +108,18 @@ pub(crate) fn run() -> Result<()> {
             )
         });
         let keymap_overrides = app_store.read(cx).settings.keymap_overrides.clone();
+        let terminal_ctrl_keys = app_store.read(cx).settings.terminal_ctrl_keys();
         #[cfg(target_os = "macos")]
         let automatically_check_for_updates =
             app_store.read(cx).settings.automatically_check_for_updates;
         #[cfg(any(windows, target_os = "linux"))]
         let automatically_download_updates =
             app_store.read(cx).settings.automatically_download_updates;
-        keymap::install_bindings(cx, &keymap_overrides, false);
+        let skipped_update_version = app_store.read(cx).settings.skipped_update_version.clone();
+        keymap::install_bindings(cx, &keymap_overrides, terminal_ctrl_keys, false);
         cx.set_global(GlobalAppStore(app_store));
         notifications::install(cx);
+        crate::terminal::clipboard::install(cx);
         cx.set_global(GlobalNativePaths(paths.clone()));
         #[cfg(target_os = "macos")]
         let updater = cx.new(|cx| Updater::new(automatically_check_for_updates, cx));
@@ -125,6 +130,9 @@ pub(crate) fn run() -> Result<()> {
                 paths.app_data_dir.join("updates"),
                 cx,
             )
+        });
+        updater.update(cx, |updater, _| {
+            updater.set_skipped_version(skipped_update_version)
         });
         cx.set_global(GlobalUpdater(updater.clone()));
         updater.read(cx).start();
@@ -237,15 +245,6 @@ pub(crate) fn run() -> Result<()> {
                 });
             }
         });
-        cx.on_action(|_: &Maximize, cx| {
-            if let Some(window) = cx.active_window() {
-                cx.defer(move |cx| {
-                    if let Err(error) = window.update(cx, |_, window, _| window.zoom_window()) {
-                        eprintln!("Runner maximize failed: {error:#}");
-                    }
-                });
-            }
-        });
         cx.on_action(|_: &CloseTab, cx| {
             if let Some(window) = cx
                 .active_window()
@@ -283,7 +282,35 @@ pub(crate) fn run() -> Result<()> {
             platform_ui::show_about_panel();
         });
         cx.on_action(|_: &CheckForUpdates, cx| {
-            global_updater(cx).read(cx).check_for_updates();
+            let active = cx.active_window();
+            cx.defer(move |cx| {
+                let native_window = |cx: &App| {
+                    cx.windows()
+                        .into_iter()
+                        .find_map(|window| window.downcast::<NativeRoot>())
+                };
+                let mut window = active
+                    .and_then(|window| window.downcast::<NativeRoot>())
+                    .or_else(|| native_window(cx));
+                if window.is_none() {
+                    if let Err(error) = open_new_runner_window(None, cx) {
+                        eprintln!("Runner check for updates failed: {error:#}");
+                        return;
+                    }
+                    window = native_window(cx);
+                }
+                let Some(window) = window else {
+                    return;
+                };
+                cx.activate(true);
+                let result = window.update(cx, |root, window, cx| {
+                    window.activate_window();
+                    crate::surfaces::update_ui::check_for_updates_from_menu(root, window, cx);
+                });
+                if let Err(error) = result {
+                    eprintln!("Runner check for updates failed: {error:#}");
+                }
+            });
         });
         cx.set_menus(app_menus());
 
@@ -310,10 +337,14 @@ pub(crate) fn run() -> Result<()> {
             }
         }
         if restored_labels.is_empty() {
-            restored_labels.push(
-                open_runner_window("main".into(), None, None, cx)
-                    .expect("fallback Runner window must open after restore failures"),
-            );
+            match open_runner_window("main".into(), None, None, cx) {
+                Ok(label) => restored_labels.push(label),
+                Err(error) => {
+                    eprintln!("Runner could not open a window: {error:#}");
+                    // A normal quit would save this windowless layout over the saved one.
+                    std::process::exit(1);
+                }
+            }
         }
         if let Some(label) = restored_labels.last() {
             focus_other_window(label, cx);
@@ -414,7 +445,6 @@ pub(crate) fn app_menus() -> Vec<Menu> {
             disabled: false,
             items: vec![
                 MenuItem::action(crate::i18n::text("ui.minimize"), Minimize),
-                MenuItem::action(crate::i18n::text("ui.maximize"), Maximize),
                 MenuItem::separator(),
                 MenuItem::action(crate::i18n::text("ui.close_tab"), CloseTab),
                 MenuItem::action(crate::i18n::text("ui.close_window"), CloseWindow),

@@ -184,7 +184,9 @@ fn test_core_with_runtime(root: &std::path::Path, runtime: Arc<dyn SessionRuntim
         mission_grid_hint: Arc::new(std::sync::Mutex::new(None)),
         windows,
         events: crate::events::EventChannel::new(),
+        files: Default::default(),
         session_event_observer: Default::default(),
+        reports: Default::default(),
         app_version: "0.0.0-test".into(),
     }
 }
@@ -611,6 +613,70 @@ fn queued_user_input_reports_backend_errors_without_blocking_the_caller() {
         .contains("session not found"));
 }
 
+/// OSC 52 writes leave the daemon only as an in-memory `session/clipboard` event.
+#[test]
+fn osc52_writes_are_emitted_as_session_clipboard_events() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = Arc::new(RecordingRuntime::default());
+    let core = test_core_with_runtime(temp.path(), Arc::clone(&runtime) as _);
+    let role = crate::ops::role::create(
+        &core.db.get().unwrap(),
+        crate::ops::role::CreateRoleInput {
+            handle: "probe".into(),
+            display_name: "Probe".into(),
+            runtime: crate::model::Runtime::Trae,
+            command: "probe".into(),
+            args: Vec::new(),
+            working_dir: None,
+            system_prompt: None,
+            env: Default::default(),
+            model: None,
+            effort: None,
+            codex_speed: None,
+            permission_mode: crate::router::runtime::PermissionMode::Auto,
+        },
+    )
+    .unwrap();
+    let spawned = core
+        .sessions
+        .spawn_direct(
+            &role,
+            None,
+            None,
+            None,
+            None,
+            Some(temp.path().to_str().unwrap()),
+            Some(80),
+            Some(24),
+            &core.app_data_dir,
+            Arc::clone(&core.db),
+            Arc::new(core.session_events()),
+            None,
+        )
+        .unwrap();
+    let mut events = core.events.subscribe();
+    runtime.push_output(b"\x1b]52;c;cnVubmVyLW9zYzUy\x07\x1b]52;p;cHJpbWFyeQ==\x1b\\");
+
+    let mut received = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while received.len() < 2 && std::time::Instant::now() < deadline {
+        match events.try_recv() {
+            Ok(event) if event.name == "session/clipboard" => received.push(event.payload),
+            Ok(_) => {}
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    }
+    assert_eq!(
+        received,
+        [
+            serde_json::json!({"session_id": spawned.id, "target": "clipboard", "text": "runner-osc52"}),
+            serde_json::json!({"session_id": spawned.id, "target": "selection", "text": "primary"}),
+        ]
+    );
+    assert!(runtime.writes().is_empty(), "a write is not answered");
+    core.sessions.kill(&spawned.id).ok();
+}
+
 /// Stands in for the PTY: hands the manager a live output channel
 /// and records every byte the manager writes back to stdin.
 #[derive(Default)]
@@ -878,7 +944,7 @@ fn keys_follow_the_apps_kitty_keyboard_mode() {
         ]
     );
 
-    session.configure(3, CursorShape::Beam);
+    session.configure(3, CursorShape::Beam, true);
     alt_d();
     assert_eq!(
         wait_for(10)[9],
@@ -1236,7 +1302,7 @@ fn terminal_configuration_applies_scrollback_and_cursor_shape() {
     let waker: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
     let terminal = TerminalSession::attach(core, "replay-race".into(), 80, 5, waker).unwrap();
 
-    terminal.configure(3, CursorShape::Beam);
+    terminal.configure(3, CursorShape::Beam, true);
     terminal
         .feed_output(&output(1, &"configured line\r\n".repeat(20)))
         .unwrap();
@@ -1277,7 +1343,7 @@ fn terminal_selection_matches_xterm_words_wraps_and_line_copy() {
         UserInputMode::Queued,
     )
     .unwrap();
-    terminal.configure(100, CursorShape::Block);
+    terminal.configure(100, CursorShape::Block, true);
     assert!(terminal.cell_is_whitespace(Point::new(Line(100), Column(100))));
     {
         let mut term = terminal.term.lock();

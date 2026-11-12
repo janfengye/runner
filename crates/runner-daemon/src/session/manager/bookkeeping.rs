@@ -178,11 +178,12 @@ impl SessionManager {
         let gate = session.lock().unwrap().delivery_gate.clone();
         let delivery = gate.state.lock().unwrap();
         let session = session.lock().unwrap();
-        session
-            .handle
-            .as_ref()
-            .is_some_and(|handle| handle.startup.is_none())
-            && !session.model.status().observation.needs_you()
+        session.handle.as_ref().is_some_and(|handle| {
+            handle
+                .startup
+                .as_ref()
+                .is_none_or(|startup| startup.reports_only)
+        }) && !session.model.status().observation.needs_you()
             && !delivery.in_flight
             && delivery.next_ticket == delivery.next_served
             && session.model.draft_quiescent(crate::session::clock::now())
@@ -231,8 +232,13 @@ impl SessionManager {
                     .unwrap_or(0),
             ),
             turn_started: session.turn_started,
+            prompted: session.delivery_prompted,
             runtime: session.delivery_runtime.clone(),
             unsent: session.model.unsent_notice(),
+            held: session
+                .terminal
+                .as_ref()
+                .is_some_and(|terminal| terminal.delivery_held()),
         })
     }
 
@@ -272,6 +278,41 @@ impl SessionManager {
             .map(|written| written.is_some())
     }
 
+    pub fn confirm_delivery(&self, session_id: &str, snapshot: &router::DeliverySnapshot) {
+        let Some(session) = self.session_state(session_id) else {
+            return;
+        };
+        let gate = session.lock().unwrap().delivery_gate.clone();
+        let delivery = gate.state.lock().unwrap();
+        let Some(terminal) = session.lock().unwrap().terminal.clone() else {
+            return;
+        };
+        if delivery.generation != snapshot.generation
+            || delivery.next_ticket != snapshot.input_revision.0
+        {
+            return;
+        }
+        let observation = terminal.confirm_delivery(snapshot.input_revision.1);
+        drop(delivery);
+        terminal.publish_input(observation);
+    }
+
+    pub fn recheck_composer(&self, session_id: &str) {
+        let Some(session) = self.session_state(session_id) else {
+            return;
+        };
+        let terminal = {
+            let session = session.lock().unwrap();
+            if session.model.activity() != Some(SessionActivityState::Idle) {
+                return;
+            }
+            session.terminal.clone()
+        };
+        if let Some(terminal) = terminal {
+            terminal.recheck_delivery();
+        }
+    }
+
     pub fn delivery_readiness(&self, session_id: &str) -> router::DeliveryReadiness {
         let Some(session) = self.raw_session_state(session_id) else {
             return router::DeliveryReadiness::Unavailable;
@@ -280,6 +321,33 @@ impl SessionManager {
         let delivery = gate.state.lock().unwrap();
         let session = session.lock().unwrap();
         session.delivery_readiness(&delivery, crate::session::clock::now())
+    }
+
+    pub fn report_readiness(&self, session_id: &str) -> router::DeliveryReadiness {
+        let Some(session) = self.raw_session_state(session_id) else {
+            return router::DeliveryReadiness::Unavailable;
+        };
+        let gate = session.lock().unwrap().delivery_gate.clone();
+        let delivery = gate.state.lock().unwrap();
+        let session = session.lock().unwrap();
+        session.report_readiness(&delivery, crate::session::clock::now())
+    }
+
+    /// Reserve the input gate for a report, only while the session is idle.
+    pub fn reserve_report(&self, session_id: &str) -> Result<Option<u64>> {
+        let Some(session) = self.session_state(session_id) else {
+            return Ok(None);
+        };
+        let gate = session.lock().unwrap().delivery_gate.clone();
+        let mut delivery = gate.state.lock().unwrap();
+        let session = session.lock().unwrap();
+        if session.report_readiness(&delivery, crate::session::clock::now())
+            != (router::DeliveryReadiness::Ready { idle: true })
+        {
+            return Ok(None);
+        }
+        delivery.in_flight = true;
+        Ok(Some(delivery.generation))
     }
 
     pub fn reserve_delivery(&self, session_id: &str) -> Result<router::DeliveryReservation> {
@@ -292,11 +360,13 @@ impl SessionManager {
         let session = session.lock().unwrap();
         let now = crate::session::clock::now();
         Ok(match session.delivery_readiness(&delivery, now) {
-            R::Ready { idle: true } => {
+            R::Ready { idle: true } | R::Working => {
                 delivery.in_flight = true;
                 D::Ready(delivery.generation)
             }
-            R::Ready { idle: false } | R::Pending | R::Unavailable => D::Unavailable,
+            R::Ready { idle: false } | R::Unconfirmed | R::Pending | R::Unavailable => {
+                D::Unavailable
+            }
             R::Starting => D::Starting,
             R::NeedsYou => D::HumanInteraction,
             R::InFlight => D::InFlight,

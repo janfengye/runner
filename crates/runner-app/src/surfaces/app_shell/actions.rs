@@ -2,7 +2,7 @@ use super::*;
 
 impl NativeRoot {
     pub(crate) fn terminal_style(&self, cx: &App) -> crate::terminal::element::TerminalStyle {
-        let mut style = terminal_style_for(self.settings(cx));
+        let mut style = terminal_style_for(self.settings(cx), cx);
         if let Some(palette) = self.remote_client.remote_terminal_palette(cx) {
             style.palette = palette;
         }
@@ -65,7 +65,7 @@ impl NativeRoot {
         self.app_store
             .read(cx)
             .bridge
-            .set_palette(terminal_style_for(self.settings(cx)).palette);
+            .set_palette(terminal_style_for(self.settings(cx), cx).palette);
     }
 
     pub(crate) fn save_settings(&self, cx: &App) {
@@ -98,6 +98,7 @@ impl NativeRoot {
         self.sidebar_collapsed = collapsed;
         if collapsed {
             self.usage_open = false;
+            self.update_popover.close_without_focus();
         }
         self.mission_workspace
             .update(cx, |workspace, workspace_cx| {
@@ -157,7 +158,6 @@ impl NativeRoot {
         if self.shortcut_recording_active() {
             self.finish_shortcut_recording(window, cx);
         }
-        self.pause_updates_pane(cx);
         self.save_settings(cx);
         match self.settings_return_route.clone() {
             AppRoute::Chat | AppRoute::Settings => {
@@ -169,6 +169,11 @@ impl NativeRoot {
                     }
                     Err(error) => self.chat_error = Some(error.to_string().into()),
                 }
+                cx.notify();
+            }
+            AppRoute::Launcher => {
+                self.set_route(AppRoute::Launcher, cx);
+                self.focus_visible_launcher(window, cx);
                 cx.notify();
             }
             AppRoute::Roles => self.open_roles(window, cx),
@@ -199,13 +204,14 @@ impl NativeRoot {
         else {
             return;
         };
-        self.tabs.clear_active();
+        self.land_on_recent_tab(cx);
+        if self.remote_client.is_local() && self.tabs.active().is_none() {
+            self.reset_launcher_page(cx);
+        }
         self.set_route(route, cx);
+        self.sync_active_project_from_active_tab(cx);
         match self.ensure_active_tab_attached(window, cx) {
-            Ok(()) => {
-                self.mark_active_tab_viewed(window, cx);
-                self.focus_active_terminal(window, cx);
-            }
+            Ok(()) => self.settle_active_tab(window, cx),
             Err(error) => self.chat_error = Some(error.to_string().into()),
         }
         cx.notify();
@@ -249,6 +255,22 @@ impl NativeRoot {
         if !collapsed {
             self.sidebar_preview_open = false;
         }
+        self.sidebar_preview_peeking = false;
+        cx.notify();
+    }
+
+    pub(crate) fn switch_sidebar_view(
+        &mut self,
+        _: &SwitchSidebarView,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.route == AppRoute::Settings && self.remote_client.is_local() {
+            return;
+        }
+        self.toggle_sidebar_view(cx);
+        self.set_sidebar_collapsed(false, true, cx);
+        self.sidebar_preview_open = false;
         self.sidebar_preview_peeking = false;
         cx.notify();
     }
@@ -372,6 +394,21 @@ impl NativeRoot {
         cx: &mut Context<Self>,
     ) {
         self.show_command_palette(window, cx);
+    }
+
+    pub(super) fn search_files(
+        &mut self,
+        _: &crate::SearchFiles,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.route {
+            AppRoute::Chat => self.search_files_in_chat(window, cx),
+            AppRoute::Mission(_) => self.mission_workspace.update(cx, |workspace, cx| {
+                workspace.search_files(window, cx);
+            }),
+            _ => cx.propagate(),
+        }
     }
 
     pub(super) fn open_settings(

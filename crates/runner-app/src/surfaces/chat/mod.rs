@@ -15,6 +15,14 @@ use crate::*;
 
 use runner_core::protocol::model::Runtime;
 
+#[derive(Clone)]
+pub(crate) struct ForkRequest {
+    pub(crate) client: crate::surfaces::front_page::FrontPageClient,
+    pub(crate) source: String,
+    title: Option<String>,
+    size: (u16, u16),
+}
+
 pub(super) fn tab_is_terminal(
     layout: &PaneLayout,
     runtime: impl Fn(&str) -> Option<Runtime>,
@@ -192,6 +200,16 @@ impl NativeRoot {
         cx.notify();
     }
 
+    pub(crate) fn retry_agent_fork(
+        &mut self,
+        request: ForkRequest,
+        launcher: Entity<crate::surfaces::start_chat::launcher::ChatLauncher>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.submit_agent_fork(request, Some(launcher), window, cx);
+    }
+
     pub(crate) fn confirm_fork_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let remote = self.front_page_client(cx).is_remote();
         let (source_session_id, title, size) = if remote {
@@ -219,46 +237,111 @@ impl NativeRoot {
             self.chat_error = None;
             (id, title, (INITIAL_COLS, INITIAL_ROWS))
         };
+        let request = ForkRequest {
+            client: self.front_page_client(cx),
+            source: source_session_id,
+            title,
+            size,
+        };
+        self.submit_agent_fork(request, None, window, cx);
+    }
+
+    fn submit_agent_fork(
+        &mut self,
+        request: ForkRequest,
+        launcher: Option<Entity<crate::surfaces::start_chat::launcher::ChatLauncher>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let source_session_id = request.source.clone();
+        let retry_request = request.clone();
+        let reveal = launcher
+            .as_ref()
+            .is_none_or(|launcher| self.update_launcher_visible(launcher, cx));
         cx.notify();
-        let Some(operation) =
-            WorkspaceAction::prepare(self, format!("session:{source_session_id}"), &["fork"], cx)
-        else {
+        let Some(operation) = self.remote_client.prepare_action(
+            request.client.clone(),
+            format!("session:{source_session_id}"),
+            &["fork"],
+            cx,
+        ) else {
             return;
         };
+        cx.notify();
         let core = operation.client.clone();
         let backend_source_session_id = source_session_id.clone();
         let fork = cx.background_spawn(async move {
-            core.fork(&backend_source_session_id, title, size)
-                .map_err(|error| error.to_string())
+            let result = core.fork(&backend_source_session_id, request.title, request.size);
+            let gate = result
+                .as_ref()
+                .err()
+                .and_then(|error| error.version_gate.clone());
+            (result.map_err(|error| error.to_string()), gate)
         });
         let origin_epoch = self.remote_client.ui.epoch;
         cx.spawn_in(window, async move |weak, cx| {
-            let result = fork.await;
+            let (result, gate) = fork.await;
             let _ = weak.update_in(cx, |this, window, cx| {
-                let Some(result) = WorkspaceAction::complete(
+                let Some(result) = WorkspaceAction::complete_observed(
                     this,
                     operation,
                     result,
                     |session| crate::surfaces::front_page::actions::Completion {
-                        session: Some(session),
+                        session: reveal.then_some(session),
                         ..Default::default()
+                    },
+                    |root, client, succeeded, cx| {
+                        root.record_session_gate(
+                            &client.target,
+                            &source_session_id,
+                            None,
+                            crate::surfaces::agent_recovery::RecoveryAction::Resume,
+                            succeeded,
+                        );
+                        if client.is_remote() {
+                            if let Some(gate) = gate.clone() {
+                                root.show_fork_update(
+                                    gate,
+                                    retry_request.clone(),
+                                    launcher.clone(),
+                                    window,
+                                    cx,
+                                );
+                            } else if succeeded {
+                                if let Some(launcher) = &launcher {
+                                    root.launchers.retain(|_, cached| cached != launcher);
+                                }
+                            }
+                        }
                     },
                     cx,
                 ) else {
                     return;
                 };
-                if this.remote_client.ui.epoch != origin_epoch {
+                if launcher.is_none() && this.remote_client.ui.epoch != origin_epoch {
                     this.forking_sessions.remove(&source_session_id);
                     cx.notify();
                     return;
                 }
-                this.fork_confirm = None;
+                if launcher.is_none() {
+                    this.fork_confirm = None;
+                }
                 match result {
                     Ok(spawned) => {
                         let session_id = spawned;
                         finish_fork_tracking(&mut this.forking_sessions, &session_id);
+                        let should_reveal = launcher.as_ref().map_or(reveal, |launcher| {
+                            this.update_launcher_visible(launcher, cx)
+                        });
+                        if let Some(launcher) = &launcher {
+                            this.launchers.retain(|_, cached| cached != launcher);
+                        }
                         let placement = (|| -> Result<()> {
                             this.refresh_sessions(cx);
+                            if !should_reveal {
+                                this.reload_tabs(cx)?;
+                                return Ok(());
+                            }
                             this.reload_tabs(cx)?;
                             this.tabs.activate_session(&session_id);
                             this.sync_active_project_from_active_tab(cx);
@@ -290,11 +373,21 @@ impl NativeRoot {
                         }
                         this.refresh_sessions(cx);
                         let _ = this.reload_tabs(cx);
-                        this.tabs.activate_session(&source_session_id);
-                        this.sync_active_project_from_active_tab(cx);
-                        let _ = this.ensure_active_tab_attached(window, cx);
-                        this.sync_active_chat_detail(cx);
-                        this.chat_error = Some(error.into());
+                        if launcher.is_none()
+                            || launcher
+                                .as_ref()
+                                .is_some_and(|launcher| this.update_launcher_visible(launcher, cx))
+                        {
+                            this.tabs.activate_session(&source_session_id);
+                            this.sync_active_project_from_active_tab(cx);
+                            let _ = this.ensure_active_tab_attached(window, cx);
+                            this.sync_active_chat_detail(cx);
+                        }
+                        if let Some(gate) = gate {
+                            this.show_fork_update(gate, retry_request, launcher, window, cx);
+                        } else {
+                            this.chat_error = Some(error.into());
+                        }
                     }
                 }
                 cx.notify();
@@ -487,11 +580,54 @@ impl NativeRoot {
         }
     }
 
+    fn panel_session_id(&mut self, cx: &App) -> Option<String> {
+        let layout = self.front_page_layout()?;
+        let tab_id = layout.id.clone();
+        let focused = layout.focused_session_id().map(str::to_owned);
+        let (session, chat) = self.panel_session_for(focused.as_deref(), cx)?;
+        if chat {
+            self.panel_chat_by_tab.insert(tab_id, session.clone());
+        }
+        Some(session)
+    }
+
+    /// The session the side panel follows once `focused` has focus, and
+    /// whether it is that chat: a chat itself, or for a terminal the tab's
+    /// last focused chat, else its first, else the terminal.
+    pub(crate) fn panel_session_for(
+        &self,
+        focused: Option<&str>,
+        cx: &App,
+    ) -> Option<(String, bool)> {
+        let layout = self.front_page_layout()?;
+        let chats = layout
+            .session_ids()
+            .into_iter()
+            .filter(|id| {
+                !self
+                    .front_page_session(id, cx)
+                    .and_then(|entry| Runtime::parse(&entry.agent_runtime))
+                    .is_some_and(Runtime::is_shell)
+            })
+            .collect::<Vec<_>>();
+        if let Some(focused) = focused.filter(|id| chats.iter().any(|chat| chat.as_str() == *id)) {
+            return Some((focused.to_owned(), true));
+        }
+        self.panel_chat_by_tab
+            .get(&layout.id)
+            .filter(|id| chats.contains(id))
+            .or_else(|| chats.first())
+            .cloned()
+            .or_else(|| focused.map(str::to_owned))
+            .map(|session| (session, false))
+    }
+
     pub(crate) fn sync_active_chat_detail(&mut self, cx: &mut Context<Self>) {
+        self.sync_chat_panel(cx);
         if self.remote_client.is_active() {
             return;
         }
-        let selected = self.active_focused_session_id();
+        let selected = self.panel_session_id(cx);
         let Some(session_id) = selected else {
             return;
         };
@@ -508,7 +644,7 @@ impl NativeRoot {
         if self.remote_client.is_active() {
             return;
         }
-        let active = self.active_focused_session_id();
+        let active = self.panel_session_id(cx);
         let loaded = self
             .active_chat_detail
             .as_ref()
@@ -605,6 +741,7 @@ impl NativeRoot {
                                 this.focus_drawer_terminal(&tracked_id, window, cx);
                             } else if this.active_focused_session_id().as_deref()
                                 == Some(tracked_id.as_str())
+                                && !this.chat_surfaces.list_focus().is_focused(window)
                             {
                                 this.focus_active_terminal(window, cx);
                             }
@@ -758,7 +895,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn exited_terminal_close_lands_on_start_unless_another_pane_session_remains() {
+    fn exited_terminal_close_lands_on_the_other_tab_unless_another_pane_session_remains() {
         use crate::surfaces::start_chat::{tests::modal_harness, ChatMode};
         use std::time::{Duration, Instant};
 
@@ -812,10 +949,16 @@ mod tests {
                             assert_eq!(layout.root.leaves().len(), 1);
                             assert_eq!(layout.focused_session_id(), Some("kept-shell"));
                         } else {
-                            assert!(root.tabs.active().is_none(), "{variant}");
+                            let other = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
+                            assert_eq!(root.tabs.active_tab_id(), Some(other), "{variant}");
                             assert_eq!(root.tabs.tabs().len(), 1);
                             root.reload_tabs(cx).unwrap();
-                            assert!(root.tabs.active().is_none(), "{variant}");
+                            assert_eq!(root.tabs.active_tab_id(), Some(other), "{variant}");
+                            assert_eq!(
+                                root.runtime_navigation_history.last(),
+                                Some(&crate::RuntimeLocation::Chat("other-tab-shell".into()))
+                            );
+                            assert!(root.tab_close_guarded());
                         }
                     }
                 });
@@ -906,111 +1049,6 @@ mod tests {
                 pane_id: "p1".into(),
             }
         );
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    fn open_rename_placeholders_follow_a_peer_window_without_resetting_input() {
-        use crate::i18n::{testing::with_locale, Language, Locale};
-        use crate::{app_store, ChatRenameTarget, NativeRoot};
-        let _theme = crate::theme_snapshot::ThemeGuard::new();
-        with_locale(Locale::English, || {
-            let temp = tempfile::tempdir().unwrap();
-            let mut cx = gpui::TestAppContext::single();
-            let store = app_store::test_lifecycle_store(&mut cx, temp.path());
-            store.update(&mut cx, |store, _| {
-                store.settings.language = Language::English;
-                let mut shell = direct_session("shell", false);
-                shell.session_id = "shell".into();
-                let mut chat = direct_session("codex", false);
-                chat.session_id = "chat".into();
-                store.sessions = vec![shell, chat];
-            });
-            let windows = ["rename-one", "rename-two"].map(|label| {
-                cx.add_window(|window, cx| {
-                    NativeRoot::new(
-                        label.into(),
-                        temp.path().join("logs"),
-                        None,
-                        None,
-                        store.clone(),
-                        window,
-                        cx,
-                    )
-                })
-            });
-            let mut visual = gpui::VisualTestContext::from_window(windows[1].into(), &cx);
-            for (target, english, chinese) in [
-                (
-                    ChatRenameTarget::Session {
-                        session_id: "shell".into(),
-                        original: "literal {count} 终端".into(),
-                    },
-                    "Terminal name",
-                    "终端名称",
-                ),
-                (
-                    ChatRenameTarget::Session {
-                        session_id: "chat".into(),
-                        original: "literal {count} 对话".into(),
-                    },
-                    "Chat name",
-                    "对话名称",
-                ),
-            ] {
-                windows[1]
-                    .update(&mut visual, |root, window, cx| {
-                        root.route = crate::AppRoute::Chat;
-                        root.open_chat_rename(target, window, cx)
-                    })
-                    .unwrap();
-                let field = windows[1]
-                    .read_with(&visual, |root, _| {
-                        root.chat_rename_modal.as_ref().unwrap().input.clone()
-                    })
-                    .unwrap();
-                for draft in ["literal {name} 草稿", ""] {
-                    field.update(&mut visual, |field, cx| {
-                        field.set_text(draft, cx);
-                        field.select_all(cx);
-                    });
-                    let caret = field.read_with(&visual, |field, _| field.caret_offset());
-                    for (language, expected) in [
-                        (Language::SimplifiedChinese, chinese),
-                        (Language::English, english),
-                    ] {
-                        windows[0]
-                            .update(&mut visual, |root, _, cx| {
-                                root.app_store.update(cx, |store, cx| {
-                                    store.update_settings(
-                                        |settings| {
-                                            settings.language = language;
-                                            true
-                                        },
-                                        false,
-                                        cx,
-                                    )
-                                })
-                            })
-                            .unwrap();
-                        visual.run_until_parked();
-                        field.read_with(&visual, |field, _| {
-                            assert_eq!(field.placeholder(), expected);
-                            assert_eq!(field.text(), draft);
-                            assert_eq!(field.caret_offset(), caret);
-                        });
-                        windows[1]
-                            .read_with(&visual, |root, _| {
-                                assert_eq!(
-                                    root.chat_rename_modal.as_ref().unwrap().input.entity_id(),
-                                    field.entity_id()
-                                )
-                            })
-                            .unwrap();
-                    }
-                }
-            }
-        });
     }
 
     #[test]

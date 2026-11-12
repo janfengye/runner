@@ -170,14 +170,18 @@ impl StoreRevisions {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct TerminalSettingsSnapshot {
     light_theme: LightTerminalTheme,
     dark_theme: DarkTerminalTheme,
     is_light: bool,
     font_family: TerminalFontFamily,
     font_size: u16,
+    line_height_tenths: u16,
     cursor_style: TerminalCursorStyle,
+    cursor_blink: bool,
+    scrollback_lines: usize,
+    copy_on_select: bool,
 }
 
 impl From<&AppSettings> for TerminalSettingsSnapshot {
@@ -192,9 +196,13 @@ impl TerminalSettingsSnapshot {
             light_theme: settings.light_terminal_theme,
             dark_theme: settings.dark_terminal_theme,
             is_light: variant.is_light(),
-            font_family: settings.terminal_font_family,
+            font_family: settings.terminal_font_family.clone(),
             font_size: settings.terminal_font_size,
+            line_height_tenths: (settings.terminal_line_height * 10.).round() as u16,
             cursor_style: settings.terminal_cursor_style,
+            cursor_blink: settings.terminal_cursor_blink,
+            scrollback_lines: settings.terminal_scrollback_lines,
+            copy_on_select: settings.terminal_copy_on_select,
         }
     }
 }
@@ -210,8 +218,10 @@ impl From<&AppSettings> for MissionSettingsSnapshot {
     fn from(settings: &AppSettings) -> Self {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         settings.last_mission_terminal_ids.hash(&mut hasher);
+        settings.info_view.hash(&mut hasher);
+        settings.files_view.hash(&mut hasher);
         Self {
-            rail_open: settings.mission_rail_open,
+            rail_open: settings.mission_rail_shown(),
             rail_width: settings.mission_rail_width.to_bits(),
             fingerprint: hasher.finish(),
         }
@@ -230,10 +240,9 @@ impl From<&AppSettings> for ShellSettingsSnapshot {
         std::mem::discriminant(&settings.light_app_theme).hash(&mut hasher);
         std::mem::discriminant(&settings.dark_app_theme).hash(&mut hasher);
         settings.app_zoom.to_bits().hash(&mut hasher);
-        settings.local_only.hash(&mut hasher);
         std::mem::discriminant(&settings.light_terminal_theme).hash(&mut hasher);
         std::mem::discriminant(&settings.dark_terminal_theme).hash(&mut hasher);
-        std::mem::discriminant(&settings.terminal_font_family).hash(&mut hasher);
+        settings.terminal_font_family.hash(&mut hasher);
         settings.terminal_font_size.hash(&mut hasher);
         std::mem::discriminant(&settings.terminal_cursor_style).hash(&mut hasher);
         settings.sidebar_width.to_bits().hash(&mut hasher);
@@ -242,6 +251,13 @@ impl From<&AppSettings> for ShellSettingsSnapshot {
         settings.sidebar_chats_open.hash(&mut hasher);
         settings.sidebar_collapsed_projects.hash(&mut hasher);
         settings.chat_panel_open.hash(&mut hasher);
+        settings.show_side_panel.hash(&mut hasher);
+        settings.info_view.hash(&mut hasher);
+        settings.files_view.hash(&mut hasher);
+        settings.file_icons.hash(&mut hasher);
+        settings.files_font_family.hash(&mut hasher);
+        settings.files_font_size.hash(&mut hasher);
+        settings.markdown_open_as.hash(&mut hasher);
         settings.chat_panel_width.to_bits().hash(&mut hasher);
         settings.default_crew_id.hash(&mut hasher);
         settings.default_working_dir.hash(&mut hasher);
@@ -249,6 +265,12 @@ impl From<&AppSettings> for ShellSettingsSnapshot {
         settings.default_runtime.hash(&mut hasher);
         settings.disabled_agents.hash(&mut hasher);
         settings.enabled_agents.hash(&mut hasher);
+        settings.usage.sidebar.hash(&mut hasher);
+        settings.usage.codex.hash(&mut hasher);
+        settings.usage.claude_code.hash(&mut hasher);
+        settings.usage.five_hour.hash(&mut hasher);
+        settings.notifications.usage.near_limit.hash(&mut hasher);
+        settings.notifications.usage.threshold.hash(&mut hasher);
         settings.runner_skill_enabled.hash(&mut hasher);
         settings.keymap_overrides.hash(&mut hasher);
         Self(hasher.finish())
@@ -310,7 +332,6 @@ pub(crate) struct AppStore {
     pub(crate) missions: Vec<MissionSummary>,
     pub(crate) session_statuses: BTreeMap<String, runner_core::protocol::status::AgentStatus>,
     pub(crate) session_activity: BTreeMap<String, SessionActivityState>,
-    #[cfg(any(windows, target_os = "linux", test))]
     mission_agent_ids: std::collections::BTreeSet<String>,
     pub(crate) live_session_count: usize,
     pub(crate) settings: AppSettings,
@@ -337,20 +358,14 @@ pub(crate) struct AppStore {
 }
 
 impl AppStore {
-    pub(crate) fn remote_access_enabled(&self) -> bool {
-        !self.settings.local_only
-            || self
-                .remote_status
-                .as_ref()
-                .is_some_and(crate::surfaces::settings::remote::account::signed_in)
+    pub(crate) fn remote_signed_in(&self) -> bool {
+        self.remote_status
+            .as_ref()
+            .is_some_and(crate::surfaces::settings::remote::account::signed_in)
     }
 
     fn apply_remote_update(&mut self, update: RemoteUpdate, live: bool) {
-        let was_enabled = self.remote_access_enabled();
-        let was_signed_in = self
-            .remote_status
-            .as_ref()
-            .is_some_and(crate::surfaces::settings::remote::account::signed_in);
+        let was_signed_in = self.remote_signed_in();
         let warning = match update {
             RemoteUpdate::Paired(_) => return,
             RemoteUpdate::Status(status) => {
@@ -391,11 +406,7 @@ impl AppStore {
                 warning
             }
         };
-        let signed_in = self
-            .remote_status
-            .as_ref()
-            .is_some_and(crate::surfaces::settings::remote::account::signed_in);
-        if self.remote_access_enabled() != was_enabled || signed_in != was_signed_in {
+        if self.remote_signed_in() != was_signed_in {
             self.revisions.shell_settings = self.revisions.shell_settings.wrapping_add(1);
         }
         if let Some(warning) = warning {
@@ -499,7 +510,9 @@ impl AppStore {
                         StoreRefreshKind::All,
                         EntityRefreshKind::All,
                         Some(DaemonEvent::Disconnected(
-                            if event.payload["restart_limit"].as_bool().unwrap_or(false) {
+                            if event.payload["in_use"].as_bool().unwrap_or(false) {
+                                runner_app::lifecycle::DaemonNotice::InUse
+                            } else if event.payload["restart_limit"].as_bool().unwrap_or(false) {
                                 runner_app::lifecycle::DaemonNotice::Repeated
                             } else {
                                 runner_app::lifecycle::DaemonNotice::Stopped
@@ -551,9 +564,13 @@ impl AppStore {
                                 }
                                 DaemonEvent::Reconnected => {
                                     this.daemon_disconnected = false;
-                                    if this.daemon_notice
-                                        == Some(runner_app::lifecycle::DaemonNotice::Repeated)
-                                    {
+                                    if matches!(
+                                        this.daemon_notice,
+                                        Some(
+                                            runner_app::lifecycle::DaemonNotice::Repeated
+                                                | runner_app::lifecycle::DaemonNotice::InUse
+                                        )
+                                    ) {
                                         this.daemon_notice = None;
                                         this.error = None;
                                     } else if this.daemon_notice
@@ -667,10 +684,6 @@ impl AppStore {
                             RemoteUpdate::Paired(pairing) => cx.emit(pairing),
                             update => store.apply_remote_update(update, live),
                         }
-                        let enabled = store.remote_access_enabled();
-                        store
-                            .remote_clients
-                            .update(cx, |clients, cx| clients.set_enabled(enabled, cx));
                         cx.notify();
                     })
                     .is_err()
@@ -704,7 +717,6 @@ impl AppStore {
             missions: Vec::new(),
             session_statuses: BTreeMap::new(),
             session_activity: BTreeMap::new(),
-            #[cfg(any(windows, target_os = "linux", test))]
             mission_agent_ids: Default::default(),
             live_session_count: 0,
             resolved_locale: runner_app::i18n::active_locale(),
@@ -774,7 +786,6 @@ impl AppStore {
                 let _ = weak.update(cx, |this, cx| {
                     match result {
                         Ok(missions) => {
-                            #[cfg(any(windows, target_os = "linux", test))]
                             match mission_agent_ids(&core, &missions) {
                                 Ok(ids) => this.mission_agent_ids = ids,
                                 Err(error) => this.record_error(error.to_string()),
@@ -894,9 +905,6 @@ impl AppStore {
         if !update(&mut self.settings) {
             return false;
         }
-        let remote_enabled = self.remote_access_enabled();
-        self.remote_clients
-            .update(cx, |clients, cx| clients.set_enabled(remote_enabled, cx));
         if agent_settings
             != (
                 self.settings.enabled_agents.clone(),
@@ -990,7 +998,6 @@ impl AppStore {
     fn refresh_missions_blocking_inner(&mut self) {
         match self.client.mission_list_summary_impl(None) {
             Ok(missions) => {
-                #[cfg(any(windows, target_os = "linux", test))]
                 match mission_agent_ids(&self.client, &missions) {
                     Ok(ids) => self.mission_agent_ids = ids,
                     Err(error) => self.record_error(error.to_string()),
@@ -1002,7 +1009,6 @@ impl AppStore {
         }
     }
 
-    #[cfg(any(windows, target_os = "linux", test))]
     pub(crate) fn working_agent_count(&self) -> usize {
         self.session_statuses
             .iter()
@@ -1077,7 +1083,6 @@ impl AppStore {
     }
 }
 
-#[cfg(any(windows, target_os = "linux", test))]
 fn mission_agent_ids(
     client: &DaemonClient,
     missions: &[MissionSummary],
@@ -1137,53 +1142,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn remote_status_keeps_signed_in_surfaces_visible_and_wakes_every_window() {
+    fn remote_status_shows_signed_in_surfaces_and_wakes_every_window() {
         use runner_core::remote::{RemoteState, RemoteStatus, StopReason};
         let temp = tempfile::tempdir().unwrap();
         let mut cx = gpui::TestAppContext::single();
         let store = super::test_lifecycle_store(&mut cx, temp.path());
         cx.run_until_parked();
         store.update(&mut cx, |store, _| {
-            for local_only in [false, true] {
-                store.settings.local_only = local_only;
-                for state in [
-                    RemoteState::Connecting { attempt: 0 },
-                    RemoteState::Connected {
-                        since: chrono::Utc::now(),
-                    },
-                    RemoteState::Reconnecting {
-                        attempt: 1,
-                        next_retry_at: chrono::Utc::now(),
-                    },
-                    RemoteState::Paused,
-                    RemoteState::Stopped {
-                        reason: StopReason::Removed,
-                    },
-                    RemoteState::Off,
-                ] {
-                    let previous = store.remote_access_enabled();
-                    let previous_signed_in = store
-                        .remote_status
-                        .as_ref()
-                        .is_some_and(crate::surfaces::settings::remote::account::signed_in);
-                    let revision = store.revisions.shell_settings;
-                    let status = RemoteStatus {
-                        state,
-                        host_id: Some("old-host".into()),
-                        account: Some(Default::default()),
-                        ..Default::default()
-                    };
-                    let signed_in = crate::surfaces::settings::remote::account::signed_in(&status);
-                    let enabled = !local_only || signed_in;
-                    store.apply_remote_update(super::RemoteUpdate::Status(status), false);
-                    assert_eq!(store.remote_access_enabled(), enabled);
-                    assert_eq!(
-                        store.revisions.shell_settings,
-                        revision
-                            + u64::from(previous != enabled || previous_signed_in != signed_in)
-                    );
-                    assert_eq!(store.settings.local_only, local_only);
-                }
+            for state in [
+                RemoteState::Connecting { attempt: 0 },
+                RemoteState::Connected {
+                    since: chrono::Utc::now(),
+                },
+                RemoteState::Reconnecting {
+                    attempt: 1,
+                    next_retry_at: chrono::Utc::now(),
+                },
+                RemoteState::Paused,
+                RemoteState::Stopped {
+                    reason: StopReason::Removed,
+                },
+                RemoteState::Off,
+            ] {
+                let previous = store.remote_signed_in();
+                let revision = store.revisions.shell_settings;
+                let status = RemoteStatus {
+                    state,
+                    host_id: Some("old-host".into()),
+                    account: Some(Default::default()),
+                    ..Default::default()
+                };
+                let signed_in = crate::surfaces::settings::remote::account::signed_in(&status);
+                store.apply_remote_update(super::RemoteUpdate::Status(status), false);
+                assert_eq!(store.remote_signed_in(), signed_in);
+                assert_eq!(
+                    store.revisions.shell_settings,
+                    revision + u64::from(previous != signed_in)
+                );
             }
         });
     }
@@ -1313,6 +1308,24 @@ mod tests {
                 Some(runner_app::lifecycle::DaemonNotice::Repeated)
             );
             assert!(store.revisions.error > before);
+        });
+        events.emit("daemon/reconnected", &serde_json::Value::Null);
+        cx.run_until_parked();
+        store.read_with(&cx, |store, _| {
+            assert!(!store.daemon_disconnected);
+            assert!(store.error.is_none() && store.daemon_notice.is_none());
+        });
+        events.emit(
+            "daemon/disconnected",
+            &serde_json::json!({"restart_limit":true,"in_use":true}),
+        );
+        cx.run_until_parked();
+        store.read_with(&cx, |store, _| {
+            assert!(store.daemon_disconnected);
+            assert_eq!(
+                store.daemon_notice,
+                Some(runner_app::lifecycle::DaemonNotice::InUse)
+            );
         });
         events.emit("daemon/reconnected", &serde_json::Value::Null);
         cx.run_until_parked();
@@ -1533,6 +1546,19 @@ mod tests {
     }
 
     #[test]
+    fn font_family_names_invalidate_terminal_and_shell_settings() {
+        let mut settings = AppSettings {
+            terminal_font_family: TerminalFontFamily::new("SF Mono"),
+            ..AppSettings::default()
+        };
+        let terminal = TerminalSettingsSnapshot::from(&settings);
+        let shell = ShellSettingsSnapshot::from(&settings);
+        settings.terminal_font_family = TerminalFontFamily::new("Fira Code");
+        assert_ne!(terminal, TerminalSettingsSnapshot::from(&settings));
+        assert_ne!(shell, ShellSettingsSnapshot::from(&settings));
+    }
+
+    #[test]
     fn terminal_settings_snapshot_ignores_unrelated_preferences() {
         let before = AppSettings {
             dark_terminal_theme: DarkTerminalTheme::CatppuccinMocha,
@@ -1706,4 +1732,34 @@ mod roster_change_tests {
             );
         }
     }
+}
+
+#[test]
+fn usage_controls_invalidate_shell_but_alert_history_does_not() {
+    let settings = AppSettings::default();
+    let before = ShellSettingsSnapshot::from(&settings);
+    let changes: [fn(&mut AppSettings); 6] = [
+        |s| s.usage.sidebar = false,
+        |s| s.usage.codex = false,
+        |s| s.usage.claude_code = false,
+        |s| s.usage.five_hour = false,
+        |s| s.notifications.usage.near_limit = false,
+        |s| s.notifications.usage.threshold = 50,
+    ];
+    for change in changes {
+        let mut next = settings.clone();
+        change(&mut next);
+        assert_ne!(ShellSettingsSnapshot::from(&next), before);
+    }
+    let mut next = settings;
+    next.notifications
+        .usage
+        .alerted
+        .push(crate::app_settings::UsageAlertPeriod {
+            runtime: runner_core::Runtime::Codex,
+            account: String::new(),
+            window: "Week".into(),
+            resets_at: None,
+        });
+    assert_eq!(ShellSettingsSnapshot::from(&next), before);
 }

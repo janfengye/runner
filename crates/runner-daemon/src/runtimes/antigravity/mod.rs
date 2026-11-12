@@ -4,7 +4,6 @@ pub(crate) mod agy_capture;
 pub(crate) mod agy_status;
 pub(crate) mod agy_trust;
 pub(crate) mod models;
-pub(crate) mod usage;
 use super::helpers::*;
 use super::*;
 pub use runner_core::protocol::runtime_metadata::ANTIGRAVITY_MODELS;
@@ -79,10 +78,6 @@ impl RuntimeAdapter for Antigravity {
     fn mcp(&self) -> Option<&'static McpConfig> {
         Some(&MCP)
     }
-    fn usage(&self) -> Option<&'static UsageSource> {
-        Some(&USAGE)
-    }
-
     fn skills(&self) -> SkillSupport {
         SkillSupport {
             roots: SKILL_DIRS,
@@ -111,6 +106,7 @@ impl RuntimeAdapter for Antigravity {
         session_id: &str,
         cwd: Option<&Path>,
         _copilot_home: Option<&str>,
+        _claude_config_dir: Option<&str>,
     ) -> crate::error::Result<()> {
         if let Some(cwd) = trust_cwd(session_id, Runtime::Antigravity, cwd) {
             agy_trust::seed_project_trust(cwd)?;
@@ -177,7 +173,9 @@ impl RuntimeAdapter for Antigravity {
                 .to_string_lossy()
                 .into_owned(),
         ]);
-        out.extend(antigravity_status_args(ctx.app_data_dir));
+        if status_hooks_enabled(ctx.env) {
+            out.extend(antigravity_status_args(ctx.app_data_dir));
+        }
         out.extend(self.first_turn_argv(if ctx.resuming { None } else { ctx.first_turn }));
         out
     }
@@ -233,10 +231,6 @@ static DISCOVERY: ModelDiscoverySource = ModelDiscoverySource {
     method: "models",
     query: models::query,
     config_home: || config_home(None, ".gemini/antigravity-cli"),
-};
-
-static USAGE: UsageSource = UsageSource {
-    fetch: |command, env, _denied| usage::fetch_antigravity(command, env),
 };
 
 static MCP: McpConfig = McpConfig {

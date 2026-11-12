@@ -5,6 +5,11 @@ mod active;
 mod archive;
 mod drag;
 mod elements;
+mod link;
+mod link_picker;
+#[cfg(test)]
+mod link_tests;
+mod logic;
 mod menus;
 mod model;
 mod project;
@@ -23,14 +28,14 @@ pub(crate) use archive::{
 };
 pub(crate) use elements::{
     default_session_label, direct_chat_display_status, project_children, session_label,
-    session_label_live, sidebar_item_row, sidebar_section_header, SidebarItemView,
+    session_label_live, sidebar_section_header, SidebarItemView,
 };
 
 use super::*;
 use crate::surfaces::front_page::model::{
     MissionDisplay as MissionSummary, SessionDisplay, SidebarNodeDisplay as NodeRow,
 };
-use crate::surfaces::sidebar_logic::{
+use crate::surfaces::sidebar::logic::{
     AttentionState, DropTarget, NumberedSidebarRow, SidebarActivationTarget, SidebarShortcutRow,
 };
 use crate::*;
@@ -213,8 +218,6 @@ impl Render for SidebarNodeDrag {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum SidebarMenuAction {
     NewChat(ProjectScope),
-    NewTerminal(ProjectScope),
-    NewMission(ProjectScope),
     TogglePin {
         node_id: String,
         pinned: bool,
@@ -230,6 +233,9 @@ enum SidebarMenuAction {
         session_id: String,
     },
     ArchiveMission(String),
+    /// Open the Link to chat picker for a mission (#748).
+    LinkToChat(String),
+    UnlinkMission(String),
     StopMission(String),
     ResumeMission(String),
     DeleteProject(String),
@@ -249,16 +255,9 @@ const WORKSPACE_ENTRIES: [WorkspaceEntry; 3] = [
 ];
 
 impl WorkspaceEntry {
-    fn selectable(self) -> bool {
-        !matches!(self, Self::NewTab)
-    }
-
     fn selected(self, route: &AppRoute) -> bool {
-        if !self.selectable() {
-            return false;
-        }
         match self {
-            Self::NewTab => unreachable!(),
+            Self::NewTab => *route == AppRoute::Launcher,
             Self::Role => matches!(
                 route,
                 AppRoute::Roles | AppRoute::NewRole | AppRoute::RoleDetail(_)
@@ -276,14 +275,13 @@ pub(crate) struct Sidebar {
     app_store: Entity<AppStore>,
     front_page: crate::surfaces::front_page::FrontPageClient,
     pub(crate) remote_settings: Option<AppSettings>,
+    remote_sidebar_seed_pending: bool,
     remote_layouts: HashMap<String, PaneLayout>,
     remote_sessions: HashMap<String, SessionDisplay>,
     remote_selection: Option<crate::surfaces::remote_client::RemoteItem>,
     store_revisions: StoreRevisions,
     scroll: ScrollHandle,
     scrollbar: Entity<Scrollbar>,
-    create_menu: Entity<PopoverMenu>,
-    create_actions: Vec<SidebarMenuAction>,
     context_menu: Option<Entity<ContextMenu>>,
     rename: Option<SidebarRename>,
     live_titles: HashMap<String, String>,
@@ -295,6 +293,11 @@ pub(crate) struct Sidebar {
     dragged_id: Option<String>,
     drop_target: Option<DropTarget>,
     drop_marker: Option<String>,
+    /// A dragged mission over the middle of a chat's row links to it (#748).
+    link_drop: Option<link::LinkDrop>,
+    /// How the current reorder drop would change the dragged mission's link.
+    drop_hint: Option<link::DropHint>,
+    link_picker: Option<Entity<link_picker::LinkPicker>>,
     hovered_row: Option<String>,
     cmd_held_since: Option<Instant>,
     shortcut_key_pressed: bool,

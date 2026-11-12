@@ -32,7 +32,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/hero.png" alt="Runner start screen — start a new chat, terminal or crew mission from one workspace" width="100%" />
+  <img src="assets/hero.png" alt="Runner start page — one launcher for your recent agents and roles, a terminal or a crew mission" width="100%" />
 </p>
 
 <p align="center">
@@ -51,7 +51,7 @@
   <a href="./CONTRIBUTING.md">Contributing</a>
 </p>
 
-> Alpha · Native macOS (Apple Silicon) and Windows (x64), with Linux (ARM64, x86_64) in beta.
+> Alpha · Native macOS (Apple Silicon and Intel) and Windows (x64), with Linux (ARM64, x86_64) in beta.
 
 Linux support is in beta from Runner 0.18.2, with signed `.deb` and tarball packages for ARM64 and x86_64 and in-app updates. It has been tried on an Ubuntu 26.04 ARM64 virtual machine; native hardware, x86_64 and other distributions are not yet verified. See [Linux build and install instructions](docs/arch/linux.md) and [validation status](docs/tests/archive/823-linux-support.md).
 
@@ -71,7 +71,7 @@ Runner brings CLI coding agents together in reusable crews, with real terminals 
   </tr>
   <tr>
     <td width="50%" valign="middle">
-      <a href="assets/mission_feed.png"><img src="assets/mission_feed.png" alt="A mission feed with coder, reviewer and QA coordinating, and a question waiting for your input" width="100%" /></a>
+      <a href="assets/mission_feed.png"><img src="assets/mission_feed.png" alt="A mission feed with the goal and the coder's review handoff to the reviewer, beside the crew's session cards" width="100%" /></a>
     </td>
     <td width="50%" valign="middle">
       <h3>Missions and coordination</h3>
@@ -80,7 +80,16 @@ Runner brings CLI coding agents together in reusable crews, with real terminals 
   </tr>
   <tr>
     <td width="50%" valign="middle">
-      <a href="assets/remote_control.png"><img src="assets/remote_control.png" alt="Runner's computer picker listing this Mac and another computer on the same account" width="100%" /></a>
+      <a href="assets/mission-link-reports.png"><img src="assets/mission-link-reports.png" alt="A Claude Code chat receiving two [runner] reports and answering each, with both missions grouped under it in the sidebar" width="100%" /></a>
+    </td>
+    <td width="50%" valign="middle">
+      <h3>Missions report back to their chat</h3>
+      <p>A mission started from a chat links to it and groups under it in the sidebar, so the agent can end its turn instead of watching. When the mission needs you, fails or settles, Runner types one line into the chat and the agent reads what happened. Drag in a mission started elsewhere to link it too. <a href="./docs/guide/concepts/missions.md#linked-chat-and-reports">Linked chat and reports →</a></p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="middle">
+      <a href="assets/remote_control.png"><img src="assets/remote_control.png" alt="The sidebar footer's host button open, listing this Mac first and the other computers on the same account" width="100%" /></a>
     </td>
     <td width="50%" valign="middle">
       <h3>Remote control</h3>
@@ -90,16 +99,16 @@ Runner brings CLI coding agents together in reusable crews, with real terminals 
   </tr>
   <tr>
     <td width="50%" valign="middle">
-      <a href="assets/mission_terminal.png"><img src="assets/mission_terminal.png" alt="A mission slot's own terminal: the coder's Codex session, beside the crew's session cards" width="100%" /></a>
+      <a href="assets/mission_terminal.png"><img src="assets/mission_terminal.png" alt="A mission slot's own terminal: the coder's Claude Code session, beside the crew's session cards" width="100%" /></a>
     </td>
     <td width="50%" valign="middle">
       <h3>Real terminals</h3>
-      <p>Each agent keeps its own TUI in a real PTY on a GPU-drawn <code>alacritty_terminal</code> grid, with mouse reporting, IME input (Pinyin included), file-path paste and click-to-open, and a shell drawer beneath every chat and mission.</p>
+      <p>Each agent keeps its own TUI in a real PTY on a GPU-drawn <code>alacritty_terminal</code> grid, with mouse reporting, IME input (Pinyin included), file-path paste and click-to-open, and a shell drawer beneath every mission.</p>
     </td>
   </tr>
   <tr>
     <td width="50%" valign="middle">
-      <a href="assets/chat_split.png"><img src="assets/chat_split.png" alt="One tab split four ways: Codex, Claude Code, Antigravity CLI and pi side by side" width="100%" /></a>
+      <a href="assets/chat_split.png"><img src="assets/chat_split.png" alt="One tab split four ways: Codex, Claude Code, Grok and pi, each pane in its own island" width="100%" /></a>
     </td>
     <td width="50%" valign="middle">
       <h3>Split tabs and windows</h3>
@@ -108,9 +117,19 @@ Runner brings CLI coding agents together in reusable crews, with real terminals 
   </tr>
   <tr>
     <td width="50%" valign="middle">
+      <a href="assets/files_view.png"><img src="assets/files_view.png" alt="A Claude Code chat beside the side panel's Files view: the worktree's tree with its git status and a file open in a tab" width="100%" /></a>
+    </td>
+    <td width="50%" valign="middle">
+      <h3>Files beside your agents</h3>
+      <p>The side panel's Files view shows the checkout an agent works in, with its git status, so you can read what changed without leaving Runner: highlighted code, rendered Markdown and a file finder on <code>⇧⌘O</code>. ⌘-click a path in a terminal to open it at that line. Files stay read-only; editing stays with your agent and editor. <a href="./docs/guide/guides/chats-and-windows.md#browse-files-in-the-side-panel">Files guide →</a></p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="middle">
       <pre><code>runner crew list
 runner mission start \
   --crew "Pair coding crew" \
+  --title "Fix the login bug" \
   --goal-file brief.md
 runner mission feed &lt;mission-id&gt; --follow
 runner help agents</code></pre>

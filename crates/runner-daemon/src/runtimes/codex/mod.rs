@@ -1,6 +1,7 @@
 pub(crate) mod capture;
 pub(crate) mod codex_status;
 pub(crate) mod codex_trust;
+mod conversation;
 pub(crate) mod fork;
 pub(crate) mod models;
 mod program_status;
@@ -22,6 +23,27 @@ fn capture_sessions_root(
     env: &std::collections::BTreeMap<String, String>,
     cwd: Option<&Path>,
 ) -> Option<PathBuf> {
+    codex_home(env, cwd).map(|home| home.join("sessions"))
+}
+
+fn probe_home(ctx: &ProbeContext<'_>) -> Option<PathBuf> {
+    #[cfg(test)]
+    if !ctx.role_env.contains_key("CODEX_HOME") && crate::runtimes::test_home().is_none() {
+        return None;
+    }
+    let env = ctx
+        .role_env
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    codex_home(&env, ctx.cwd.map(Path::new))
+}
+
+/// The Codex home a session spawned with `env` in `cwd` reads.
+fn codex_home(
+    env: &std::collections::BTreeMap<String, String>,
+    cwd: Option<&Path>,
+) -> Option<PathBuf> {
     let home = env
         .get("CODEX_HOME")
         .filter(|value| !value.trim().is_empty())
@@ -39,7 +61,26 @@ fn capture_sessions_root(
             .or_else(|| std::env::current_dir().ok())?
             .join(home)
     };
-    Some(home.join("sessions"))
+    Some(home)
+}
+
+/// Whether `args` move Codex to another folder (`-C`/`--cd`) or override its project
+/// trust (`-c projects…`), so the spawn's own folder and config no longer decide it.
+fn overrides_trust_lookup(args: &[String]) -> bool {
+    let projects = |value: &str| value.trim_start().starts_with("projects");
+    args.iter().enumerate().any(|(index, arg)| {
+        let next = || args.get(index + 1).is_some_and(|value| projects(value));
+        match arg.as_str() {
+            "-C" | "--cd" => true,
+            "-c" | "--config" => next(),
+            _ => {
+                arg.starts_with("--cd=")
+                    || (arg.starts_with("-C") && !arg.starts_with("--"))
+                    || arg.strip_prefix("--config=").is_some_and(projects)
+                    || (arg.starts_with("-c") && !arg.starts_with("--") && projects(&arg[2..]))
+            }
+        }
+    })
 }
 
 pub(crate) fn inject_codex_hooks(args: &[String], windows: bool) -> bool {
@@ -94,6 +135,10 @@ pub(crate) fn codex_status_args(
     app_data_dir: &Path,
     _session_id: &str,
 ) -> Vec<String> {
+    codex_hook_args(role_args, app_data_dir, true)
+}
+
+fn codex_hook_args(role_args: &[String], app_data_dir: &Path, status: bool) -> Vec<String> {
     if !inject_codex_hooks(role_args, cfg!(windows)) {
         return Vec::new();
     }
@@ -110,6 +155,9 @@ pub(crate) fn codex_status_args(
         format!("mcp_servers.runner_hooks={{command={executable},args=[\"hook\",\"serve\"],env_vars=[\"{}\",\"{}\",\"{}\"],required=false,enabled=true}}", hook::ENDPOINT_ENV, hook::SESSION_ENV, hook::GENERATION_ENV),
     ]);
     for event in crate::runtimes::codex::codex_status::EVENTS {
+        if !status && !matches!(*event, "SessionStart" | "UserPromptSubmit") {
+            continue;
+        }
         if *event == "SessionEnd" {
             let command = toml_edit::Value::from(hook_report_command(
                 app_data_dir,
@@ -168,6 +216,32 @@ impl RuntimeAdapter for Codex {
                 .collect(),
         )
     }
+    fn classify_startup_error(
+        &self,
+        output: &str,
+    ) -> Option<runner_core::protocol::status::StartupError> {
+        let (_, cause) = output.split_once("Error loading config.toml:")?;
+        let cause = cause.trim();
+        let detail = cause
+            .lines()
+            .take(4)
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(512)
+            .collect::<String>();
+        let message = if cause.contains("unknown variant `mcp_tool`") {
+            "This Codex does not recognize Runner's mcp_tool hook type.".into()
+        } else {
+            format!("Codex could not load Runner's configuration: {detail}")
+        };
+        Some(runner_core::protocol::status::StartupError {
+            runtime: Runtime::Codex,
+            message,
+            output: cause.to_owned(),
+        })
+    }
+
     fn status_semantics(&self) -> StatusSemantics {
         StatusSemantics {
             startup_ready_batch: true,
@@ -233,6 +307,21 @@ impl RuntimeAdapter for Codex {
     fn startup_delivery_uses_hooks(&self, _pending_turn: bool) -> bool {
         true
     }
+    /// A native fork or a resume can start without SessionStart.
+    fn startup_hook_on_reopen(&self) -> bool {
+        false
+    }
+    fn starts_trusted(
+        &self,
+        cwd: Option<&Path>,
+        args: &[String],
+        env: &std::collections::BTreeMap<String, String>,
+    ) -> bool {
+        !overrides_trust_lookup(args)
+            && cwd.zip(codex_home(env, cwd)).is_some_and(|(cwd, home)| {
+                codex_trust::trust_decided(cwd, &home.join("config.toml"))
+            })
+    }
     fn status_hooks(&self) -> Option<&'static dyn StatusHooks> {
         Some(&Hooks)
     }
@@ -251,6 +340,7 @@ impl RuntimeAdapter for Codex {
         session_id: &str,
         cwd: Option<&Path>,
         _copilot_home: Option<&str>,
+        _claude_config_dir: Option<&str>,
     ) -> crate::error::Result<()> {
         let hook_server = codex_trust::seed_hook_server();
         if let Some(cwd) = trust_cwd(session_id, Runtime::Codex, cwd) {
@@ -294,6 +384,20 @@ impl RuntimeAdapter for Codex {
     fn mission_dir_args(&self, dir: Option<&Path>) -> Vec<String> {
         add_dir(dir)
     }
+    fn probe_uses_shell_env(&self) -> bool {
+        true
+    }
+    fn conversation_exists(&self, key: &str, ctx: &ProbeContext<'_>) -> Option<bool> {
+        conversation::conversation_exists(&probe_home(ctx)?, key)
+    }
+    fn recover_conversation(
+        &self,
+        session_id: &str,
+        missing_key: &str,
+        ctx: &ProbeContext<'_>,
+    ) -> Option<String> {
+        conversation::recover_conversation(&probe_home(ctx)?, session_id, missing_key)
+    }
     fn launch_args(&self, ctx: &LaunchContext<'_>) -> Vec<String> {
         let mut out = Vec::new();
         out.extend(self.model_effort_args(ctx.model, ctx.effort));
@@ -307,11 +411,18 @@ impl RuntimeAdapter for Codex {
                 format!("service_tier={}", speed.service_tier()),
             ]);
         }
-        out.extend(codex_status_args(
-            ctx.role_args,
-            ctx.app_data_dir,
-            ctx.session_id,
-        ));
+        if ctx
+            .env
+            .get(REMOTE_PLUGIN_ENV)
+            .is_some_and(|value| value == "false")
+        {
+            out.extend(strings(&["-c", "features.remote_plugin=false"]));
+        }
+        out.extend(if status_hooks_enabled(ctx.env) {
+            codex_status_args(ctx.role_args, ctx.app_data_dir, ctx.session_id)
+        } else {
+            codex_hook_args(ctx.role_args, ctx.app_data_dir, false)
+        });
         out.extend(self.first_turn_argv(if ctx.resuming { None } else { ctx.first_turn }));
         out
     }
@@ -379,3 +490,37 @@ static MCP: McpConfig = McpConfig {
     preserve_disabled: false,
     supports_http: true,
 };
+
+#[cfg(test)]
+mod startup_error_tests {
+    use super::*;
+    #[test]
+    fn config_failure_is_classified_but_normal_output_is_not() {
+        let adapter = crate::runtimes::adapter(Runtime::Codex);
+        let field_error = "Error loading config.toml: unknown variant `mcp_tool`, expected one of `command`, `prompt`, `agent` in `hooks`";
+        let error = adapter.classify_startup_error(field_error).unwrap();
+        assert_eq!(error.runtime, Runtime::Codex);
+        assert!(error.output.contains("unknown variant `mcp_tool`"));
+        assert_eq!(
+            error.message,
+            "This Codex does not recognize Runner's mcp_tool hook type."
+        );
+        let future = adapter.classify_startup_error("Error loading config.toml: invalid type: integer, expected a string in hooks.command").unwrap();
+        assert!(future
+            .message
+            .contains("invalid type: integer, expected a string in hooks.command"));
+        let bounded = adapter
+            .classify_startup_error(&format!(
+                "Error loading config.toml: {}",
+                "x".repeat(10_000)
+            ))
+            .unwrap();
+        assert!(bounded.message.len() < 600);
+        assert!(adapter
+            .classify_startup_error("Interrupted by user")
+            .is_none());
+        assert!(crate::runtimes::adapter(Runtime::Pi)
+            .classify_startup_error(field_error)
+            .is_none());
+    }
+}

@@ -192,6 +192,7 @@ pub mod codex {
         ));
         Some(RuntimeCatalog {
             name: Runtime::Codex,
+            min_version: Some("0.149.0"),
             display_name: Runtime::Codex.display_name(),
             command: Runtime::Codex.command().unwrap(),
             capabilities: capabilities(),
@@ -310,6 +311,7 @@ pub mod claude_code {
         ];
         Some(RuntimeCatalog {
             name: Runtime::ClaudeCode,
+            min_version: None,
             display_name: Runtime::ClaudeCode.display_name(),
             command: Runtime::ClaudeCode.command().unwrap(),
             capabilities: capabilities(),
@@ -384,7 +386,6 @@ pub mod antigravity {
     }
     pub fn capabilities() -> RuntimeCapabilities {
         RuntimeCapabilities {
-            usage: true,
             effort_needs_launch_model: true,
             ..Default::default()
         }
@@ -392,6 +393,7 @@ pub mod antigravity {
     pub fn catalog() -> Option<RuntimeCatalog> {
         Some(RuntimeCatalog {
             name: Runtime::Antigravity,
+            min_version: None,
             display_name: Runtime::Antigravity.display_name(),
             command: Runtime::Antigravity.command().unwrap(),
             capabilities: capabilities(),
@@ -481,6 +483,7 @@ pub mod copilot {
     pub fn catalog() -> Option<RuntimeCatalog> {
         Some(RuntimeCatalog {
             name: Runtime::Copilot,
+            min_version: None,
             display_name: Runtime::Copilot.display_name(),
             command: Runtime::Copilot.command().unwrap(),
             capabilities: capabilities(),
@@ -553,6 +556,7 @@ pub mod pi {
     pub fn catalog() -> Option<RuntimeCatalog> {
         Some(RuntimeCatalog {
             name: Runtime::Pi,
+            min_version: None,
             display_name: Runtime::Pi.display_name(),
             command: Runtime::Pi.command().unwrap(),
             capabilities: capabilities(),
@@ -611,6 +615,7 @@ pub mod trae {
     pub fn catalog() -> Option<RuntimeCatalog> {
         Some(RuntimeCatalog {
             name: Runtime::Trae,
+            min_version: None,
             display_name: Runtime::Trae.display_name(),
             command: Runtime::Trae.command().unwrap(),
             capabilities: capabilities(),
@@ -664,6 +669,7 @@ pub mod cursor_agent {
     pub fn catalog() -> Option<RuntimeCatalog> {
         Some(RuntimeCatalog {
             name: Runtime::Cursor,
+            min_version: None,
             display_name: Runtime::Cursor.display_name(),
             command: Runtime::Cursor.command().unwrap(),
             capabilities: RuntimeCapabilities::default(),
@@ -732,6 +738,7 @@ pub mod grok {
     pub fn catalog() -> Option<RuntimeCatalog> {
         Some(RuntimeCatalog {
             name: Runtime::Grok,
+            min_version: None,
             display_name: Runtime::Grok.display_name(),
             command: Runtime::Grok.command().unwrap(),
             capabilities: RuntimeCapabilities::default(),
@@ -777,6 +784,7 @@ pub mod opencode {
     pub fn catalog() -> Option<RuntimeCatalog> {
         Some(RuntimeCatalog {
             name: Runtime::OpenCode,
+            min_version: None,
             display_name: "OpenCode",
             command: "opencode",
             capabilities: RuntimeCapabilities {
@@ -830,6 +838,24 @@ impl RuntimeMetadata {
     }
     pub fn catalog(&self) -> Option<RuntimeCatalog> {
         catalog_for(self.0)
+    }
+    /// Whether the composer reliably accepts and submits input typed during a turn, which the
+    /// agent then reads at its next tool call. Only a runtime shown to do so may be sent a
+    /// mission notice while it works; every other one waits for idle, because a notice typed
+    /// into a busy composer can sit unsubmitted there (#753, #1075).
+    pub fn queues_input_mid_turn(&self) -> bool {
+        match self.0 {
+            Runtime::ClaudeCode => true,
+            Runtime::Codex
+            | Runtime::Antigravity
+            | Runtime::Copilot
+            | Runtime::Pi
+            | Runtime::Trae
+            | Runtime::Cursor
+            | Runtime::Grok
+            | Runtime::OpenCode
+            | Runtime::Shell => false,
+        }
     }
     pub fn permissions(&self) -> &'static Permissions {
         match self.0 {
@@ -957,6 +983,25 @@ mod input_tests {
             for windows in [true, false] {
                 assert_eq!(super::for_key(key).image_paste_shortcut(windows), b"\x16");
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod mid_turn_tests {
+    use super::*;
+
+    #[test]
+    fn only_claude_code_is_marked_for_mid_turn_delivery() {
+        for runtime in Runtime::ALL {
+            assert_eq!(
+                for_key(runtime.key()).queues_input_mid_turn(),
+                runtime == Runtime::ClaudeCode,
+                "{runtime:?}"
+            );
+        }
+        for key in ["shell", "unknown", ""] {
+            assert!(!for_key(key).queues_input_mid_turn(), "{key}");
         }
     }
 }

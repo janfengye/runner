@@ -9,6 +9,10 @@ fn runtime_with_defaults(
     default_effort: Option<&str>,
 ) -> RuntimeCatalogEntry {
     RuntimeCatalogEntry {
+        installed_version: None,
+        available_version: None,
+        min_version: None,
+        below_minimum: false,
         name: Runtime::Codex,
         capabilities: runner_daemon::ops::runtime::RuntimeCatalogEntry::for_runtime(Runtime::Codex)
             .map(|entry| entry.capabilities)
@@ -338,7 +342,7 @@ fn role_page_harness(label: &str) -> RolePageHarness {
     });
     let label = label.to_owned();
     let host = cx.add_window(|window, cx| {
-        NativeRoot::new(
+        let mut root = NativeRoot::new(
             label,
             temp.path().join("logs"),
             None,
@@ -346,7 +350,11 @@ fn role_page_harness(label: &str) -> RolePageHarness {
             store.clone(),
             window,
             cx,
-        )
+        );
+        root.chat_surfaces
+            .open
+            .open(crate::surfaces::side_panel::PanelViewId::Info);
+        root
     });
     let visual = VisualTestContext::from_window(host.into(), &cx);
     RolePageHarness {
@@ -449,6 +457,9 @@ fn selected_chat_panel_keeps_recorded_values_after_a_shared_role_edit() {
             root.tabs.activate_session("panel-chat");
             root.route = AppRoute::Chat;
             root.sync_active_chat_detail(cx);
+            root.chat_surfaces
+                .open
+                .open(crate::surfaces::side_panel::PanelViewId::Info);
             cx.notify();
         })
         .unwrap();
@@ -1064,8 +1075,21 @@ fn an_untouched_form_is_clean_even_when_an_arg_holds_a_space() {
     assert!(!dirty, "opening the editor changes nothing");
     assert!(page.visual.debug_bounds("ROLE_EDIT_IN_PLACE").is_some());
     assert!(page.visual.debug_bounds("ROLE_EDIT_DIRTY").is_none());
+    assert!(page.visual.debug_bounds("ROLE_EDIT_ROW Args").is_some());
+    assert_eq!(
+        super::logic::role_command_label(&role),
+        "claude --label two words"
+    );
 
-    let args = page.read(|root| root.role_surfaces.edit.as_ref().unwrap().args.clone());
+    let args = page.read(|root| {
+        root.role_surfaces
+            .edit
+            .as_ref()
+            .unwrap()
+            .args
+            .clone()
+            .unwrap()
+    });
     page.host
         .update(&mut page.visual, |_, _, cx| {
             args.update(cx, |input, cx| {
@@ -1113,6 +1137,83 @@ fn saving_a_rename_keeps_an_arg_that_holds_a_space() {
     assert_eq!(stored.display_name, "Renamed coder");
     assert_eq!(stored.args, role.args, "a rename leaves the command alone");
     assert!(stored.args.iter().any(|arg| arg == "two words"));
+}
+
+#[test]
+fn an_edit_without_extra_args_is_clean_and_preserves_permission_flags() {
+    for mode in ["default", "auto", "bypass"] {
+        let mut page = role_page_harness("role-hidden-args");
+        let role = runner_daemon::ops::role::role_create(
+            &page.core,
+            serde_json::from_value(serde_json::json!({
+                "handle": "permission-coder",
+                "display_name": "Permission coder",
+                "runtime": "codex",
+                "command": "codex",
+                "permission_mode": mode
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(super::logic::role_command_label(&role), "codex");
+        page.open_role(&role.handle);
+        page.host
+            .update(&mut page.visual, |root, window, cx| {
+                root.open_role_edit(role.clone(), window, cx);
+                let form = root.role_surfaces.edit.as_ref().unwrap();
+                assert!(form.args.is_none());
+                assert!(!super::logic::role_edit_is_dirty(form, cx));
+                form.display_name
+                    .update(cx, |input, cx| input.set_text("Renamed coder", cx));
+            })
+            .unwrap();
+        page.visual.run_until_parked();
+        assert!(page.visual.debug_bounds("ROLE_EDIT_ROW Args").is_none());
+        page.click("ROLE_EDIT_SAVE");
+        let stored = runner_daemon::ops::role::role_get(&page.core, &role.id).unwrap();
+        assert_eq!(stored.display_name, "Renamed coder");
+        assert_eq!(
+            stored.args, role.args,
+            "{mode}: hidden args keep permission flags"
+        );
+    }
+}
+
+#[test]
+fn clearing_legacy_args_preserves_permissions_and_removes_the_field_on_reopen() {
+    let mut page = role_page_harness("role-clear-args");
+    let role =
+        create_test_role_with_args(&page.core, "legacy-coder", None, vec!["--verbose".into()]);
+    let mode = super::logic::role_permission_mode(&role);
+    assert_eq!(super::logic::role_command_label(&role), "claude --verbose");
+    page.open_role(&role.handle);
+    page.host
+        .update(&mut page.visual, |root, window, cx| {
+            root.open_role_edit(role.clone(), window, cx);
+        })
+        .unwrap();
+    page.visual.run_until_parked();
+    assert!(page.visual.debug_bounds("ROLE_EDIT_ROW Args").is_some());
+    page.host
+        .update(&mut page.visual, |root, _, cx| {
+            let form = root.role_surfaces.edit.as_ref().unwrap();
+            let args = form.args.as_ref().unwrap();
+            assert_eq!(args.read(cx).text(), "--verbose");
+            args.update(cx, |input, cx| input.set_text("", cx));
+            assert!(super::logic::role_edit_is_dirty(form, cx));
+        })
+        .unwrap();
+    page.click("ROLE_EDIT_SAVE");
+    let stored = runner_daemon::ops::role::role_get(&page.core, &role.id).unwrap();
+    assert!(super::logic::role_visible_args(&stored).is_empty());
+    assert_eq!(super::logic::role_permission_mode(&stored), mode);
+    assert_eq!(super::logic::role_command_label(&stored), "claude");
+    page.host
+        .update(&mut page.visual, |root, window, cx| {
+            root.open_role_edit(stored, window, cx);
+            assert!(root.role_surfaces.edit.as_ref().unwrap().args.is_none());
+        })
+        .unwrap();
 }
 
 #[test]
@@ -1788,6 +1889,7 @@ fn new_role_saves_effort_speed_and_prompt_then_opens_view_mode() {
             .unwrap();
         page.visual.run_until_parked();
         assert!(page.visual.debug_bounds("ROLE_CREATE_AVATAR").is_some());
+        assert!(page.visual.debug_bounds("ROLE_EDIT_ROW Args").is_none());
         let model = page.visual.debug_bounds("ROLE_EDIT_ROW Model").unwrap();
         let effort = page.visual.debug_bounds("ROLE_EDIT_ROW Effort").unwrap();
         assert_eq!(model.top(), effort.top());
@@ -1812,6 +1914,11 @@ fn new_role_saves_effort_speed_and_prompt_then_opens_view_mode() {
             Some(runner_daemon::model::CodexSpeed::Fast)
         );
         assert_eq!(role.system_prompt.as_deref(), Some("# Build\n\nShip it."));
+        assert!(super::logic::role_visible_args(&role).is_empty());
+        assert_eq!(
+            super::logic::role_permission_mode(&role),
+            Some(PermissionMode::Default)
+        );
         assert_eq!(
             page.read(|root| root.route.clone()),
             AppRoute::RoleDetail("new-coder".into())
@@ -2014,6 +2121,9 @@ fn chat_panel_opens_role_clamps_toggles_and_resets_on_another_chat() {
             root.tabs.activate_session("first-panel-chat");
             root.route = AppRoute::Chat;
             root.sync_active_chat_detail(cx);
+            root.chat_surfaces
+                .open
+                .open(crate::surfaces::side_panel::PanelViewId::Info);
             cx.notify();
         })
         .unwrap();
@@ -2048,6 +2158,9 @@ fn chat_panel_opens_role_clamps_toggles_and_resets_on_another_chat() {
         .update(&mut page.visual, |root, _, cx| {
             root.tabs.activate_session("second-panel-chat");
             root.sync_active_chat_detail(cx);
+            root.chat_surfaces
+                .open
+                .open(crate::surfaces::side_panel::PanelViewId::Info);
             cx.notify();
         })
         .unwrap();
@@ -2074,6 +2187,9 @@ fn chat_panel_opens_role_clamps_toggles_and_resets_on_another_chat() {
         page.host
             .update(&mut page.visual, |root, _, cx| {
                 root.sync_active_chat_detail(cx);
+                root.chat_surfaces
+                    .open
+                    .open(crate::surfaces::side_panel::PanelViewId::Info);
                 cx.notify();
             })
             .unwrap();
@@ -2084,6 +2200,9 @@ fn chat_panel_opens_role_clamps_toggles_and_resets_on_another_chat() {
         .update(&mut page.visual, |root, _, cx| {
             root.set_route(AppRoute::Chat, cx);
             root.sync_active_chat_detail(cx);
+            root.chat_surfaces
+                .open
+                .open(crate::surfaces::side_panel::PanelViewId::Info);
             cx.notify();
         })
         .unwrap();
@@ -2099,6 +2218,9 @@ fn chat_panel_opens_role_clamps_toggles_and_resets_on_another_chat() {
             root.tabs.activate_session("runtime-panel-chat");
             root.set_route(AppRoute::Chat, cx);
             root.sync_active_chat_detail(cx);
+            root.chat_surfaces
+                .open
+                .open(crate::surfaces::side_panel::PanelViewId::Info);
             cx.notify();
         })
         .unwrap();

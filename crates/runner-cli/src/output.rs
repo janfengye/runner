@@ -18,6 +18,7 @@ pub enum View {
     MissionList,
     Mission,
     MissionShow,
+    MissionLink,
     MissionFeed,
     SessionList,
     SessionShow,
@@ -91,6 +92,7 @@ fn render_default(view: View, value: &Value) -> Vec<String> {
         View::MissionList => render_mission_list(value),
         View::Mission => render_mission(value),
         View::MissionShow => render_mission_show(value),
+        View::MissionLink => render_mission_link(value),
         View::MissionFeed => render_mission_feed(value),
         View::SessionList => render_session_list(value),
         View::SessionShow => render_session_show(value),
@@ -336,6 +338,38 @@ fn render_mission(value: &Value) -> Vec<String> {
     ])
 }
 
+/// "Frontman (01S…), reports on": a mission's linked chat, or none.
+fn linked_chat(mission: &Value) -> Value {
+    let Some(chat) = mission.get("linked_chat").filter(|chat| !chat.is_null()) else {
+        return Value::Null;
+    };
+    let archived = if chat.get("archived").and_then(Value::as_bool) == Some(true) {
+        ", archived"
+    } else {
+        ""
+    };
+    let reports = if chat.get("reports").and_then(Value::as_bool) == Some(false) {
+        "reports off"
+    } else {
+        "reports on"
+    };
+    Value::String(format!(
+        "{} ({}{archived}), {reports}",
+        text(chat.get("title")),
+        text(chat.get("session_id")),
+    ))
+}
+
+fn render_mission_link(value: &Value) -> Vec<String> {
+    let mission = mission_value(value);
+    let linked = linked_chat(mission);
+    key_values(&[
+        ("ID", mission.get("id")),
+        ("TITLE", mission.get("title")),
+        ("LINKED TO", Some(&linked)),
+    ])
+}
+
 fn render_mission_show(value: &Value) -> Vec<String> {
     let mission = mission_value(value);
     let crew = value.get("crew").unwrap_or(&Value::Null);
@@ -350,14 +384,42 @@ fn render_mission_show(value: &Value) -> Vec<String> {
             .and_then(Value::as_array)
             .map_or(0, Vec::len),
     ));
+    let started_by = value
+        .get("started_by")
+        .filter(|starter| !starter.is_null())
+        .map_or(Value::Null, |starter| {
+            Value::String(format!(
+                "{} ({})",
+                text(starter.get("title")),
+                text(starter.get("session_id"))
+            ))
+        });
+    let linked = linked_chat(mission);
+    // The state a report names, beside the lifecycle STATUS (#748).
+    let state = value
+        .get("phase")
+        .and_then(Value::as_str)
+        .map_or(Value::Null, |phase| {
+            let restarted = value
+                .get("interrupted_at")
+                .and_then(Value::as_str)
+                .filter(|_| phase == "interrupted")
+                .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+                .map(|at| format!(" (Runner restarted at {})", restart_time(at)))
+                .unwrap_or_default();
+            Value::String(format!("{}{restarted}", phase.replace('_', " ")))
+        });
     let mut lines = key_values(&[
         ("ID", mission.get("id")),
         ("TITLE", mission.get("title")),
         ("STATUS", Some(&status)),
+        ("STATE", Some(&state)),
         ("CREW", crew.get("name")),
         ("PROJECT", mission.get("project_id")),
         ("CWD", mission.get("cwd")),
         ("STARTED", mission.get("started_at")),
+        ("STARTED BY", Some(&started_by)),
+        ("LINKED TO", Some(&linked)),
     ]);
 
     let latest = value
@@ -433,6 +495,13 @@ fn render_mission_show(value: &Value) -> Vec<String> {
         }
     }
     lines
+}
+
+/// `7:57 PM`, in the viewer's time zone.
+fn restart_time(at: chrono::DateTime<chrono::FixedOffset>) -> String {
+    at.with_timezone(&chrono::Local)
+        .format("%-I:%M %p")
+        .to_string()
 }
 
 fn displayed_mission_status(
@@ -545,7 +614,7 @@ pub fn write_feed_events(
 
 fn event_text(event: &Value) -> String {
     let payload = event.get("payload").unwrap_or(&Value::Null);
-    for key in ["text", "message", "prompt", "question", "note", "choice"] {
+    for key in ["text", "message", "prompt", "question", "choice", "note"] {
         if let Some(value) = payload.get(key) {
             return cell_width(Some(value), 72);
         }
@@ -1026,7 +1095,10 @@ mod tests {
             ]
         );
         let show = json!({
-            "mission": {"id": "mission-id", "title": "CLI", "status": "running", "crew_id": "crew-id", "project_id": null, "cwd": "/repo", "started_at": "2026-09-18T10:20:30Z"},
+            "mission": {"id": "mission-id", "title": "CLI", "status": "running", "crew_id": "crew-id", "project_id": null, "cwd": "/repo", "started_at": "2026-09-18T10:20:30Z",
+                "linked_chat": {"session_id": "chat-id", "title": "Frontman", "archived": true, "reports": false}},
+            "started_by": {"session_id": "chat-id", "title": "Frontman"},
+            "phase": "needs_you",
             "crew": {"name": "Peer"},
             "live_session_count": 1,
             "sessions": [{"id": "session-id", "handle": "coder", "role_handle": "implementer", "lead": true, "runtime": "codex", "status": "running"}],
@@ -1037,13 +1109,16 @@ mod tests {
         assert_eq!(
             render_default(View::MissionShow, &show),
             [
-                "ID       mission-id",
-                "TITLE    CLI",
-                "STATUS   running",
-                "CREW     Peer",
-                "PROJECT  -",
-                "CWD      /repo",
-                "STARTED  2026-09-18T10:20:30Z",
+                "ID          mission-id",
+                "TITLE       CLI",
+                "STATUS      running",
+                "STATE       needs you",
+                "CREW        Peer",
+                "PROJECT     -",
+                "CWD         /repo",
+                "STARTED     2026-09-18T10:20:30Z",
+                "STARTED BY  Frontman (chat-id)",
+                "LINKED TO   Frontman (chat-id, archived), reports off",
                 "",
                 "HANDLE  ROLE         RUNTIME  STATUS   STATE  SESSION ID",
                 "coder   implementer  codex    running  busy   session-id",
@@ -1054,6 +1129,28 @@ mod tests {
                 "RECENT WARNINGS",
                 "10:21:31  router  retry later",
             ]
+        );
+
+        let interrupted = json!({
+            "mission": {"id": "mission-id", "title": "CLI", "status": "running"},
+            "phase": "interrupted",
+            "interrupted_at": "2026-11-05T07:50:17.123456Z",
+            "live_session_count": 1,
+            "sessions": [{"id": "session-id", "handle": "coder", "role_handle": "implementer", "runtime": "codex", "status": "running"}],
+            "latest_session_status_by_handle": {"coder": {"state": "interrupted"}}
+        });
+        let lines = render_default(View::MissionShow, &interrupted);
+        assert_eq!(
+            lines[3],
+            format!(
+                "STATE       interrupted (Runner restarted at {})",
+                restart_time("2026-11-05T07:50:17.123456Z".parse().unwrap())
+            )
+        );
+        assert!(restart_time("2026-11-05T19:57:00+00:00".parse().unwrap()).ends_with('M'));
+        assert_eq!(
+            lines[12],
+            "coder   implementer  codex    running  interrupted  session-id"
         );
     }
 
@@ -1108,7 +1205,7 @@ mod tests {
         });
         assert!(render_default(View::MissionShow, &show)
             .iter()
-            .any(|line| line == "STATUS   stopped"));
+            .any(|line| line == "STATUS      stopped"));
 
         let status = json!({
             "cli_version": "0.10.0",
@@ -1172,6 +1269,23 @@ mod tests {
         assert_eq!(
             render_default(View::Generic, &json!({"nested": {"a": "one\ntwo"}})),
             [r#"nested  {"a":"one\ntwo"}"#]
+        );
+    }
+
+    #[test]
+    fn a_noted_answer_previews_its_choice_in_the_feed() {
+        let feed = json!({
+            "events": [
+                {"event": {"id": "1", "ts": "2026-09-18T10:20:30Z", "kind": "signal", "from": "human", "to": null, "type": "human_response", "payload": {"question_id": "q", "choice": "yes", "note": "Only on Friday"}}}
+            ],
+            "skipped": [], "next_offset": 42
+        });
+        assert_eq!(
+            render_default(View::MissionFeed, &feed),
+            [
+                "10:20:30  human -> all  human_response  yes",
+                "next_offset  42",
+            ]
         );
     }
 

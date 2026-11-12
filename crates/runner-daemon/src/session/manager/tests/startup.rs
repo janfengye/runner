@@ -521,6 +521,69 @@ fn a_synthetic_busy_publication_cannot_confirm_an_attempt() {
 }
 
 #[test]
+fn only_a_turn_reporting_the_typed_line_as_its_prompt_marks_it_delivered() {
+    let fixture = StartupFixture::new();
+    let _output = fixture.launch("claude-code", false, Instant::now());
+    fixture.event(Runtime::ClaudeCode, AgentEvent::StartupReady);
+    let prompted = || {
+        fixture
+            .manager
+            .delivery_snapshot("session")
+            .unwrap()
+            .prompted
+    };
+    let turn = |prompt: &str| {
+        fixture.manager.publish_agent_event(
+            "session",
+            AgentEvent::Batch {
+                runtime: Runtime::ClaudeCode,
+                events: vec![
+                    AgentEvent::PromptSubmitted {
+                        prompt: prompt.into(),
+                    },
+                    AgentEvent::TurnStarted,
+                ],
+            },
+            &Capture::default(),
+        );
+    };
+    let end = || {
+        fixture.event(
+            Runtime::ClaudeCode,
+            AgentEvent::TurnEnded {
+                outcome: crate::session::status::TurnOutcome::Completed,
+            },
+        );
+    };
+    let typed = |line: &[u8]| {
+        let DeliveryReservation::Ready(token) =
+            fixture.manager.reserve_delivery("session").unwrap()
+        else {
+            panic!("the session is not ready");
+        };
+        assert!(fixture
+            .manager
+            .inject_reserved("session", token, line)
+            .unwrap());
+        fixture.manager.finish_delivery("session", token);
+    };
+
+    typed(b"[runner] line");
+    assert!(!prompted());
+    turn("a scheduled wakeup");
+    assert!(!prompted(), "another prompt");
+    end();
+    fixture.event(Runtime::ClaudeCode, AgentEvent::TurnStarted);
+    assert!(!prompted(), "a turn with no reported prompt");
+    end();
+    turn("[runner] line\n");
+    assert!(prompted());
+    end();
+    typed(b"[runner] next");
+    assert!(!prompted(), "the next line starts unproven");
+}
+
+#[test]
 fn approval_response_and_release_are_readiness_events_not_composer_clear_evidence() {
     #[derive(Default)]
     struct Events(Mutex<Vec<crate::router::SessionDeliveryEvent>>);
@@ -761,7 +824,7 @@ fn an_ignored_delivery_enter_is_resubmitted_at_turn_end_instead_of_holding_as_a_
         advance(crate::router::dispatch::CONFIRM_WINDOW);
         assert!(matches!(
             readiness(Duration::ZERO),
-            DeliveryReadiness::Ready { .. }
+            DeliveryReadiness::Ready { .. } | DeliveryReadiness::Unconfirmed
         ));
         fixture
             .manager
@@ -774,6 +837,418 @@ fn an_ignored_delivery_enter_is_resubmitted_at_turn_end_instead_of_holding_as_a_
         drop(terminal);
         for worker in workers {
             worker.join().unwrap();
+        }
+    }
+}
+
+#[test]
+fn a_confirmed_notice_left_on_screen_never_holds_the_idle_member() {
+    // After the turn the input cursor sits below the output, off the live composer. Either the
+    // submitted prompt stays in history at the composer row the tracker followed (#1125), or that
+    // row now holds output and no prompt row is near it.
+    for history_at_composer_row in [true, false] {
+        let fixture = StartupFixture::new();
+        let _output = fixture.launch("claude-code", false, Instant::now());
+        fixture.event(Runtime::ClaudeCode, AgentEvent::StartupReady);
+        let pool = db::open_pool(&fixture._dir.path().join("terminal.db")).unwrap();
+        let events: Arc<dyn SessionEvents> = Arc::new(Capture::default());
+        let terminal = fixture
+            .manager
+            .create_terminal("session", 80, 8, &pool, &events)
+            .unwrap();
+        fixture
+            .manager
+            .session_state("session")
+            .unwrap()
+            .lock()
+            .unwrap()
+            .terminal = Some(terminal.clone());
+        let emit = |bytes: &[u8]| {
+            fixture
+                .manager
+                .ingest_output_chunk("session", Some("mission"), bytes, events.as_ref());
+        };
+        let now = || *fixture.now.lock().unwrap();
+        let advance = |duration| {
+            *fixture.now.lock().unwrap() += duration;
+            crate::session::clock::at(now(), 0, || fixture.drive());
+        };
+        let inputs = || fixture.fake.inputs.lock().unwrap().clone();
+        emit(b"\x1b[5;1H> ");
+        fixture.drive();
+        fixture.queue("first");
+        let body = match &inputs()[0] {
+            FakeInput::Bytes { bytes, .. } => String::from_utf8(bytes.clone()).unwrap(),
+            other => panic!("{other:?}"),
+        };
+        emit(format!("\x1b[5;1H\x1b[K> {body}").as_bytes());
+        advance(Duration::from_millis(300));
+        assert!(
+            matches!(inputs().last(), Some(FakeInput::Key { key, .. }) if key == "Enter"),
+            "{:?}",
+            inputs()
+        );
+        crate::session::clock::at(now(), 0, || {
+            fixture.event(Runtime::ClaudeCode, AgentEvent::TurnStarted)
+        });
+        if history_at_composer_row {
+            emit(
+                format!("\x1b[5;1H\x1b[K> {body}\x1b[6;1H\x1b[K⏺ Read 1 message\x1b[7;1H\x1b[K> \x1b[8;1H\x1b[K")
+                    .as_bytes(),
+            );
+        } else {
+            emit(
+                "\x1b[2J\x1b[1;1H⏺ Read 1 message\x1b[5;1H⏺ Replied to @qa\x1b[7;1H> \x1b[8;1H"
+                    .as_bytes(),
+            );
+        }
+        advance(crate::router::dispatch::CONFIRM_WINDOW);
+        assert_eq!(fixture.fake.inputs.lock().unwrap().len(), 2);
+        crate::session::clock::at(now(), 0, || {
+            fixture.event(
+                Runtime::ClaudeCode,
+                AgentEvent::TurnEnded {
+                    outcome: TurnOutcome::Completed,
+                },
+            )
+        });
+        advance(Duration::from_secs(60));
+        crate::session::clock::at(now(), 0, || fixture.queue("second"));
+        advance(Duration::from_millis(300));
+        let readiness =
+            crate::session::clock::at(now(), 0, || fixture.manager.delivery_readiness("session"));
+        let typed = inputs();
+        fixture
+            .manager
+            .session_state("session")
+            .unwrap()
+            .lock()
+            .unwrap()
+            .terminal = None;
+        let workers = terminal.take_workers();
+        drop(terminal);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert!(
+            typed.iter().any(|input| matches!(input, FakeInput::Bytes { bytes, .. }
+                if String::from_utf8_lossy(bytes).contains("2 new messages"))),
+            "history_at_composer_row={history_at_composer_row} readiness={readiness:?} hold={:?} inputs={typed:?}",
+            fixture.dispatcher.lock().unwrap().hold_reason("tester")
+        );
+    }
+}
+
+#[test]
+fn an_output_observation_published_after_the_confirmation_cannot_restore_the_hold() {
+    use crate::router::DeliveryReadiness;
+
+    let fixture = StartupFixture::new();
+    let _output = fixture.launch("claude-code", false, Instant::now());
+    fixture.event(Runtime::ClaudeCode, AgentEvent::StartupReady);
+    let pool = db::open_pool(&fixture._dir.path().join("terminal.db")).unwrap();
+    let events: Arc<dyn SessionEvents> = Arc::new(Capture::default());
+    let terminal = fixture
+        .manager
+        .create_terminal("session", 80, 8, &pool, &events)
+        .unwrap();
+    fixture
+        .manager
+        .session_state("session")
+        .unwrap()
+        .lock()
+        .unwrap()
+        .terminal = Some(terminal.clone());
+    let emit = |bytes: &[u8]| {
+        fixture
+            .manager
+            .ingest_output_chunk("session", Some("mission"), bytes, events.as_ref());
+    };
+    let now = || *fixture.now.lock().unwrap();
+    let advance = |duration| {
+        *fixture.now.lock().unwrap() += duration;
+        crate::session::clock::at(now(), 0, || fixture.drive());
+    };
+    let readiness =
+        || crate::session::clock::at(now(), 0, || fixture.manager.delivery_readiness("session"));
+    emit(b"\x1b[5;1H> ");
+    fixture.drive();
+    fixture.queue("first");
+    let body = match &fixture.fake.inputs.lock().unwrap()[0] {
+        FakeInput::Bytes { bytes, .. } => String::from_utf8(bytes.clone()).unwrap(),
+        other => panic!("{other:?}"),
+    };
+    emit(format!("\x1b[5;1H\x1b[K> {body}").as_bytes());
+    advance(Duration::from_millis(300));
+    crate::session::clock::at(now(), 0, || {
+        fixture.event(Runtime::ClaudeCode, AgentEvent::TurnStarted)
+    });
+    // The output thread computes its observation, then the router confirms before it publishes.
+    let seq = fixture
+        .manager
+        .session_state("session")
+        .unwrap()
+        .lock()
+        .unwrap()
+        .output_seq
+        + 1;
+    let late = terminal.feed_output(
+        seq,
+        format!("\x1b[5;1H\x1b[K> {body}\x1b[6;1H\x1b[K⏺ Read 1 message\x1b[7;1H\x1b[K> \x1b[8;1H\x1b[K")
+            .as_bytes(),
+    );
+    assert_eq!(late.map(|late| late.state), Some(InputState::Unsent));
+    advance(crate::router::dispatch::CONFIRM_WINDOW);
+    terminal.publish_input(late);
+    crate::session::clock::at(now(), 0, || {
+        fixture.event(
+            Runtime::ClaudeCode,
+            AgentEvent::TurnEnded {
+                outcome: TurnOutcome::Completed,
+            },
+        )
+    });
+    let idle = readiness();
+    crate::session::clock::at(now(), 0, || fixture.queue("second"));
+    advance(Duration::from_secs(1));
+    let typed = fixture.fake.inputs.lock().unwrap().clone();
+    fixture
+        .manager
+        .session_state("session")
+        .unwrap()
+        .lock()
+        .unwrap()
+        .terminal = None;
+    let workers = terminal.take_workers();
+    drop(terminal);
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    assert_eq!(idle, DeliveryReadiness::Ready { idle: true });
+    assert!(
+        typed
+            .iter()
+            .any(|input| matches!(input, FakeInput::Bytes { bytes, .. }
+            if String::from_utf8_lossy(bytes).contains("2 new messages"))),
+        "{typed:?}"
+    );
+}
+
+#[test]
+fn person_input_before_the_confirmation_keeps_its_draft_held() {
+    use crate::router::DeliveryReadiness;
+    use runner_terminal::input_state::InputEvent;
+    use runner_terminal::mappings::InputKind;
+
+    for paste in [false, true] {
+        let fixture = StartupFixture::new();
+        let _output = fixture.launch("claude-code", false, Instant::now());
+        fixture.event(Runtime::ClaudeCode, AgentEvent::StartupReady);
+        let pool = db::open_pool(&fixture._dir.path().join("terminal.db")).unwrap();
+        let events: Arc<dyn SessionEvents> = Arc::new(Capture::default());
+        let terminal = fixture
+            .manager
+            .create_terminal("session", 80, 8, &pool, &events)
+            .unwrap();
+        fixture
+            .manager
+            .session_state("session")
+            .unwrap()
+            .lock()
+            .unwrap()
+            .terminal = Some(terminal.clone());
+        let emit = |bytes: &[u8]| {
+            fixture
+                .manager
+                .ingest_output_chunk("session", Some("mission"), bytes, events.as_ref());
+        };
+        let now = || *fixture.now.lock().unwrap();
+        let advance = |duration| {
+            *fixture.now.lock().unwrap() += duration;
+            crate::session::clock::at(now(), 0, || fixture.drive());
+        };
+        let notices = || {
+            fixture
+                .fake
+                .inputs
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|input| matches!(input, FakeInput::Bytes { bytes, .. } if String::from_utf8_lossy(bytes).contains("new messages")))
+                .count()
+        };
+        emit(b"\x1b[5;1H> ");
+        fixture.drive();
+        fixture.queue("first");
+        let body = match &fixture.fake.inputs.lock().unwrap()[0] {
+            FakeInput::Bytes { bytes, .. } => String::from_utf8(bytes.clone()).unwrap(),
+            other => panic!("{other:?}"),
+        };
+        emit(format!("\x1b[5;1H\x1b[K> {body}").as_bytes());
+        *fixture.now.lock().unwrap() += Duration::from_millis(300);
+        let snapshot = crate::session::clock::at(now(), 0, || {
+            fixture.drive();
+            fixture.manager.delivery_snapshot("session").unwrap()
+        });
+        crate::session::clock::at(now(), 0, || {
+            fixture.event(Runtime::ClaudeCode, AgentEvent::TurnStarted)
+        });
+        emit(
+            format!("\x1b[5;1H\x1b[K> {body}\x1b[6;1H\x1b[K⏺ Read 1 message\x1b[7;1H\x1b[K> \x1b[8;1H\x1b[K")
+                .as_bytes(),
+        );
+        // The router has decided to confirm; a person's input lands before its echo.
+        terminal.observe_input(&if paste {
+            InputEvent::Paste {
+                text: "draft".into(),
+            }
+        } else {
+            InputEvent::Key {
+                kind: InputKind::Content {
+                    text: "draft".into(),
+                },
+            }
+        });
+        fixture.typed();
+        fixture.manager.confirm_delivery("session", &snapshot);
+        emit(b"\x1b[7;1H\x1b[K> draft");
+        crate::session::clock::at(now(), 0, || {
+            fixture.event(
+                Runtime::ClaudeCode,
+                AgentEvent::TurnEnded {
+                    outcome: TurnOutcome::Completed,
+                },
+            )
+        });
+        advance(Duration::from_secs(60));
+        crate::session::clock::at(now(), 0, || fixture.queue("second"));
+        advance(Duration::from_secs(1));
+        advance(Duration::from_secs(150));
+        let readiness =
+            crate::session::clock::at(now(), 0, || fixture.manager.delivery_readiness("session"));
+        let typed = notices();
+        fixture
+            .manager
+            .session_state("session")
+            .unwrap()
+            .lock()
+            .unwrap()
+            .terminal = None;
+        let workers = terminal.take_workers();
+        drop(terminal);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert!(
+            !matches!(
+                readiness,
+                DeliveryReadiness::Ready { .. } | DeliveryReadiness::Working
+            ),
+            "paste={paste} readiness={readiness:?}"
+        );
+        assert_eq!(typed, 1, "paste={paste}: no notice is typed over the draft");
+    }
+}
+
+#[test]
+fn an_unsent_notice_without_a_pending_attempt_is_rechecked_when_the_member_is_idle() {
+    use crate::router::DeliveryReadiness;
+
+    // The tracker still owns a submitted notice that no attempt of this dispatcher left behind.
+    for stale in [true, false] {
+        let fixture = StartupFixture::new();
+        let _output = fixture.launch("claude-code", false, Instant::now());
+        fixture.event(Runtime::ClaudeCode, AgentEvent::StartupReady);
+        let pool = db::open_pool(&fixture._dir.path().join("terminal.db")).unwrap();
+        let events: Arc<dyn SessionEvents> = Arc::new(Capture::default());
+        let terminal = fixture
+            .manager
+            .create_terminal("session", 80, 8, &pool, &events)
+            .unwrap();
+        fixture
+            .manager
+            .session_state("session")
+            .unwrap()
+            .lock()
+            .unwrap()
+            .terminal = Some(terminal.clone());
+        let emit = |bytes: &[u8]| {
+            fixture
+                .manager
+                .ingest_output_chunk("session", Some("mission"), bytes, events.as_ref());
+        };
+        let now = || *fixture.now.lock().unwrap();
+        let advance = |duration| {
+            *fixture.now.lock().unwrap() += duration;
+            crate::session::clock::at(now(), 0, || fixture.drive());
+        };
+        let notices = || {
+            fixture
+                .fake
+                .inputs
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|input| matches!(input, FakeInput::Bytes { bytes, .. } if String::from_utf8_lossy(bytes).contains("new messages")))
+                .count()
+        };
+        let notice = "[inbox] 1 new messages — run `runner msg read` to view.";
+        let echo = format!("\x1b[5;1H\x1b[K> {notice}");
+        emit(b"\x1b[5;1H> Try a task");
+        fixture.drive();
+        terminal.track_delivery_input(notice);
+        emit(echo.as_bytes());
+        terminal.track_delivery_submit();
+        if stale {
+            crate::session::clock::at(now(), 0, || {
+                fixture.event(Runtime::ClaudeCode, AgentEvent::TurnStarted)
+            });
+            emit(
+                format!("{echo}\x1b[6;1H\x1b[K⏺ Read 1 message\x1b[7;1H\x1b[K> \x1b[8;1H\x1b[K")
+                    .as_bytes(),
+            );
+            crate::session::clock::at(now(), 0, || {
+                fixture.event(
+                    Runtime::ClaudeCode,
+                    AgentEvent::TurnEnded {
+                        outcome: TurnOutcome::Completed,
+                    },
+                )
+            });
+        } else {
+            emit(echo.as_bytes());
+        }
+        let readiness = || {
+            crate::session::clock::at(now(), 0, || fixture.manager.delivery_readiness("session"))
+        };
+        assert_eq!(readiness(), DeliveryReadiness::Unsent, "stale={stale}");
+        assert_eq!(
+            fixture.manager.activity_snapshot()["session"],
+            SessionActivityState::Idle,
+            "stale={stale}"
+        );
+        advance(Duration::from_secs(1));
+        crate::session::clock::at(now(), 0, || fixture.queue("first"));
+        advance(Duration::from_millis(300));
+        advance(Duration::from_secs(150));
+        let (after, typed) = (readiness(), notices());
+        fixture
+            .manager
+            .session_state("session")
+            .unwrap()
+            .lock()
+            .unwrap()
+            .terminal = None;
+        let workers = terminal.take_workers();
+        drop(terminal);
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        if stale {
+            assert_eq!(typed, 1, "the released member gets its notice");
+        } else {
+            assert_eq!(after, DeliveryReadiness::Unsent);
+            assert_eq!(typed, 0, "a notice under the cursor is never typed over");
         }
     }
 }
@@ -975,6 +1450,8 @@ fn generated_submissions_accept_rotating_placeholders_and_deliver_later_backlogs
         assert!(matches!(
             crate::session::clock::at(now, 0, || fixture.manager.delivery_readiness("session")),
             crate::router::DeliveryReadiness::Ready { .. }
+                | crate::router::DeliveryReadiness::Working
+                | crate::router::DeliveryReadiness::Unconfirmed
         ));
         assert_eq!(terminal.input_reset_guard(), revision);
         crate::session::clock::at(now, 0, || fixture.queue("second"));
@@ -1062,6 +1539,8 @@ fn generated_submit_cannot_publish_over_a_newer_composition_observation() {
         fn is_local_host(&self, _: &str) -> bool {
             true
         }
+        fn clipboard_store(&self, _: &str, _: runner_terminal::terminal::ClipboardTarget, _: &str) {
+        }
     }
 
     for guarded in [false, true] {
@@ -1124,5 +1603,665 @@ fn generated_submit_cannot_publish_over_a_newer_composition_observation() {
         for worker in workers {
             worker.join().unwrap();
         }
+    }
+}
+
+#[test]
+fn a_return_that_starts_no_turn_frees_the_member_for_its_queued_notice() {
+    for runtime in [Runtime::ClaudeCode, Runtime::Codex] {
+        let fixture = StartupFixture::new();
+        let output = fixture.launch(runtime.key(), false, Instant::now());
+        fixture.event(runtime, AgentEvent::StartupReady);
+        let stop = output.stop_flag();
+        let events = Capture::default();
+        let start = *fixture.now.lock().unwrap();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        let advance_to = |secs: u64| {
+            *fixture.now.lock().unwrap() = at(secs);
+            crate::session::clock::at(at(secs), 0, || fixture.drive());
+        };
+        let activity = || fixture.manager.activity_snapshot()["session"];
+        let notices = || {
+            fixture
+                .fake
+                .inputs
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|input| matches!(input, FakeInput::Bytes { bytes, .. } if String::from_utf8_lossy(bytes).contains("new message")))
+                .count()
+        };
+        let statuses = || -> Vec<(String, String)> {
+            fixture
+                .log
+                .read_from(0)
+                .unwrap()
+                .into_iter()
+                .filter(|entry| {
+                    entry.event.signal_type.as_ref().map(SignalType::as_str)
+                        == Some("session_status")
+                })
+                .map(|entry| {
+                    (
+                        entry.event.payload["state"].as_str().unwrap().to_owned(),
+                        entry.event.payload["source"].as_str().unwrap().to_owned(),
+                    )
+                })
+                .collect()
+        };
+
+        // Return on an empty composer, from the keyboard rather than the router.
+        crate::session::clock::at(at(0), 0, || {
+            fixture
+                .manager
+                .inject_direct_stdin("session", b"\r", &events)
+                .unwrap()
+        });
+        assert_eq!(activity(), SessionActivityState::Busy, "{runtime:?}");
+        if runtime == Runtime::Codex {
+            // Codex repaints its composer on an Enter it ignores; that is not a turn.
+            fixture.manager.ingest_output_chunk(
+                "session",
+                Some("mission"),
+                b"\x1b[2;1H\xe2\x80\xba Ask Codex",
+                &events,
+            );
+        }
+        advance_to(3);
+        // Claude Code queues input typed while it is busy, so its notice goes at once; Codex
+        // waits for the Busy to clear.
+        let mid_turn = runtime == Runtime::ClaudeCode;
+        assert_eq!(
+            crate::session::clock::at(at(3), 0, || fixture.manager.delivery_readiness("session")),
+            if mid_turn {
+                crate::router::DeliveryReadiness::Working
+            } else {
+                crate::router::DeliveryReadiness::Unconfirmed
+            },
+            "{runtime:?}"
+        );
+        crate::session::clock::at(at(3), 0, || fixture.queue("hello"));
+        // The local Enter's input-clear grace ends half a second later.
+        advance_to(4);
+        assert_eq!(notices(), usize::from(mid_turn), "{runtime:?}");
+
+        crate::session::clock::at(at(9), 0, || {
+            fixture
+                .manager
+                .expire_submit_busy("session", &stop, &events)
+        });
+        advance_to(9);
+        assert_eq!(activity(), SessionActivityState::Busy, "{runtime:?}");
+        assert_eq!(notices(), usize::from(mid_turn), "{runtime:?}");
+
+        crate::session::clock::at(at(11), 0, || {
+            fixture
+                .manager
+                .expire_submit_busy("session", &stop, &events)
+        });
+        assert_eq!(activity(), SessionActivityState::Idle, "{runtime:?}");
+        advance_to(11);
+        assert_eq!(notices(), 1, "{runtime:?}: the queued notice is delivered");
+        assert!(
+            statuses().contains(&("idle".to_owned(), "input-timeout".to_owned())),
+            "{runtime:?}: {:?}",
+            statuses()
+        );
+        let published = events.status.lock().unwrap();
+        assert!(
+            published
+                .iter()
+                .any(|event| event.state == SessionActivityState::Idle
+                    && event.source.as_str() == "input-timeout"),
+            "{runtime:?}"
+        );
+    }
+}
+
+#[test]
+fn a_turn_that_reports_in_time_is_never_reverted_and_a_late_one_returns_to_busy() {
+    for late in [false, true] {
+        let fixture = StartupFixture::new();
+        let output = fixture.launch("claude-code", false, Instant::now());
+        fixture.event(Runtime::ClaudeCode, AgentEvent::StartupReady);
+        let stop = output.stop_flag();
+        let events = Capture::default();
+        let start = *fixture.now.lock().unwrap();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        let activity = || fixture.manager.activity_snapshot()["session"];
+        crate::session::clock::at(at(0), 0, || {
+            fixture
+                .manager
+                .inject_direct_stdin("session", b"\r", &events)
+                .unwrap()
+        });
+        let expire = |secs: u64| {
+            crate::session::clock::at(at(secs), 0, || {
+                fixture
+                    .manager
+                    .expire_submit_busy("session", &stop, &events)
+            })
+        };
+        if !late {
+            crate::session::clock::at(at(2), 0, || {
+                fixture.event(Runtime::ClaudeCode, AgentEvent::TurnStarted)
+            });
+        }
+        expire(11);
+        if late {
+            assert_eq!(activity(), SessionActivityState::Idle);
+            crate::session::clock::at(at(14), 0, || {
+                fixture.event(Runtime::ClaudeCode, AgentEvent::TurnStarted)
+            });
+        }
+        assert_eq!(activity(), SessionActivityState::Busy, "late={late}");
+        assert_eq!(
+            fixture.manager.agent_status("session").observation.activity,
+            Activity::Working,
+            "late={late}"
+        );
+        crate::session::clock::at(at(40), 0, || {
+            fixture.event(
+                Runtime::ClaudeCode,
+                AgentEvent::TurnEnded {
+                    outcome: TurnOutcome::Completed,
+                },
+            )
+        });
+        assert_eq!(activity(), SessionActivityState::Idle, "late={late}");
+        expire(60);
+        assert_eq!(activity(), SessionActivityState::Idle, "late={late}");
+    }
+}
+
+#[test]
+fn the_forwarder_loop_withdraws_a_submit_busy_that_outlived_its_window() {
+    let fixture = StartupFixture::new();
+    let output = fixture.launch("claude-code", false, Instant::now());
+    fixture.event(Runtime::ClaudeCode, AgentEvent::StartupReady);
+    let events = Arc::new(Capture::default());
+    // The forwarder reads the real clock, so the Return goes in a window ago.
+    let past = Instant::now() - crate::session::state::SUBMIT_TURN_START_WINDOW;
+    crate::session::clock::at(past, 0, || {
+        fixture
+            .manager
+            .inject_direct_stdin("session", b"\r", events.as_ref())
+            .unwrap()
+    });
+    assert_eq!(
+        fixture.manager.activity_snapshot()["session"],
+        SessionActivityState::Busy
+    );
+    let rt_session = fixture.manager.live_runtime_session("session").unwrap();
+    let app_data = tempfile::tempdir().unwrap();
+    let forwarder = fixture.manager.start_forwarder_thread(
+        "session".into(),
+        String::new(),
+        Some("mission".into()),
+        rt_session,
+        output,
+        pool_with_schema(),
+        events.clone(),
+        role("fake", &[]),
+        None,
+        true,
+        None,
+        app_data.path().to_path_buf(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while fixture.manager.activity_snapshot()["session"] != SessionActivityState::Idle {
+        assert!(
+            Instant::now() < deadline,
+            "the forwarder never withdrew the busy"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(events
+        .status
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event.state == SessionActivityState::Idle
+            && event.source.as_str() == "input-timeout"));
+    fixture.manager.kill("session").unwrap();
+    forwarder.join().unwrap();
+}
+
+#[test]
+fn output_after_a_return_leaves_an_output_only_session_to_its_idle_detector() {
+    for output_follows in [false, true] {
+        let fixture = StartupFixture::new();
+        let output = fixture.launch("opencode", false, Instant::now());
+        let stop = output.stop_flag();
+        let events = Capture::default();
+        assert!(fixture.manager.note_forwarder_transition(
+            "session",
+            SessionActivityState::Idle,
+            StatusSource::Forwarder
+        ));
+        let start = *fixture.now.lock().unwrap();
+        crate::session::clock::at(start, 0, || {
+            fixture
+                .manager
+                .inject_direct_stdin("session", b"\r", &events)
+                .unwrap()
+        });
+        if output_follows {
+            fixture.manager.ingest_output_chunk(
+                "session",
+                Some("mission"),
+                b"working\r\n",
+                &events,
+            );
+        }
+        crate::session::clock::at(start + Duration::from_secs(11), 0, || {
+            fixture
+                .manager
+                .expire_submit_busy("session", &stop, &events)
+        });
+        assert_eq!(
+            fixture.manager.activity_snapshot()["session"],
+            if output_follows {
+                SessionActivityState::Busy
+            } else {
+                SessionActivityState::Idle
+            },
+            "output_follows={output_follows}"
+        );
+    }
+}
+
+#[test]
+fn only_a_working_claude_member_is_deliverable_and_every_hold_still_blocks_it() {
+    use crate::router::DeliveryReadiness as R;
+    use crate::session::state::agent::AgentEvent;
+    let working = |runtime: Runtime| {
+        let fixture = StartupFixture::new();
+        let output = fixture.launch(runtime.key(), false, Instant::now());
+        fixture.event(runtime, AgentEvent::StartupReady);
+        fixture.event(runtime, AgentEvent::TurnStarted);
+        (fixture, output)
+    };
+    let readiness = |fixture: &StartupFixture| fixture.manager.delivery_readiness("session");
+    for (runtime, expected, reservable) in [
+        (Runtime::ClaudeCode, R::Working, true),
+        (Runtime::Codex, R::Ready { idle: false }, false),
+    ] {
+        let (fixture, _output) = working(runtime);
+        assert_eq!(
+            fixture.manager.report_readiness("session"),
+            R::Ready { idle: false },
+            "{runtime:?}: a report waits for the turn to end on every runtime"
+        );
+        assert_eq!(
+            fixture.manager.reserve_report("session").unwrap(),
+            None,
+            "{runtime:?}"
+        );
+        assert_eq!(readiness(&fixture), expected, "{runtime:?}");
+        assert_eq!(
+            matches!(
+                fixture.manager.reserve_delivery("session").unwrap(),
+                DeliveryReservation::Ready(_)
+            ),
+            reservable,
+            "{runtime:?}"
+        );
+        if reservable {
+            assert_eq!(readiness(&fixture), R::InFlight, "{runtime:?}");
+        }
+
+        let (fixture, _output) = working(runtime);
+        fixture.typed();
+        assert!(
+            matches!(readiness(&fixture), R::RecentlyTyping(_)),
+            "{runtime:?}: {:?}",
+            readiness(&fixture)
+        );
+
+        let (fixture, _output) = working(runtime);
+        let now = Instant::now();
+        fixture
+            .manager
+            .session_state("session")
+            .unwrap()
+            .lock()
+            .unwrap()
+            .model
+            .apply(
+                SessionEvent::TestObserved(crate::session::state::ObservedInput {
+                    state: runner_terminal::input_state::InputState::Drafting,
+                    since: now,
+                    composer_visible: true,
+                }),
+                crate::session::clock::state_now(),
+            );
+        fixture
+            .manager
+            .session_state("session")
+            .unwrap()
+            .lock()
+            .unwrap()
+            .model
+            .apply(
+                SessionEvent::TestInputAt(Some(now)),
+                crate::session::clock::state_now(),
+            );
+        assert_eq!(
+            crate::session::clock::at(now + Duration::from_secs(5), 0, || readiness(&fixture)),
+            R::Drafting,
+            "{runtime:?}"
+        );
+
+        let (fixture, _output) = working(runtime);
+        fixture.manager.publish_model_event(
+            "session",
+            SessionEvent::CodexAttention {
+                blocked: true,
+                live: true,
+            },
+            &Capture::default(),
+        );
+        assert_eq!(readiness(&fixture), R::NeedsYou, "{runtime:?}");
+
+        let fixture = StartupFixture::new();
+        let _output = fixture.launch(runtime.key(), false, Instant::now());
+        fixture.event(runtime, AgentEvent::TurnStarted);
+        assert_eq!(readiness(&fixture), R::Starting, "{runtime:?}");
+    }
+}
+
+#[test]
+fn a_direct_chat_takes_no_report_until_its_agent_is_ready_after_spawn_and_resume() {
+    let app_data = tempfile::tempdir().unwrap();
+    let pool = pool_with_schema();
+    let mut role = role("codex", &[]);
+    role.runtime = Runtime::Codex.key().into();
+    insert_role_row(&pool.get().unwrap(), &role);
+    let fake = fake_runtime();
+    let manager = mgr_with_fake(None, fake.clone());
+    let spawned = manager
+        .spawn_direct(
+            &role,
+            None,
+            None,
+            None,
+            None,
+            Some(app_data.path().to_str().unwrap()),
+            None,
+            None,
+            app_data.path(),
+            pool.clone(),
+            capture(),
+            None,
+        )
+        .unwrap();
+    let id = spawned.id.clone();
+    let ready = |manager: &SessionManager| {
+        manager.publish_agent_event(
+            &id,
+            AgentEvent::Batch {
+                runtime: Runtime::Codex,
+                events: vec![AgentEvent::StartupReady],
+            },
+            &Capture::default(),
+        );
+        manager.note_forwarder_transition(&id, SessionActivityState::Idle, StatusSource::Forwarder);
+    };
+    // A report typed before the agent draws its prompt lands in nothing it reads.
+    manager.note_forwarder_transition(&id, SessionActivityState::Idle, StatusSource::Forwarder);
+    assert_eq!(
+        manager.report_readiness(&id),
+        crate::router::DeliveryReadiness::Starting
+    );
+    ready(&manager);
+    assert_eq!(
+        manager.report_readiness(&id),
+        crate::router::DeliveryReadiness::Ready { idle: true }
+    );
+
+    manager.kill(&id).unwrap();
+    manager
+        .resume(&id, None, None, app_data.path(), pool.clone(), capture())
+        .unwrap();
+    manager.note_forwarder_transition(&id, SessionActivityState::Idle, StatusSource::Forwarder);
+    assert_eq!(
+        manager.report_readiness(&id),
+        crate::router::DeliveryReadiness::Starting,
+        "a resumed chat waits for its agent again"
+    );
+    ready(&manager);
+    assert_eq!(
+        manager.report_readiness(&id),
+        crate::router::DeliveryReadiness::Ready { idle: true }
+    );
+    manager.kill(&id).unwrap();
+}
+
+#[test]
+fn a_codex_chat_takes_reports_once_its_startup_output_settles_only_where_no_trust_screen_shows() {
+    let app_data = tempfile::tempdir().unwrap();
+    let codex_home = tempfile::tempdir().unwrap();
+    let pool = pool_with_schema();
+    let mut role = role("codex", &[]);
+    role.runtime = Runtime::Codex.key().into();
+    role.env.insert(
+        "CODEX_HOME".into(),
+        codex_home.path().to_str().unwrap().into(),
+    );
+    insert_role_row(&pool.get().unwrap(), &role);
+    let fake = fake_runtime();
+    let manager = mgr_with_fake(None, fake.clone());
+    let spawn = |first_turn: Option<&str>| {
+        manager
+            .spawn_direct(
+                &role,
+                None,
+                None,
+                None,
+                None,
+                Some(app_data.path().to_str().unwrap()),
+                None,
+                None,
+                app_data.path(),
+                pool.clone(),
+                capture(),
+                first_turn.map(str::to_owned),
+            )
+            .unwrap()
+            .id
+    };
+    let id = spawn(None);
+    let settle_session = |id: &str, screen: &[u8]| {
+        manager.note_forwarder_transition(id, SessionActivityState::Idle, StatusSource::Forwarder);
+        let stop = manager
+            .session_state(id)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .handle
+            .as_ref()
+            .unwrap()
+            .stop
+            .clone();
+        let now = Instant::now();
+        manager.startup_output(id, &stop, screen, now);
+        manager.release_settled_startup(id, &stop, now + Duration::from_secs(5));
+        assert_eq!(
+            manager.report_readiness(id),
+            crate::router::DeliveryReadiness::Starting,
+            "inside the startup grace"
+        );
+        manager.release_settled_startup(id, &stop, now + Duration::from_secs(60));
+        manager.report_readiness(id)
+    };
+    let settle = |screen: &[u8]| settle_session(&id, screen);
+    let trust = b"Do you trust the contents of this directory?";
+    // A fresh chat's quiet trust prompt is no prompt for the report (QA run 4).
+    assert_eq!(settle(trust), crate::router::DeliveryReadiness::Starting);
+    manager.kill(&id).unwrap();
+    // With no conversation to resume, the chat starts fresh and can meet the prompt again.
+    manager
+        .resume(&id, None, None, app_data.path(), pool.clone(), capture())
+        .unwrap();
+    assert_eq!(settle(trust), crate::router::DeliveryReadiness::Starting);
+    manager.kill(&id).unwrap();
+    // A folder Codex's config already trusts shows no trust screen, and Codex sends no
+    // hook before the first turn, so a fresh start opens once its output settles.
+    let composer = b"> Ask Codex to do anything";
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        format!(
+            "[projects.{:?}]\ntrust_level = \"trusted\"\n",
+            std::fs::canonicalize(app_data.path()).unwrap()
+        ),
+    )
+    .unwrap();
+    manager
+        .resume(&id, None, None, app_data.path(), pool.clone(), capture())
+        .unwrap();
+    assert_eq!(
+        settle(composer),
+        crate::router::DeliveryReadiness::Ready { idle: true }
+    );
+    manager.kill(&id).unwrap();
+    let fresh = spawn(None);
+    assert_eq!(
+        settle_session(&fresh, composer),
+        crate::router::DeliveryReadiness::Ready { idle: true }
+    );
+    manager.kill(&fresh).unwrap();
+    // A first turn sends hooks, so its gate still waits for that turn to complete.
+    let first_turn = spawn(Some("first turn"));
+    assert_eq!(
+        settle_session(&first_turn, composer),
+        crate::router::DeliveryReadiness::Starting
+    );
+    manager.kill(&first_turn).unwrap();
+    std::fs::remove_file(codex_home.path().join("config.toml")).unwrap();
+    // A resumed or natively forked Codex conversation draws its prompt but may never send
+    // SessionStart.
+    pool.get()
+        .unwrap()
+        .execute(
+            "UPDATE sessions SET agent_session_key = ?1 WHERE id = ?2",
+            rusqlite::params![uuid::Uuid::new_v4().to_string(), id],
+        )
+        .unwrap();
+    manager
+        .resume(&id, None, None, app_data.path(), pool.clone(), capture())
+        .unwrap();
+    assert_eq!(
+        settle(composer),
+        crate::router::DeliveryReadiness::Ready { idle: true }
+    );
+    manager.kill(&id).unwrap();
+}
+
+#[test]
+fn a_reopened_chat_whose_runtime_sends_its_startup_hook_waits_for_it() {
+    let now = Instant::now();
+    for (runtime, opens) in [(Runtime::Codex, true), (Runtime::ClaudeCode, false)] {
+        let mut gate =
+            super::super::startup::StartupDelivery::for_trusted_reports(runtime.key(), false, now);
+        gate.output(b"prompt", now);
+        assert_eq!(
+            gate.output_settled(now + Duration::from_secs(60)),
+            opens,
+            "{runtime:?}"
+        );
+        let mut fresh =
+            super::super::startup::StartupDelivery::for_reports(runtime.key(), false, now);
+        fresh.output(b"Do you trust this folder?", now);
+        assert!(
+            !fresh.output_settled(now + Duration::from_secs(60)),
+            "{runtime:?}: a fresh chat waits for its hook"
+        );
+    }
+}
+
+#[test]
+fn a_chat_started_with_a_first_turn_takes_no_report_until_that_turn_completes() {
+    let app_data = tempfile::tempdir().unwrap();
+    let pool = pool_with_schema();
+    let mut role = role("codex", &[]);
+    role.runtime = Runtime::Codex.key().into();
+    insert_role_row(&pool.get().unwrap(), &role);
+    let fake = fake_runtime();
+    let manager = mgr_with_fake(None, fake.clone());
+    let spawned = manager
+        .spawn_direct(
+            &role,
+            None,
+            None,
+            None,
+            None,
+            Some(app_data.path().to_str().unwrap()),
+            None,
+            None,
+            app_data.path(),
+            pool.clone(),
+            capture(),
+            Some("first turn".into()),
+        )
+        .unwrap();
+    let id = spawned.id.clone();
+    let hook = |event: AgentEvent| {
+        manager.publish_agent_event(
+            &id,
+            AgentEvent::Batch {
+                runtime: Runtime::Codex,
+                events: vec![event],
+            },
+            &Capture::default(),
+        );
+    };
+    let stop = manager
+        .session_state(&id)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .handle
+        .as_ref()
+        .unwrap()
+        .stop
+        .clone();
+    let starting = |why: &str| {
+        manager.note_forwarder_transition(&id, SessionActivityState::Idle, StatusSource::Forwarder);
+        assert_eq!(
+            manager.report_readiness(&id),
+            crate::router::DeliveryReadiness::Starting,
+            "{why}"
+        );
+    };
+    hook(AgentEvent::StartupReady);
+    starting("ready, but the first turn has not run");
+    let now = Instant::now();
+    manager.startup_output(&id, &stop, b"> first turn", now);
+    manager.release_settled_startup(&id, &stop, now + Duration::from_secs(60));
+    starting("settled output does not open a fresh chat's gate");
+    hook(AgentEvent::TurnStarted);
+    starting("the first turn is running");
+    hook(AgentEvent::TurnEnded {
+        outcome: TurnOutcome::Completed,
+    });
+    manager.note_forwarder_transition(&id, SessionActivityState::Idle, StatusSource::Forwarder);
+    assert_eq!(
+        manager.report_readiness(&id),
+        crate::router::DeliveryReadiness::Ready { idle: true }
+    );
+    manager.kill(&id).unwrap();
+}
+
+#[test]
+fn chat_without_status_hooks_uses_output_settle_even_with_identity_hooks() {
+    let now = super::super::super::clock::now();
+    for runtime in [Runtime::Codex, Runtime::ClaudeCode, Runtime::Pi] {
+        let mut gate =
+            super::super::startup::StartupDelivery::for_reports(runtime.key(), false, now)
+                .with_status_hooks(false);
+        gate.output(b"ready", now);
+        assert!(!gate.output_settled(now + Duration::from_secs(1)));
+        assert!(gate.output_settled(now + Duration::from_secs(11)));
     }
 }

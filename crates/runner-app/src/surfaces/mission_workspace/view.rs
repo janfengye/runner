@@ -7,7 +7,7 @@ use gpui::{
     div, px, rems, AnyElement, App, DragMoveEvent, FontWeight, MouseButton, SharedString, Window,
     WindowControlArea,
 };
-use runner_app::ui::resize::{resize_strip, ResizeAxis};
+use runner_app::ui::resize::{resize_strip, resize_strip_inset, ResizeAxis};
 use runner_app::ui::{
     Button, ButtonSize, IconButton, SessionControl, SessionControlKind, SessionControlVariant,
     SessionOverlay, SessionOverlayKind,
@@ -48,6 +48,7 @@ impl MissionWorkspace {
         let area = area
             .id(id)
             .window_control_area(WindowControlArea::Drag)
+            .capture_any_mouse_down(|event, _, _| platform_ui::capture_titlebar_press(event))
             .on_mouse_down_out(cx.listener(|this, _, _, _| {
                 this.titlebar_drag_armed = false;
             }))
@@ -108,10 +109,7 @@ impl MissionWorkspace {
         let group_control = crate::terminal::control::mission_covered(
             control_ids.iter().map(|id| self.attached.get(id)),
         );
-        let drawer_visible = !self.loading
-            && self.mission_view().is_some()
-            && mission_drawer_available(self.archived(), self.secondary && !group_control)
-            && self.layout.drawer.open();
+        let drawer_visible = self.drawer_visible(group_control);
         let drawer_focused = drawer_visible && self.drawer_focused(window, cx);
         let drawer = drawer_visible.then(|| self.render_mission_terminal_drawer(cx));
         let focus_border = theme::with_alpha(
@@ -298,7 +296,14 @@ impl MissionWorkspace {
             .absolute()
             .inset_0()
         }));
-        let rail_open = self.settings(cx).mission_rail_open;
+        if !self.presentation.is_remote() {
+            let default_open = self.settings(cx).mission_rail_open;
+            self.rail_open.get_or_insert(default_open);
+        }
+        let rail_open = self.settings(cx).show_side_panel && self.rail_is_open(cx);
+        if std::mem::take(&mut self.rail_switched) {
+            self.rail_visibility = SidebarVisibilityTransition::new(rail_open);
+        }
         let (rail_visibility, rail_animating) = self.rail_visibility.animate_to(
             if rail_open { 1. } else { 0. },
             Instant::now(),
@@ -307,16 +312,17 @@ impl MissionWorkspace {
         if rail_animating {
             window.request_animation_frame();
         }
+        let rail_layout = self.rail_layout(cx);
+        let widened = rail_layout.1;
         let rail = self.cached_region(
             "mission-rail",
             gpui::StyleRefinement::default()
-                .w(rems(
-                    self.settings(cx).mission_rail_width * rail_visibility / 16.,
-                ))
+                .w(rems(rail_layout.0 * rail_visibility / 16.))
                 .h_full()
                 .flex_none(),
             move |workspace, window, cx| {
                 workspace.render_mission_rail(
+                    rail_layout,
                     rail_visibility,
                     rail_open || rail_animating,
                     window,
@@ -344,9 +350,9 @@ impl MissionWorkspace {
             })
             .absolute()
             .top_0()
-            .right(px(self.settings(cx).mission_rail_width
-                * rail_visibility
-                * zoom))
+            .right(px(
+                rail_layout.0 * rail_visibility * zoom - resize_strip_inset(zoom)
+            ))
             .on_drag(
                 MissionRailResizeDrag,
                 |drag: &MissionRailResizeDrag, _, _, cx: &mut App| cx.new(|_| drag.clone()),
@@ -360,6 +366,7 @@ impl MissionWorkspace {
             .min_w(px(0.))
             .h_full()
             .flex()
+            .child(self.rail_files.measure(self.settings(cx).app_zoom))
             .child(center)
             .children(
                 (rail_open || rail_animating).then(|| div().w(rems(6. / 16.)).h_full().flex_none()),
@@ -379,9 +386,22 @@ impl MissionWorkspace {
             .on_action(cx.listener(Self::focus_previous_mission_tab))
             .on_action(cx.listener(Self::focus_next_mission_tab))
             .on_drag_move::<MissionRailResizeDrag>(cx.listener(
-                |this, event: &DragMoveEvent<MissionRailResizeDrag>, _, cx| {
+                move |this, event: &DragMoveEvent<MissionRailResizeDrag>, _, cx| {
                     let width = f32::from(event.bounds.right() - event.event.position.x)
                         / this.settings(cx).app_zoom;
+                    // With a file open the drag sizes the file beside the tree.
+                    if let Some(widened) = widened {
+                        let tree = if widened.tree { widened.tree_width } else { 0. };
+                        let width = app_settings::clamp_file_viewer_width(width - tree);
+                        this.update_app_settings(cx, false, |settings| {
+                            if settings.file_viewer_width == width {
+                                return false;
+                            }
+                            settings.file_viewer_width = width;
+                            true
+                        });
+                        return;
+                    }
                     let width = app_settings::clamp_mission_rail_width(width);
                     this.update_app_settings(cx, false, |settings| {
                         if settings.mission_rail_width == width {
@@ -533,6 +553,22 @@ impl MissionWorkspace {
             .as_ref()
             .map(|mission| mission.title.clone())
             .unwrap_or_else(|| "…".into());
+        // The app store's summary follows link changes; a remote window reads its host's.
+        let linked = mission.as_ref().and_then(|mission| {
+            if self.client.is_remote() {
+                return mission.linked_chat.clone();
+            }
+            self.app_store
+                .read(cx)
+                .missions
+                .iter()
+                .find(|summary| summary.mission.id == mission.id)
+                .map_or_else(
+                    || mission.linked_chat.clone(),
+                    |summary| summary.mission.linked_chat.clone(),
+                )
+        });
+        let back_link = linked.map(|chat| self.render_linked_chat(chat, cx));
         let drawer_action = (mission_drawer_available(self.archived(), secondary)
             && (!self.layout.drawer.shells().is_empty()
                 || self.remote_supports(&["startShell", "layout"])))
@@ -555,27 +591,29 @@ impl MissionWorkspace {
             })
             .into_any_element()
         });
-        let rail_action = (!self.settings(cx).mission_rail_open).then(|| {
-            IconButton::new("open-mission-rail", "panel-right-hidden.svg")
-                .tooltip(crate::i18n::text("ui.open_sessions_panel"))
-                .on_press(move |_, cx| {
-                    open_rail_root.update(cx, |this, cx| {
-                        this.update_app_settings(cx, true, |settings| {
-                            settings.mission_rail_open = true;
-                            true
+        let rail_action =
+            (self.settings(cx).show_side_panel && !self.rail_is_open(cx)).then(|| {
+                IconButton::new("open-mission-rail", "panel-right-hidden.svg")
+                    .tooltip(crate::i18n::text("ui.open_side_panel"))
+                    .on_press(move |_, cx| {
+                        open_rail_root.update(cx, |this, cx| {
+                            this.set_rail_open(true, cx);
+                            cx.notify();
                         });
-                        cx.notify();
-                    });
-                })
-                .into_any_element()
-        });
+                    })
+                    .into_any_element()
+            });
         let row = WorkspaceHeader::new(
             px(self.workspace_titlebar_padding(window, cx)),
             ChatIcon::mission().render(rems(15. / 16.), theme::accent(), true),
             title,
         )
         .sidebar_toggle(self.render_collapsed_titlebar_spacer())
-        .title_actions(controls.into_iter().map(IntoElement::into_any_element))
+        .title_actions(
+            back_link
+                .into_iter()
+                .chain(controls.into_iter().map(IntoElement::into_any_element)),
+        )
         .trailing_actions(drawer_action.into_iter().chain(rail_action))
         .into_div()
         .rounded_tl(rems(11. / 16.))
@@ -587,6 +625,58 @@ impl MissionWorkspace {
             element
         });
         self.render_titlebar_drag_area("mission-titlebar-drag", row, cx)
+            .into_any_element()
+    }
+
+    /// "linked to <chat>": opens the chat, or reads "(archived)" and opens nothing.
+    fn render_linked_chat(
+        &self,
+        chat: runner_core::protocol::LinkedChat,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let label = if chat.archived {
+            crate::i18n::tf(
+                "format.linked_to_chat_archived",
+                &[("chat", chat.title.clone())],
+            )
+        } else {
+            crate::i18n::tf("format.linked_to_chat", &[("chat", chat.title.clone())])
+        };
+        let shell = self.shell.clone();
+        let session = chat.session_id.clone();
+        div()
+            .id("mission-linked-chat")
+            .debug_selector(|| "MISSION_LINKED_CHAT".into())
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(rems(4. / 16.))
+            .px(rems(6. / 16.))
+            .py(rems(2. / 16.))
+            .rounded(rems(4. / 16.))
+            .bg(theme::chrome_selected())
+            .text_size(theme::text_caption())
+            .text_color(theme::muted())
+            .child(
+                gpui::svg()
+                    .path("link.svg")
+                    .size(rems(10. / 16.))
+                    .text_color(theme::faint()),
+            )
+            .child(label)
+            .when(!chat.archived, |caption| {
+                caption
+                    .cursor_pointer()
+                    .hover(|caption| caption.text_color(theme::text()))
+                    .on_click(cx.listener(move |_, _, window, cx| {
+                        if let Some(shell) = shell.upgrade() {
+                            let session = session.clone();
+                            shell.update(cx, |shell, cx| {
+                                shell.open_chat_session(&session, window, cx);
+                            });
+                        }
+                    }))
+            })
             .into_any_element()
     }
 
@@ -815,6 +905,8 @@ impl MissionWorkspace {
             let terminal_scrollbar = chat.terminal_scrollbar.clone();
             let terminal_input = chat.terminal_input.clone();
             let terminal_focus = chat.terminal_focus.clone();
+            let terminal_find = chat.terminal_find.clone();
+            let open_find = terminal_find.clone();
             let key_id = session_id.clone();
             let copy_id = session_id.clone();
             let paste_id = session_id.clone();
@@ -845,6 +937,9 @@ impl MissionWorkspace {
                         this.on_mission_terminal_copy(&copy_id, action, window, cx)
                     });
                 })
+                .on_action(move |_: &crate::FindInTerminal, window, cx| {
+                    open_find.update(cx, |find, cx| find.open(window, cx));
+                })
                 .child(
                     div()
                         .relative()
@@ -863,6 +958,8 @@ impl MissionWorkspace {
                                 terminal_style,
                             )
                             .scrollable(scrollable)
+                            .find(terminal_find.clone())
+                            .file_links(Some(self.file_link_route(cx)))
                             .cached(),
                         )
                         .child(terminal_scrollbar),
@@ -897,7 +994,7 @@ impl MissionWorkspace {
                         },
                     ));
             }
-            surface.into_any_element()
+            crate::terminal::find::with_find_bar(surface, &terminal_find)
         } else {
             div()
                 .absolute()
@@ -1158,5 +1255,40 @@ impl MissionWorkspace {
             .children(can_compose.then(|| self.render_mission_composer(window, cx)))
             .children(paused.then(|| self.render_mission_paused_overlay(cx)))
             .into_any_element()
+    }
+}
+
+impl MissionWorkspace {
+    fn drawer_visible(&self, group_control: bool) -> bool {
+        !self.loading
+            && self.mission_view().is_some()
+            && mission_drawer_available(self.archived(), self.secondary && !group_control)
+            && self.layout.drawer.open()
+    }
+
+    /// The terminals this workspace draws for `mission`: the member tab a
+    /// primary window shows and the open drawer's selected shell.
+    pub(crate) fn shown_terminals(&self, mission: &str, cx: &App) -> Vec<String> {
+        if !self.active
+            || self.loading
+            || self.mission_id.as_deref() != Some(mission)
+            || self.mission_view().is_none()
+        {
+            return Vec::new();
+        }
+        let mut ids = Vec::new();
+        if let MissionTab::Session(id) = &self.active_tab {
+            if !self.secondary && self.members().iter().any(|member| member.session.id == *id) {
+                ids.push(id.clone());
+            }
+        }
+        let control_ids = self.control_session_ids(cx);
+        let group_control = crate::terminal::control::mission_covered(
+            control_ids.iter().map(|id| self.attached.get(id)),
+        );
+        if self.drawer_visible(group_control) {
+            ids.extend(self.layout.drawer.active_shell().map(str::to_owned));
+        }
+        ids
     }
 }

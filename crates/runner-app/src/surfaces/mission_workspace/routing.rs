@@ -16,6 +16,9 @@ impl NativeRoot {
             return;
         }
         let route_changed = self.route != route;
+        if route_changed {
+            self.update_popover.close_without_focus();
+        }
         let leaving_mission =
             matches!(self.route, AppRoute::Mission(_)) && !matches!(route, AppRoute::Mission(_));
         if !matches!(route, AppRoute::ArchivedChat | AppRoute::Settings) {
@@ -29,6 +32,9 @@ impl NativeRoot {
         }
         if self.route != AppRoute::Chat {
             self.attached.clear();
+        }
+        if !matches!(self.route, AppRoute::Chat | AppRoute::ArchivedChat) {
+            self.chat_files.hide(cx);
         }
         self.report_current_subjects(cx);
         self.record_current_runtime_location();
@@ -50,6 +56,7 @@ impl NativeRoot {
                         )
                     });
                     if !still_active {
+                        workspace.rail_files.hide(workspace_cx);
                         workspace.active = false;
                         workspace.attached.clear();
                         workspace_cx.notify();

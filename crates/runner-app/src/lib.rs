@@ -13,9 +13,6 @@ pub mod i18n;
 pub mod lifecycle;
 pub mod logging;
 pub mod pane_layout;
-pub mod terminal_ime;
-pub mod terminal_paste;
-pub mod terminal_resize;
 pub mod text_util;
 pub mod theme;
 pub mod ui;
@@ -27,8 +24,6 @@ mod wake;
 
 #[cfg(test)]
 mod render_counts;
-#[cfg(test)]
-mod terminal_redraw_tests;
 
 mod app_settings;
 mod app_store;
@@ -36,6 +31,7 @@ mod assets;
 #[cfg(test)]
 mod catalog_golden;
 mod chat_icon;
+mod file_icons;
 mod file_links;
 mod keymap;
 mod list_controls;
@@ -60,6 +56,7 @@ pub use platform_ui::platform_fonts;
 use startup::app_menus;
 use surfaces::root::*;
 use surfaces::windowing::*;
+pub use terminal::{ime as terminal_ime, paste as terminal_paste, resize as terminal_resize};
 
 #[cfg(not(test))]
 use std::borrow::Cow;
@@ -116,22 +113,23 @@ use surfaces::{pane_close_behavior, PaneCloseBehavior};
 use surfaces::{
     AppRoute, CommandPaletteState, CrewSurfaces, MissionWorkspace, PaneKey, ProjectModal,
     RoleSurfaces, SettingsPane, SettingsState, Sidebar, SplitMenuKey, StartChatModal,
-    StartMissionModalState,
 };
 
 actions!(
     runner_app_ui,
     [
         AboutRunner,
+        CloseFileTab,
         CloseTab,
         CloseWindow,
         CheckForUpdates,
         CommandPalette,
+        FindInFile,
+        FindInTerminal,
         FocusNextPane,
         FocusPreviousPane,
         Hide,
         HideOthers,
-        Maximize,
         Minimize,
         MissionTabNext,
         MissionTabPrevious,
@@ -139,11 +137,12 @@ actions!(
         NavigatePreviousPage,
         NewTab,
         NewTerminal,
+        NextFileTab,
         NewMission,
         ConfirmStartChat,
-        ConfirmStartMission,
         NewWindow,
         OpenSettings,
+        PreviousFileTab,
         Quit,
         QuitAndStopSessions,
         SelectTab1,
@@ -158,11 +157,16 @@ actions!(
         ShowAll,
         SplitPaneDown,
         SplitPaneRight,
+        SearchFiles,
         ResumeFocusedSession,
         StopFocusedSession,
         ToggleFullscreen,
+        ToggleMaximizePane,
         ToggleTerminalDrawer,
         ToggleSidebar,
+        SwitchSidebarView,
+        ZoomFileIn,
+        ZoomFileOut,
         ZoomIn,
         ZoomOut,
         ZoomReset

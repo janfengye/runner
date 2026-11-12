@@ -2,10 +2,11 @@ use super::*;
 
 impl NativeRoot {
     fn clear_remote_transients(&mut self) {
+        self.usage_open = false;
+        self.remote_client.usage_popover = None;
         self.start_chat_modal = None;
-        self.start_mission_modal = None;
-        self.chat_rename_modal = None;
         self.pane_rename = None;
+        self.maximized_panes.clear();
         self.fork_confirm = None;
         self.terminal_close_confirm = None;
     }
@@ -65,9 +66,31 @@ impl NativeRoot {
         self.sync_window_activation(window, cx);
     }
 
+    pub(crate) fn open_this_computer_settings(
+        &mut self,
+        pane: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.remote_client.ui.picker_open = false;
+        if self.remote_client.is_active() {
+            self.return_to_this_computer(window, cx);
+        }
+        self.enter_settings_route(pane, window, cx);
+        cx.notify();
+    }
+
     pub(crate) fn sync_remote_state(&mut self, cx: &mut Context<Self>) {
+        let connection = self.remote_client.connection_marker();
+        let was_empty = self.launcher_is_empty_state();
         if self.remote_client.sync_remote_state(cx) {
             self.clear_remote_transients();
+        }
+        if !was_empty && self.launcher_is_empty_state() {
+            self.reset_launcher_page(cx);
+        }
+        if self.remote_client.connection_marker() != connection {
+            self.maximized_panes.clear();
         }
         self.remote_client
             .refresh_remote_palette(&self.command_palette, cx);
@@ -76,7 +99,6 @@ impl NativeRoot {
     pub(crate) fn select_remote_item(&mut self, item: RemoteItem, cx: &mut Context<Self>) {
         if self.remote_client.select_remote_item(item) {
             self.start_chat_modal = None;
-            self.start_mission_modal = None;
         }
         self.sync_remote_state(cx);
         self.remote_client.mark_remote_stopped_sessions_viewed(cx);

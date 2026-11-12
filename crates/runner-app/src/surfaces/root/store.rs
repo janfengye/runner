@@ -3,10 +3,27 @@ use super::*;
 impl NativeRoot {
     pub(crate) fn handle_app_store_update(&mut self, cx: &mut Context<Self>) {
         let core = self.core(cx).clone();
-        if core
-            .usage_set_enabled(self.settings(cx).model_runtimes())
-            .unwrap_or(false)
+        let enabled = self.settings(cx).model_runtimes();
+        let checked: Vec<_> = enabled
+            .iter()
+            .copied()
+            .filter(|runtime| {
+                self.settings(cx)
+                    .usage
+                    .checks(*runtime, self.settings(cx).notifications.usage.near_limit)
+            })
+            .collect();
+        let store = self.app_store.read(cx);
+        if store.daemon_disconnected || store.revisions.restart != self.store_revisions.restart {
+            self.usage_checked = None;
+        }
+        if !store.daemon_disconnected
+            && self.usage_checked.as_ref() != Some(&checked)
+            && core.usage_set_checked(checked.clone()).is_ok()
         {
+            self.usage_checked = Some(checked);
+        }
+        if core.usage_set_enabled(enabled).unwrap_or(false) {
             cx.notify();
         }
         let revisions = self.app_store.read(cx).revisions;
@@ -39,6 +56,11 @@ impl NativeRoot {
         }
 
         if revisions.settings != previous.settings {
+            let settings = self.settings(cx).clone();
+            self.chat_surfaces.open.close_off(&settings, false);
+            for panel in self.chat_panels_by_tab.values_mut() {
+                panel.surfaces.close_off(&settings, false);
+            }
             self.sync_role_page_size(cx);
             self.sync_crew_page_size(cx);
             let language = self.settings(cx).language.key();
@@ -49,6 +71,8 @@ impl NativeRoot {
             self.settings_page
                 .quit_behavior
                 .update(cx, |select, cx| select.set_value(value, cx));
+            self.sync_terminal_scrollback_select(cx);
+            self.sync_side_panel_selects(cx);
             #[cfg(target_os = "macos")]
             {
                 let value = self.settings(cx).option_as_meta.key();
@@ -75,6 +99,7 @@ impl NativeRoot {
                 self.error = None;
             }
             if store.daemon_disconnected {
+                self.maximized_panes.clear();
                 self.toasts.dismiss();
             } else if store.daemon_notice.is_some() || store.error.is_none() {
                 self.chat_error = None;

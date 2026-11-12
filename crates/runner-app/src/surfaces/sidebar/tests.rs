@@ -9,16 +9,14 @@ use super::elements::sidebar_fork_menu_target;
 use super::elements::sidebar_icon_color;
 use super::elements::tab_label_live;
 use super::menus::mission_menu_entries;
-use super::menus::project_create_menu_entries;
 use super::menus::project_menu_entries;
-use super::menus::sidebar_create_menu_entries;
 use super::menus::sidebar_tab_icon;
 use super::menus::tab_menu_entries;
 use super::rows_render::project_header_icon;
 use super::view::sidebar_scroll_container;
 use super::view::sidebar_scroll_frame;
 use super::*;
-use crate::surfaces::sidebar_logic::DropKind;
+use crate::surfaces::sidebar::logic::DropKind;
 use gpui::{
     prelude::*, size, Context, Render, ScrollHandle, TestAppContext, VisualTestContext, Window,
 };
@@ -108,6 +106,8 @@ fn paused_mission_hides_unread_without_acknowledging_sessions() {
         let summary = &mut store.missions[0];
         summary.mission.status = MissionStatus::Running;
         summary.any_session_live = false;
+        // An older daemon's summary: attention comes from the members.
+        summary.phase = None;
         summary.session_statuses = ["coder", "reviewer"]
             .into_iter()
             .map(|id| {
@@ -313,7 +313,7 @@ fn mission_rename_commits_when_the_field_loses_focus() {
 }
 
 #[test]
-fn sidebar_archive_returns_to_start_only_after_success() {
+fn sidebar_archive_leaves_the_mission_for_the_tab_only_after_success() {
     for (route, archive_id, expected_route) in [
         (
             AppRoute::Mission("mission".into()),
@@ -380,10 +380,9 @@ fn sidebar_archive_returns_to_start_only_after_success() {
         cx.run_until_parked();
         host.update(&mut cx, |root, window, cx| {
             assert_eq!(root.route, expected_route);
-            let expected_tab = (expected_route != AppRoute::Chat).then_some(tab.id.as_str());
-            assert_eq!(root.tabs.active_tab_id(), expected_tab);
+            assert_eq!(root.tabs.active_tab_id(), Some(tab.id.as_str()));
             root.reload_tabs(cx).unwrap();
-            assert_eq!(root.tabs.active_tab_id(), expected_tab);
+            assert_eq!(root.tabs.active_tab_id(), Some(tab.id.as_str()));
             assert_eq!(root.tabs.tabs().len(), 1);
             assert!(root.sidebar.read(cx).archiving_missions.is_empty());
             window.remove_window();
@@ -826,7 +825,7 @@ fn menu_labels(entries: &[(UiMenuItem, SidebarMenuAction)]) -> Vec<&str> {
 }
 
 #[test]
-fn workspace_starts_with_a_non_selectable_new_chat_action() {
+fn workspace_new_tab_is_selected_on_the_launcher_page() {
     assert_eq!(
         WORKSPACE_ENTRIES,
         [
@@ -835,12 +834,10 @@ fn workspace_starts_with_a_non_selectable_new_chat_action() {
             WorkspaceEntry::Crew,
         ]
     );
-    assert!(!WorkspaceEntry::NewTab.selectable());
+    assert!(WorkspaceEntry::NewTab.selected(&AppRoute::Launcher));
     assert!(!WorkspaceEntry::NewTab.selected(&AppRoute::Roles));
     assert!(!WorkspaceEntry::NewTab.selected(&AppRoute::Crews));
     assert!(!WorkspaceEntry::NewTab.selected(&AppRoute::Settings));
-    assert!(WorkspaceEntry::Role.selectable());
-    assert!(WorkspaceEntry::Crew.selectable());
 }
 
 #[test]
@@ -863,41 +860,7 @@ fn shortcut_pills_use_the_platform_primary_modifier_alone() {
 }
 
 #[test]
-fn project_create_menu_uses_short_labels_and_project_targets() {
-    let root_entries = sidebar_create_menu_entries(&keymap::KeymapOverrides::new());
-    assert_eq!(
-        menu_labels(&root_entries),
-        ["New chat", "New mission", "New terminal"]
-    );
-    assert_eq!(
-        root_entries
-            .iter()
-            .map(|(_, action)| action.clone())
-            .collect::<Vec<_>>(),
-        [
-            SidebarMenuAction::NewChat(ProjectScope::Root),
-            SidebarMenuAction::NewMission(ProjectScope::Root),
-            SidebarMenuAction::NewTerminal(ProjectScope::Root),
-        ]
-    );
-
-    let entries = project_create_menu_entries("project-1", &keymap::KeymapOverrides::new());
-    assert_eq!(
-        menu_labels(&entries),
-        ["New chat", "New mission", "New terminal"]
-    );
-    assert_eq!(
-        entries
-            .iter()
-            .map(|(_, action)| action.clone())
-            .collect::<Vec<_>>(),
-        [
-            SidebarMenuAction::NewChat(ProjectScope::Project("project-1".into())),
-            SidebarMenuAction::NewMission(ProjectScope::Project("project-1".into())),
-            SidebarMenuAction::NewTerminal(ProjectScope::Project("project-1".into())),
-        ]
-    );
-
+fn project_menu_has_rename_and_delete() {
     let project_entries = project_menu_entries("project-1".into(), "Runner".into());
     assert_eq!(
         menu_labels(&project_entries),
@@ -907,68 +870,16 @@ fn project_create_menu_uses_short_labels_and_project_targets() {
 
 #[test]
 fn tab_and_mission_menus_have_the_trimmed_item_lists() {
-    let tab_entries = tab_menu_entries(
-        "tab-1",
-        false,
-        "My tab".into(),
-        None,
-        false,
-        None,
-        false,
-        vec!["session-1".into(), "session-2".into()],
-        vec!["session-1".into(), "session-2".into()],
-        None,
-        &keymap::KeymapOverrides::new(),
-    );
-    assert_eq!(menu_labels(&tab_entries), ["Pin", "Rename tab", "Archive"]);
-    assert!(tab_entries[2].0.destructive);
-
-    let single_pane_entries = tab_menu_entries(
-        "tab-1",
-        false,
-        "build".into(),
-        Some("shell".into()),
-        false,
-        None,
-        false,
-        Vec::new(),
-        vec!["shell".into()],
-        Some("shell".into()),
-        &keymap::KeymapOverrides::new(),
-    );
-    assert_eq!(
-        single_pane_entries[1].1,
-        SidebarMenuAction::Rename(SidebarRenameTarget::Tab {
-            node_id: "tab-1".into(),
-            original: "build".into(),
-            session_id: Some("shell".into()),
-        })
-    );
-    assert_eq!(
-        tab_entries
+    let separated = |entries: &[(UiMenuItem, SidebarMenuAction)]| {
+        entries
             .iter()
-            .map(|(_, action)| action.clone())
-            .collect::<Vec<_>>(),
-        [
-            SidebarMenuAction::TogglePin {
-                node_id: "tab-1".into(),
-                pinned: false,
-            },
-            SidebarMenuAction::Rename(SidebarRenameTarget::Tab {
-                node_id: "tab-1".into(),
-                original: "My tab".into(),
-                session_id: None,
-            }),
-            SidebarMenuAction::ArchiveTab {
-                tab_id: "tab-1".into(),
-                session_ids: vec!["session-1".into(), "session-2".into()],
-            },
-        ]
-    );
-
-    let multi_pane_entries = tab_menu_entries(
+            .map(|(item, _)| item.separator_before)
+            .collect::<Vec<_>>()
+    };
+    let split_entries = tab_menu_entries(
         "tab-1",
         false,
+        true,
         "My tab".into(),
         None,
         true,
@@ -980,15 +891,64 @@ fn tab_and_mission_menus_have_the_trimmed_item_lists() {
         &keymap::KeymapOverrides::new(),
     );
     assert_eq!(
-        menu_labels(&multi_pane_entries),
-        ["Pin", "Rename tab", "Archive"]
+        menu_labels(&split_entries),
+        ["Rename tab…", "Pin", "Archive all"]
     );
-    assert!(multi_pane_entries[2].0.destructive);
-    assert!(multi_pane_entries[2].0.shortcut.is_none());
+    assert_eq!(separated(&split_entries), [false, false, true]);
+    assert!(split_entries[2].0.destructive);
+    assert!(split_entries[2].0.shortcut.is_none());
+    assert_eq!(
+        split_entries
+            .iter()
+            .map(|(_, action)| action.clone())
+            .collect::<Vec<_>>(),
+        [
+            SidebarMenuAction::Rename(SidebarRenameTarget::Tab {
+                node_id: "tab-1".into(),
+                original: "My tab".into(),
+                session_id: None,
+            }),
+            SidebarMenuAction::TogglePin {
+                node_id: "tab-1".into(),
+                pinned: false,
+            },
+            SidebarMenuAction::ArchiveTab {
+                tab_id: "tab-1".into(),
+                session_ids: vec!["session-1".into(), "session-2".into()],
+            },
+        ]
+    );
+
+    let pinned_chat_entries = tab_menu_entries(
+        "tab-1",
+        true,
+        false,
+        "Chat".into(),
+        Some("chat".into()),
+        false,
+        None,
+        false,
+        vec!["chat".into()],
+        vec!["chat".into()],
+        None,
+        &keymap::KeymapOverrides::new(),
+    );
+    assert_eq!(
+        menu_labels(&pinned_chat_entries),
+        ["Rename…", "Unpin", "Archive"]
+    );
+    assert_eq!(
+        pinned_chat_entries[1].1,
+        SidebarMenuAction::TogglePin {
+            node_id: "tab-1".into(),
+            pinned: true,
+        }
+    );
 
     let mixed_entries = tab_menu_entries(
         "tab-1",
         false,
+        true,
         "Mixed tab".into(),
         None,
         true,
@@ -1010,8 +970,9 @@ fn tab_and_mission_menus_have_the_trimmed_item_lists() {
     let terminal_only_entries = tab_menu_entries(
         "tab-1",
         false,
+        false,
         "Terminal".into(),
-        None,
+        Some("shell-1".into()),
         false,
         None,
         false,
@@ -1022,7 +983,16 @@ fn tab_and_mission_menus_have_the_trimmed_item_lists() {
     );
     assert_eq!(
         menu_labels(&terminal_only_entries),
-        ["Pin", "Rename tab", "Close terminal"]
+        ["Rename…", "Pin", "Close terminal"]
+    );
+    assert_eq!(separated(&terminal_only_entries), [false, false, true]);
+    assert_eq!(
+        terminal_only_entries[0].1,
+        SidebarMenuAction::Rename(SidebarRenameTarget::Tab {
+            node_id: "tab-1".into(),
+            original: "Terminal".into(),
+            session_id: Some("shell-1".into()),
+        })
     );
     assert!(terminal_only_entries[2].0.destructive);
     assert_eq!(
@@ -1056,10 +1026,18 @@ fn tab_and_mission_menus_have_the_trimmed_item_lists() {
         }
     }
 
-    let mission_entries =
-        mission_menu_entries("mission-node-1", false, "mission-1", "My mission".into());
-    assert_eq!(menu_labels(&mission_entries), ["Pin", "Rename", "Archive"]);
-    assert!(mission_entries[2].0.destructive);
+    let mission_entries = mission_menu_entries(
+        "mission-node-1",
+        false,
+        "mission-1",
+        "My mission".into(),
+        None,
+    );
+    assert_eq!(
+        menu_labels(&mission_entries),
+        ["Pin", "Rename", "Link to chat", "Archive"]
+    );
+    assert!(mission_entries[3].0.destructive);
     assert_eq!(
         mission_entries
             .iter()
@@ -1074,8 +1052,37 @@ fn tab_and_mission_menus_have_the_trimmed_item_lists() {
                 mission_id: "mission-1".into(),
                 original: "My mission".into(),
             }),
+            SidebarMenuAction::LinkToChat("mission-1".into()),
             SidebarMenuAction::ArchiveMission("mission-1".into()),
         ]
+    );
+    let linked = runner_core::protocol::LinkedChat {
+        session_id: "chat-1".into(),
+        title: "Frontman".into(),
+        archived: false,
+        reports: true,
+    };
+    let linked_entries = mission_menu_entries(
+        "mission-node-1",
+        false,
+        "mission-1",
+        "My mission".into(),
+        Some(&linked),
+    );
+    assert_eq!(
+        menu_labels(&linked_entries),
+        [
+            "Pin",
+            "Rename",
+            "Link to chat",
+            "Unlink from Frontman",
+            "Archive"
+        ],
+        "a linked mission keeps Link to chat, with Unlink right below it"
+    );
+    assert_eq!(
+        linked_entries[3].1,
+        SidebarMenuAction::UnlinkMission("mission-1".into())
     );
 }
 
@@ -1259,6 +1266,7 @@ fn sidebar_fork_menu_target_exposes_enabled_and_disabled_single_chats() {
     let entries = tab_menu_entries(
         "tab-1",
         false,
+        false,
         "Codex".into(),
         None,
         false,
@@ -1271,10 +1279,17 @@ fn sidebar_fork_menu_target_exposes_enabled_and_disabled_single_chats() {
     );
     assert_eq!(
         menu_labels(&entries),
-        ["Pin", "Rename tab", "Fork chat", "Archive"]
+        ["Rename…", "Fork chat", "Pin", "Archive"]
     );
-    assert!(!entries[2].0.disabled);
-    assert_eq!(entries[2].1, SidebarMenuAction::ForkChat("chat".into()));
+    assert_eq!(
+        entries
+            .iter()
+            .map(|(item, _)| item.separator_before)
+            .collect::<Vec<_>>(),
+        [false, false, false, true]
+    );
+    assert!(!entries[1].0.disabled);
+    assert_eq!(entries[1].1, SidebarMenuAction::ForkChat("chat".into()));
     assert!(entries[..3].iter().all(|(item, _)| item.shortcut.is_none()));
     assert_eq!(
         entries[3].0.shortcut.as_deref(),
@@ -1283,6 +1298,7 @@ fn sidebar_fork_menu_target_exposes_enabled_and_disabled_single_chats() {
 
     let busy_entries = tab_menu_entries(
         "tab-1",
+        false,
         false,
         "Codex".into(),
         None,
@@ -1294,7 +1310,7 @@ fn sidebar_fork_menu_target_exposes_enabled_and_disabled_single_chats() {
         None,
         &keymap::KeymapOverrides::from([("close-pane".into(), None)]),
     );
-    assert!(busy_entries[2].0.disabled);
+    assert!(busy_entries[1].0.disabled);
     assert!(busy_entries[3].0.shortcut.is_none());
 
     let mut waiting = direct_session("chat", "codex", SessionStatus::Running);
@@ -1306,6 +1322,7 @@ fn sidebar_fork_menu_target_exposes_enabled_and_disabled_single_chats() {
     let waiting_entries = tab_menu_entries(
         "tab-1",
         false,
+        false,
         "Waiting".into(),
         None,
         false,
@@ -1316,10 +1333,10 @@ fn sidebar_fork_menu_target_exposes_enabled_and_disabled_single_chats() {
         None,
         &keymap::KeymapOverrides::new(),
     );
-    assert!(waiting_entries[2].0.disabled);
-    assert_eq!(waiting_entries[2].0.description, None);
+    assert!(waiting_entries[1].0.disabled);
+    assert_eq!(waiting_entries[1].0.description, None);
     assert_eq!(
-        waiting_entries[2].0.tooltip.clone(),
+        waiting_entries[1].0.tooltip.clone(),
         Some("No session key captured yet".into())
     );
 
@@ -1329,6 +1346,7 @@ fn sidebar_fork_menu_target_exposes_enabled_and_disabled_single_chats() {
     assert_eq!(trae_target.reason, None);
     let trae_entries = tab_menu_entries(
         "tab-1",
+        false,
         false,
         "Trae".into(),
         None,
@@ -1340,8 +1358,8 @@ fn sidebar_fork_menu_target_exposes_enabled_and_disabled_single_chats() {
         None,
         &keymap::KeymapOverrides::new(),
     );
-    assert!(trae_entries[2].0.disabled);
-    assert_eq!(trae_entries[2].0.tooltip, None);
+    assert!(trae_entries[1].0.disabled);
+    assert_eq!(trae_entries[1].0.tooltip, None);
 
     for runtime in ["copilot", "antigravity"] {
         let members = vec![direct_session("chat", runtime, SessionStatus::Running)];
@@ -1525,30 +1543,6 @@ fn creating_routes_highlight_their_workspace_entry() {
     assert!(!WorkspaceEntry::Role.selected(&AppRoute::NewCrew));
 }
 
-#[test]
-fn both_create_menus_show_effective_bindings_and_omit_unbound_keys() {
-    let mut overrides = keymap::KeymapOverrides::new();
-    overrides.insert(
-        "new-chat".into(),
-        Some(keymap::entry("command-palette").unwrap().default.clone()),
-    );
-    overrides.insert("new-terminal".into(), None);
-    for entries in [
-        sidebar_create_menu_entries(&overrides),
-        project_create_menu_entries("project-1", &overrides),
-    ] {
-        assert_eq!(
-            entries[0].0.shortcut.as_deref(),
-            Some(keymap::format_combo(&keymap::entry("command-palette").unwrap().default).as_str())
-        );
-        assert_eq!(
-            entries[1].0.shortcut.as_deref(),
-            Some(keymap::format_combo(&keymap::entry("new-mission").unwrap().default).as_str())
-        );
-        assert!(entries[2].0.shortcut.is_none());
-    }
-}
-
 #[cfg(debug_assertions)]
 #[test]
 fn empty_tab_rename_source_changes_language_while_named_tabs_stay_literal() {
@@ -1714,6 +1708,8 @@ fn active_projection_orders_tabs_and_rolls_up_missions_without_drawers() {
             .session_activity
             .insert("drawer".into(), SessionActivityState::Busy);
         store.missions[0].session_statuses = vec![("member".into(), working)];
+        // An older daemon's summary: the rollup comes from the members.
+        store.missions[0].phase = None;
     });
     let sidebar = cx.new(|cx| Sidebar::new(WeakEntity::new_invalid(), store.clone(), None, cx));
     let mut tabs = cx.update(|cx| TabSet::from_rows(&store.read(cx).nodes));
@@ -1756,15 +1752,10 @@ fn active_projection_orders_tabs_and_rolls_up_missions_without_drawers() {
         );
         assert_eq!(
             rows.iter()
-                .filter(|row| row.group() == ActiveGroup::Chats)
+                .filter(|row| row.group() == ActiveGroup::Agents)
                 .count(),
-            8
-        );
-        assert_eq!(
-            rows.iter()
-                .filter(|row| row.group() == ActiveGroup::Missions)
-                .count(),
-            1
+            9,
+            "chats and missions share the Agents heading"
         );
         assert!(rows.iter().all(|row| row.group() != ActiveGroup::Terminals));
         assert_eq!(
@@ -1977,15 +1968,9 @@ fn active_includes_live_idle_chats_and_missions_and_removes_stopped_selection() 
         let rows = sidebar.resolved_active_rows_for_tabs(&tabs, cx);
         assert_eq!(
             rows.iter()
-                .filter(|row| row.group() == ActiveGroup::Chats)
+                .filter(|row| row.group() == ActiveGroup::Agents)
                 .count(),
-            3
-        );
-        assert_eq!(
-            rows.iter()
-                .filter(|row| row.group() == ActiveGroup::Missions)
-                .count(),
-            1
+            4
         );
         let shortcuts = rows
             .iter()
@@ -2027,7 +2012,7 @@ fn active_includes_live_idle_chats_and_missions_and_removes_stopped_selection() 
     sidebar.update(&mut cx, |sidebar, cx| {
         let rows = sidebar.resolved_active_rows_for_tabs(&tabs, cx);
         assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|row| row.group() == ActiveGroup::Chats));
+        assert!(rows.iter().all(|row| row.group() == ActiveGroup::Agents));
         assert!(!active_row_names(&rows, &store.read(cx).nodes).contains(&"idle".into()));
         let ids = rows
             .iter()
@@ -2141,7 +2126,14 @@ fn active_shortcut_and_row_click_focus_the_split_pane_needing_attention() {
         root.root_focus.focus(window, cx);
         root
     });
-    cx.update(|cx| keymap::install_bindings(cx, &keymap::KeymapOverrides::new(), false));
+    cx.update(|cx| {
+        keymap::install_bindings(
+            cx,
+            &keymap::KeymapOverrides::new(),
+            crate::keymap::TerminalCtrlKeys::RunnerFirst,
+            false,
+        )
+    });
     let mut visual = VisualTestContext::from_window(host.into(), &cx);
     visual.simulate_resize(size(px(1200.), px(900.)));
     visual.run_until_parked();
@@ -2411,7 +2403,7 @@ fn active_split_rename_stays_on_its_tab_row_across_status_changes() {
             "split context menu did not open"
         )
     });
-    visual.simulate_keystrokes("home down enter");
+    visual.simulate_keystrokes("home enter");
     visual.run_until_parked();
     let split_rename: &str = Box::leak(format!("ACTIVE_RENAME {}", tab.id).into_boxed_str());
     let other_rename: &str = Box::leak(format!("ACTIVE_RENAME {}", other_tab.id).into_boxed_str());
@@ -2611,7 +2603,7 @@ fn active_group_collapse_hides_rows_and_skips_their_shortcuts() {
         [chat_node.id.clone(), terminal_node.id.clone()]
     );
 
-    let toggle = visual.debug_bounds("ACTIVE_GROUP_TOGGLE chats").unwrap();
+    let toggle = visual.debug_bounds("ACTIVE_GROUP_TOGGLE agents").unwrap();
     visual.simulate_click(toggle.center(), gpui::Modifiers::default());
     visual.run_until_parked();
     assert!(visual.debug_bounds(chat_title).is_none());
@@ -2625,10 +2617,10 @@ fn active_group_collapse_hides_rows_and_skips_their_shortcuts() {
         assert!(store
             .settings
             .sidebar_collapsed_active_groups
-            .contains("chats"));
+            .contains("agents"));
     });
 
-    let toggle = visual.debug_bounds("ACTIVE_GROUP_TOGGLE chats").unwrap();
+    let toggle = visual.debug_bounds("ACTIVE_GROUP_TOGGLE agents").unwrap();
     visual.simulate_click(toggle.center(), gpui::Modifiers::default());
     visual.run_until_parked();
     assert!(visual.debug_bounds(chat_title).is_some());
@@ -2712,7 +2704,7 @@ fn active_lists_unselected_idle_shells_until_they_exit() {
     sidebar.update(&mut cx, |sidebar, cx| {
         let rows = sidebar.resolved_active_rows_for_tabs(&tabs, cx);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].group(), super::active::ActiveGroup::Chats);
+        assert_eq!(rows[0].group(), super::active::ActiveGroup::Agents);
         sidebar.refresh_shortcut_rows(&tabs, cx);
         assert_eq!(sidebar.numbered_shortcut_rows.len(), 1);
         assert_eq!(sidebar.numbered_shortcut_rows[0].node_id, chat_node.id);
@@ -2803,7 +2795,7 @@ fn active_mixed_split_is_one_chat_row_targeting_the_working_chat() {
             sidebar.update(&mut cx, |sidebar, cx| {
                 let rows = sidebar.resolved_active_rows_for_tabs(&tabs, cx);
                 assert_eq!(rows.len(), 1);
-                assert_eq!(rows[0].group(), super::active::ActiveGroup::Chats);
+                assert_eq!(rows[0].group(), super::active::ActiveGroup::Agents);
                 for row in &rows {
                     let (label, icon) = row.title_and_icon(|id| {
                         Some(
@@ -3010,5 +3002,141 @@ fn terminal_program_status_reaches_classic_and_active_sidebar_rollups() {
                 }
             });
         }
+    }
+}
+
+#[test]
+fn switch_sidebar_view_expands_persists_and_refreshes_local_number_rows() {
+    let _theme = crate::theme_snapshot::ThemeGuard::new();
+    let temp = tempfile::tempdir().unwrap();
+    let mut cx = TestAppContext::single();
+    let store = crate::app_store::test_lifecycle_store(&mut cx, temp.path());
+    let rows = store.update(&mut cx, |store, cx| {
+        let conn = store.test_core.db.get().unwrap();
+        conn.execute_batch("INSERT INTO sessions (id, status, agent_runtime, agent_command) VALUES ('busy-shell', 'running', 'shell', 'shell'), ('direct-agent', 'running', 'codex', 'codex');").unwrap();
+        let rows = ["busy-shell", "direct-agent"].map(|id| {
+            let layout = PaneLayout::single(Some(id), &[id.into()]);
+            runner_daemon::repo::node::create_tab(&conn, None, id, 0, &layout.serialize().unwrap())
+                .unwrap()
+        });
+        drop(conn);
+        store.refresh_nodes(cx).unwrap();
+        store.refresh_sessions(cx);
+        for id in ["busy-shell", "direct-agent"] {
+            store.session_statuses.insert(id.into(), runner_core::protocol::AgentStatus {
+                lifecycle: runner_core::protocol::Lifecycle::Running,
+                ..Default::default()
+            });
+        }
+        rows
+    });
+    let host = crate::surfaces::remote_client::tests::add_window(
+        &mut cx,
+        &store,
+        temp.path(),
+        "switch-local",
+    );
+    host.update(&mut cx, |root, _, cx| {
+        root.set_sidebar_collapsed(true, true, cx);
+        root.sidebar_preview_open = true;
+        root.sidebar_preview_peeking = true;
+        root.front_page_sidebar().update(cx, |sidebar, _| {
+            sidebar.dragged_id = Some(rows[0].id.clone())
+        });
+    })
+    .unwrap();
+    for active in [true, false] {
+        host.update(&mut cx, |root, window, cx| {
+            root.switch_sidebar_view(&crate::SwitchSidebarView, window, cx);
+            assert!(!root.front_page_sidebar_collapsed());
+            assert!(!root.sidebar_preview_open && !root.sidebar_preview_peeking);
+            let sidebar = root.front_page_sidebar().read(cx);
+            assert_eq!(sidebar.active_only(cx), active);
+            assert!(sidebar.dragged_id.is_none());
+            let expected = if active {
+                [&rows[1].id, &rows[0].id]
+            } else {
+                [&rows[0].id, &rows[1].id]
+            };
+            assert_eq!(
+                sidebar
+                    .numbered_shortcut_rows
+                    .iter()
+                    .map(|row| &row.node_id)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        })
+        .unwrap();
+        let saved = AppSettings::load(&temp.path().join("settings.json")).unwrap();
+        assert_eq!(saved.sidebar_active_only, active);
+        assert!(!saved.sidebar_collapsed);
+    }
+}
+
+#[test]
+fn switch_sidebar_view_expands_only_the_remote_computer_and_syncs_number_rows() {
+    use crate::surfaces::remote_client::tests::{
+        add_window, choose_host, enable_front_page, fixture, overview,
+    };
+    let _theme = crate::theme_snapshot::ThemeGuard::new();
+    let temp = tempfile::tempdir().unwrap();
+    let mut cx = TestAppContext::single();
+    let (store, fake, _) = fixture(&mut cx, temp.path());
+    enable_front_page(&fake);
+    let mut data = overview();
+    let mut stopped = data.tabs[0].clone();
+    stopped.id = "stopped-tab".into();
+    stopped.pinned = false;
+    stopped.project = None;
+    stopped.panes = serde_json::from_value(serde_json::json!({"session":"stopped"})).unwrap();
+    data.tabs.push(stopped);
+    let mut session = data.sessions["s"].clone();
+    session.status.status = runner_core::companion::Status::Stopped;
+    session.status.unread = false;
+    session.status.reason = None;
+    data.sessions.insert("stopped".into(), session);
+    fake.set_overview(data);
+    let host = add_window(&mut cx, &store, temp.path(), "switch-remote");
+    host.update(&mut cx, choose_host).unwrap();
+    cx.run_until_parked();
+    let local = store.read_with(&cx, |store, _| {
+        (
+            store.settings.sidebar_active_only,
+            store.settings.sidebar_collapsed,
+        )
+    });
+    for active in [true, false] {
+        host.update(&mut cx, |root, window, cx| {
+            root.set_sidebar_collapsed(true, true, cx);
+            root.front_page_sidebar().update(cx, |sidebar, _| {
+                sidebar.dragged_id = Some("remote-tab".into())
+            });
+            root.switch_sidebar_view(&crate::SwitchSidebarView, window, cx);
+            assert!(!root.front_page_sidebar_collapsed());
+            let sidebar = root.front_page_sidebar().read(cx);
+            assert_eq!(sidebar.active_only(cx), active);
+            assert!(sidebar.dragged_id.is_none());
+            assert_eq!(
+                sidebar.tab_index_by_node.contains_key("stopped-tab"),
+                !active
+            );
+            assert_eq!(sidebar.tab_index_by_node.get("remote-tab"), Some(&1));
+        })
+        .unwrap();
+        assert_eq!(
+            store.read_with(&cx, |store, _| (
+                store.settings.sidebar_active_only,
+                store.settings.sidebar_collapsed
+            )),
+            local
+        );
+        assert_eq!(
+            AppSettings::load(&temp.path().join("settings.json"))
+                .unwrap()
+                .remote_sidebars["host"]
+                .active_only,
+            active
+        );
     }
 }

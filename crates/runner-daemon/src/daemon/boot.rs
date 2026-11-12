@@ -81,7 +81,12 @@ pub fn boot(
         mission_grid_hint: Arc::new(std::sync::Mutex::new(None)),
         windows: window_registry,
         events: event_channel.clone(),
+        files: Arc::new(crate::files::FilesService::new(
+            Arc::clone(&runtime_shell_env),
+            event_channel.clone(),
+        )),
         session_event_observer: Default::default(),
+        reports: Default::default(),
         app_version: runner_core::version::display_version(),
     };
     session::manager::terminal::restore_palette(&core);
@@ -101,6 +106,11 @@ pub fn boot(
             }
         }
         Err(error) => log::warn!("mission roster conversion database unavailable: {error}"),
+    }
+    // Before the routers read the logs and the reports baseline (#1187).
+    match ops::mission::interrupt::mark_on_boot(&core) {
+        Ok(restarts) => core.reports.restarted(restarts),
+        Err(error) => log::warn!("marking interrupted mission members failed: {error}"),
     }
     super::block_on(ops::mission::mount_all_running_mission_routers(&core));
     session::pty_runtime::cleanup_stale_running_rows_on_startup(&pool)
@@ -125,6 +135,7 @@ pub fn boot(
         ops::session::close_exited_shells(&mut conn).context("close exited shells")?;
     }
     core.usage.set_enabled(model_runtimes.clone());
+    core.usage.restore(&pool);
     if background {
         runtime_status::start_background_discovery(
             event_channel,
@@ -136,6 +147,7 @@ pub fn boot(
         );
         #[cfg(not(test))]
         core.usage.start_scheduler(core.clone());
+        ops::mission::report::Reports::start(core.clone());
     }
     Ok(core)
 }

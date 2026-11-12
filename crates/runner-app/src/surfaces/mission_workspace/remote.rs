@@ -12,7 +12,7 @@ struct SavedPresentation {
     active: MissionTab,
     open_handles: Vec<String>,
     selected_handle: Option<String>,
-    rail: MissionRailView,
+    rail: crate::surfaces::side_panel::OpenSurfaces,
 }
 
 pub(super) struct RemoteMission {
@@ -100,15 +100,15 @@ impl MissionWorkspace {
                     active: self.active_tab.clone(),
                     open_handles: open_handles.clone(),
                     selected_handle: None,
-                    rail: self.rail_view,
+                    rail: self.rail_surfaces.open.clone(),
                 },
             );
             if let Some(id) = mission_id.clone() {
-                self.prepare_mission(id.clone(), MissionRailView::Roles);
+                self.prepare_mission(id.clone());
                 if let Some(saved) = saved {
                     self.layout = saved.layout;
                     self.active_tab = saved.active;
-                    self.rail_view = saved.rail;
+                    self.rail_surfaces.open = saved.rail;
                     self.presentation.set_selected_handle(saved.selected_handle);
                     open_handles = saved.open_handles;
                     restored = true;
@@ -391,7 +391,26 @@ impl MissionWorkspace {
         remote_ids: impl FnOnce(T) -> Vec<String>,
         cx: &mut Context<Self>,
     ) -> Option<Result<T, String>> {
+        self.complete_mission_action_observed(action, result, remote_ids, |_, _, _| {}, cx)
+    }
+
+    pub(super) fn complete_mission_action_observed<T>(
+        &mut self,
+        action: MissionAction,
+        result: Result<T, String>,
+        remote_ids: impl FnOnce(T) -> Vec<String>,
+        observe: impl FnOnce(&mut Self, bool, &mut Context<Self>),
+        cx: &mut Context<Self>,
+    ) -> Option<Result<T, String>> {
+        let succeeded = result.is_ok();
         if !action.remote {
+            if self.generation != action.generation
+                || self.client.target != action.client.target
+                || !action.client.valid()
+            {
+                return None;
+            }
+            observe(self, succeeded, cx);
             return Some(result);
         }
         let done = self.presentation.complete_action(
@@ -402,6 +421,7 @@ impl MissionWorkspace {
             result,
             remote_ids,
         )?;
+        observe(self, succeeded, cx);
         let MissionCompletion {
             key,
             client: guard,
@@ -480,6 +500,26 @@ impl MissionPresentation {
             Self::Remote(remote) => Some(remote),
         }
     }
+    /// Whether the host's tab holding `chat` is pinned; `None` when no tab
+    /// holds it or the window is local.
+    pub(super) fn chat_tab_pinned(&self, chat: &str) -> Option<bool> {
+        fn holds(pane: &runner_core::companion::Pane, chat: &str) -> bool {
+            match pane {
+                runner_core::companion::Pane::Split { a, b, .. } => {
+                    holds(a, chat) || holds(b, chat)
+                }
+                runner_core::companion::Pane::Leaf { session } => session.as_deref() == Some(chat),
+                runner_core::companion::Pane::Unknown(_) => false,
+            }
+        }
+        self.remote()?
+            .overview
+            .as_ref()?
+            .tabs
+            .iter()
+            .find(|tab| holds(&tab.panes, chat))
+            .map(|tab| tab.pinned)
+    }
     pub(super) fn summary(
         &self,
         mission_id: Option<&str>,
@@ -515,6 +555,14 @@ impl MissionPresentation {
             started_at: None,
             archived: false,
             pinned: mission.pinned,
+            linked_chat: mission.linked_chat.clone().map(|chat| {
+                runner_core::protocol::LinkedChat {
+                    session_id: chat.session_id,
+                    title: chat.title,
+                    archived: chat.archived,
+                    reports: chat.reports,
+                }
+            }),
         })
     }
     pub(super) fn members(
@@ -944,11 +992,12 @@ impl MissionPresentation {
     pub(super) fn terminal_style(
         &self,
         settings: &AppSettings,
+        cx: &App,
     ) -> crate::terminal::element::TerminalStyle {
         let host = self
             .remote()
             .and_then(|remote| remote.overview.as_ref()?.terminal_palette.clone());
-        let mut style = crate::surfaces::app_shell::terminal_style_for(settings);
+        let mut style = crate::surfaces::app_shell::terminal_style_for(settings, cx);
         if let Some(palette) = host {
             style.palette = runner_terminal::terminal::palette_from_wire(palette.into());
         }

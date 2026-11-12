@@ -368,6 +368,10 @@ impl From<CatalogRole> for RoleChoice {
 
 #[derive(Clone)]
 pub(crate) struct RuntimeChoice {
+    pub(crate) installed_version: Option<String>,
+    pub(crate) available_version: Option<String>,
+    pub(crate) min_version: Option<String>,
+    pub(crate) below_minimum: bool,
     pub(crate) name: runner_core::protocol::model::Runtime,
     pub(crate) display_name: String,
     pub(crate) command: Option<String>,
@@ -382,6 +386,10 @@ pub(crate) struct RuntimeChoice {
 impl From<runner_core::protocol::runtime::RuntimeCatalogEntry> for RuntimeChoice {
     fn from(runtime: runner_core::protocol::runtime::RuntimeCatalogEntry) -> Self {
         Self {
+            installed_version: runtime.installed_version,
+            available_version: runtime.available_version,
+            min_version: runtime.min_version,
+            below_minimum: runtime.below_minimum,
             name: runtime.name,
             display_name: runtime.display_name,
             command: Some(runtime.command),
@@ -407,6 +415,10 @@ impl RuntimeChoice {
             }
         };
         Some(Self {
+            installed_version: runtime.installed_version.clone(),
+            available_version: runtime.available_version.clone(),
+            min_version: runtime.min_version.clone(),
+            below_minimum: runtime.below_minimum,
             name,
             display_name: runtime.label.clone(),
             command: None,
@@ -504,6 +516,8 @@ pub(crate) struct MissionDisplay {
     pub(crate) mission: MissionFields,
     pub(crate) any_session_live: bool,
     pub(crate) session_statuses: Vec<(String, runner_core::protocol::AgentStatus)>,
+    /// The daemon's state for the mission (#748); None from an older daemon.
+    pub(crate) phase: Option<runner_core::protocol::MissionPhase>,
 }
 #[derive(Clone)]
 pub(crate) struct MissionFields {
@@ -513,6 +527,7 @@ pub(crate) struct MissionFields {
     pub(crate) project_id: Option<String>,
     pub(crate) cwd: Option<String>,
     pub(crate) archived_at: Option<runner_core::protocol::model::Timestamp>,
+    pub(crate) linked_chat: Option<runner_core::protocol::LinkedChat>,
 }
 impl From<runner_core::protocol::mission::MissionSummary> for MissionDisplay {
     fn from(summary: runner_core::protocol::mission::MissionSummary) -> Self {
@@ -525,9 +540,11 @@ impl From<runner_core::protocol::mission::MissionSummary> for MissionDisplay {
                 project_id: mission.project_id,
                 cwd: mission.cwd,
                 archived_at: mission.archived_at,
+                linked_chat: mission.linked_chat,
             },
             any_session_live: summary.any_session_live,
             session_statuses: summary.session_statuses,
+            phase: summary.phase,
         }
     }
 }
@@ -562,6 +579,7 @@ pub(crate) struct WorkspaceMission {
     pub(crate) started_at: Option<runner_core::protocol::model::Timestamp>,
     pub(crate) archived: bool,
     pub(crate) pinned: bool,
+    pub(crate) linked_chat: Option<runner_core::protocol::LinkedChat>,
 }
 
 impl From<&runner_core::protocol::model::Mission> for WorkspaceMission {
@@ -575,6 +593,7 @@ impl From<&runner_core::protocol::model::Mission> for WorkspaceMission {
             started_at: Some(mission.started_at),
             archived: mission.archived_at.is_some(),
             pinned: mission.pinned_at.is_some(),
+            linked_chat: mission.linked_chat.clone(),
         }
     }
 }

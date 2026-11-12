@@ -6,6 +6,7 @@ impl NativeRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.sync_chat_panel(cx);
         let Some(detail) = self.archived_chat_detail.as_ref() else {
             return div()
                 .flex_1()
@@ -48,9 +49,11 @@ impl NativeRoot {
             .border_b_1()
             .border_color(theme::border())
             .rounded_tl(rems(11. / 16.))
-            .when(!self.settings(cx).chat_panel_open, |header| {
-                header.rounded_tr(rems(11. / 16.))
-            })
+            .when(
+                !(self.chat_panel_is_open(cx)
+                    && side_panel_available(self.settings(cx), PanelSurface::Chat)),
+                |header| header.rounded_tr(rems(11. / 16.)),
+            )
             .children(sidebar_toggle)
             .children(sidebar_divider)
             .child(
@@ -85,21 +88,23 @@ impl NativeRoot {
                     }),
             )
             .child(div().min_w(px(0.)).flex_1())
-            .when(!self.settings(cx).chat_panel_open, |header| {
-                header.child(
-                    IconButton::new("open-archived-chat-panel", "panel-right-hidden.svg")
-                        .tooltip(crate::i18n::text("ui.open_side_panel"))
-                        .on_press(move |_, cx| {
-                            panel_root.update(cx, |this, cx| {
-                                this.update_app_settings(cx, true, |settings| {
-                                    settings.chat_panel_open = true;
-                                    true
+            .when(
+                !self.chat_panel_is_open(cx)
+                    && side_panel_available(self.settings(cx), PanelSurface::Chat),
+                |header| {
+                    header.child(
+                        IconButton::new("open-archived-chat-panel", "panel-right-hidden.svg")
+                            .tooltip(crate::i18n::text("ui.open_side_panel"))
+                            .on_press(move |window, cx| {
+                                panel_root.update(cx, |this, cx| {
+                                    this.set_chat_panel_open(true, cx);
+                                    this.focus_empty_chat_panel(window, cx);
+                                    cx.notify();
                                 });
-                                cx.notify();
-                            });
-                        }),
-                )
-            });
+                            }),
+                    )
+                },
+            );
         let chat_column = div()
             .flex_1()
             .min_w(px(0.))
@@ -142,7 +147,8 @@ impl NativeRoot {
                             ),
                     ),
             );
-        let panel_open = self.settings(cx).chat_panel_open;
+        let panel_open = self.chat_panel_is_open(cx)
+            && side_panel_available(self.settings(cx), PanelSurface::Chat);
         let (panel_visibility, panel_animating) = self.chat_panel_visibility.animate_to(
             if panel_open { 1. } else { 0. },
             Instant::now(),
@@ -156,20 +162,26 @@ impl NativeRoot {
                 .as_ref()
                 .map(|chat| chat.session_id.clone()),
         );
+        let panel_layout = self.chat_panel_layout(self.archived_chat_detail.as_ref(), cx);
         let side_panel = self.render_chat_side_panel(
             self.archived_chat_detail.as_ref(),
+            PanelSurface::Chat,
             self.archived_session_key_copy.clone(),
+            panel_layout,
             panel_visibility,
             panel_open || panel_animating,
             panel_open && !panel_animating,
+            window,
             cx,
         );
         div()
+            .relative()
             .track_focus(&self.chat_focus)
             .flex_1()
             .min_w(px(0.))
             .h_full()
             .flex()
+            .child(self.chat_files.measure(self.settings(cx).app_zoom))
             .child(chat_column)
             .child(side_panel)
             .into_any_element()
@@ -180,6 +192,7 @@ impl NativeRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.sync_chat_panel(cx);
         self.prune_launchers(cx);
         if self.remote_client.is_local() {
             self.ensure_active_chat_detail(cx);
@@ -216,7 +229,25 @@ impl NativeRoot {
             });
 
         let Some(layout) = self.front_page_layout().cloned() else {
+            let launcher = self.render_launcher(None, true, window, cx);
+            let close = self.launcher_page_closable(cx).then(|| {
+                let root = cx.entity();
+                div()
+                    .debug_selector(|| "LAUNCHER_PAGE_CLOSE".into())
+                    .absolute()
+                    .top(rems(8. / 16.))
+                    .right(rems(8. / 16.))
+                    .child(
+                        IconButton::new("launcher-page-close", "close.svg")
+                            .size(IconButtonSize::Sm)
+                            .tooltip(crate::i18n::text("keymap.close-pane.title"))
+                            .on_press(move |window, cx| {
+                                root.update(cx, |root, cx| root.close_launcher_page(window, cx));
+                            }),
+                    )
+            });
             return div()
+                .debug_selector(|| "LAUNCHER_PAGE".into())
                 .track_focus(&self.chat_focus)
                 .flex_1()
                 .min_h(px(0.))
@@ -236,25 +267,14 @@ impl NativeRoot {
                 .children(warning_banner)
                 .child(
                     div()
-                        .h(rems(40. / 16.))
-                        .flex_none()
-                        .px(rems(14. / 16.))
+                        .relative()
+                        .flex_1()
+                        .min_h(px(0.))
                         .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            svg()
-                                .path("plus.svg")
-                                .size(rems(15. / 16.))
-                                .text_color(theme::muted()),
-                        )
-                        .child(
-                            div()
-                                .text_size(theme::text_ui())
-                                .child(crate::i18n::text("launcher.new")),
-                        ),
+                        .flex_col()
+                        .child(launcher)
+                        .children(close),
                 )
-                .child(self.render_launcher(None, true, window, cx))
                 .into_any_element();
         };
         if self.remote_client.is_local()
@@ -273,16 +293,15 @@ impl NativeRoot {
         let group_control = self.remote_client.is_local() && self.tab_control_covered(&layout, cx);
         let show_start = start_surface_visible(Some(&layout));
         let grouped = layout.root.leaves().len() > 1;
-        let focused_shell = layout
-            .focused_session_id()
-            .and_then(|id| self.front_page_session(id, cx))
-            .is_some_and(|entry| {
-                Runtime::parse(&entry.agent_runtime).is_some_and(Runtime::is_shell)
-            });
+        let terminal_tab = self.active_tab_is_terminal(cx);
         if self.remote_client.is_local() {
             self.prune_pane_state(&layout);
         }
-        let pane_tree = self.render_pane_node(&layout.root, &layout, cx);
+        prune_maximized(&mut self.maximized_panes, &layout);
+        let pane_tree = match maximized_leaf(&self.maximized_panes, &layout).cloned() {
+            Some(leaf) => self.render_pane_node(&PaneNode::Leaf(leaf), &layout, cx),
+            None => self.render_pane_node(&layout.root, &layout, cx),
+        };
         let tab_archiving =
             split_tab_archiving(&layout, |id| self.sidebar_archiving_session(id, cx));
         let tab_body = div()
@@ -339,9 +358,10 @@ impl NativeRoot {
             .children(error_banner)
             .children(warning_banner)
             .child(tab_body);
+        let surface = side_panel_surface(terminal_tab);
         let panel_open = self.remote_client.is_local()
             && !show_start
-            && side_panel_open(self.settings(cx).chat_panel_open, focused_shell);
+            && (self.chat_panel_is_open(cx) && side_panel_available(self.settings(cx), surface));
         let (panel_visibility, panel_animating) = self.chat_panel_visibility.animate_to(
             if panel_open { 1. } else { 0. },
             Instant::now(),
@@ -355,29 +375,32 @@ impl NativeRoot {
                 .as_ref()
                 .map(|chat| chat.session_id.clone()),
         );
+        let panel_layout = self.chat_panel_layout(self.active_chat_detail.as_ref(), cx);
         let side_panel = self.cached_region(
             "side-panel",
             gpui::StyleRefinement::default()
-                .w(rems(
-                    self.settings(cx).chat_panel_width * panel_visibility / 16.,
-                ))
+                .w(rems(panel_layout.0 * panel_visibility / 16.))
                 .h_full()
                 .flex_none(),
-            move |root, _, cx| {
+            move |root, window, cx| {
                 root.render_chat_side_panel(
                     root.active_chat_detail.as_ref(),
+                    surface,
                     root.session_key_copy.clone(),
+                    panel_layout,
                     panel_visibility,
                     panel_open || panel_animating,
                     panel_open && !panel_animating,
+                    window,
                     cx,
                 )
             },
             cx,
         );
+        let widened = panel_layout.1;
         let panel_resize = (panel_open || panel_animating).then(|| {
             let zoom = self.settings(cx).app_zoom;
-            let panel_width = self.settings(cx).chat_panel_width * panel_visibility * zoom;
+            let panel_width = panel_layout.0 * panel_visibility * zoom;
             resize_strip(
                 "chat-panel-resize",
                 ResizeAxis::Columns,
@@ -397,7 +420,7 @@ impl NativeRoot {
             })
             .absolute()
             .top_0()
-            .right(px(panel_width))
+            .right(px(panel_width - resize_strip_inset(zoom)))
             .on_drag(
                 ChatPanelResizeDrag,
                 |drag: &ChatPanelResizeDrag, _, _, cx: &mut App| cx.new(|_| drag.clone()),
@@ -412,6 +435,7 @@ impl NativeRoot {
             .min_w(px(0.))
             .h_full()
             .flex()
+            .child(self.chat_files.measure(self.settings(cx).app_zoom))
             .child(chat_column)
             .children(
                 (panel_open || panel_animating)
@@ -436,14 +460,27 @@ impl NativeRoot {
                 }),
             )
             .on_drag_move::<ChatPanelResizeDrag>(cx.listener(
-                |this, event: &DragMoveEvent<ChatPanelResizeDrag>, _, cx| {
+                move |this, event: &DragMoveEvent<ChatPanelResizeDrag>, _, cx| {
                     let width = f32::from(event.bounds.right() - event.event.position.x)
                         / this.settings(cx).app_zoom;
-                    let width = app_settings::clamp_chat_panel_width(width);
                     if !this.chat_panel_resizing {
                         this.chat_panel_resizing = true;
                         cx.notify();
                     }
+                    // With a file open the drag sizes the file beside the tree.
+                    if let Some(widened) = widened {
+                        let tree = if widened.tree { widened.tree_width } else { 0. };
+                        let width = app_settings::clamp_file_viewer_width(width - tree);
+                        this.update_app_settings(cx, false, |settings| {
+                            if settings.file_viewer_width == width {
+                                return false;
+                            }
+                            settings.file_viewer_width = width;
+                            true
+                        });
+                        return;
+                    }
+                    let width = app_settings::clamp_chat_panel_width(width);
                     this.update_app_settings(cx, false, |settings| {
                         if settings.chat_panel_width == width {
                             return false;

@@ -14,11 +14,17 @@ wire_enum!(NeedsYouReason, Unknown, {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_error: Option<crate::protocol::StartupError>,
     pub status: Status,
     pub reason: Option<NeedsYouReason>,
     pub unread: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub error_acknowledged: bool,
+    /// An idle mission member that lost its turn to a Runner restart: when
+    /// runnerd stopped, in ms (#1187). Older hosts send none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupted_since: Option<i64>,
 }
 
 impl From<&AgentStatus> for SessionStatus {
@@ -42,11 +48,14 @@ impl From<&AgentStatus> for SessionStatus {
                 }
             }
         };
+        let interrupted_since = agent.interrupted_since.filter(|_| status == Status::Idle);
         Self {
+            startup_error: agent.startup_error.clone(),
             status,
             reason,
             unread: agent.unread_since.is_some(),
             error_acknowledged: agent.lifecycle == Lifecycle::Error && agent.error_since.is_none(),
+            interrupted_since,
         }
     }
 }

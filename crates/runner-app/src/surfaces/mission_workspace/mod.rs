@@ -1,9 +1,11 @@
 mod actions;
 mod attach;
 mod composer;
+mod composer_model;
 mod drawer;
 mod events;
 mod feed;
+mod feed_model;
 mod input;
 mod rail;
 mod remote;
@@ -33,9 +35,10 @@ use runner_core::protocol::session::SessionRow;
 
 use super::front_page::client::is_concurrent_resume_error;
 use super::*;
-use crate::surfaces::mission_composer::ComposerState;
-use crate::surfaces::mission_feed::{message_text, FeedBlock};
 use crate::surfaces::mission_markdown::{FeedMarkdown, FeedSelection};
+use crate::surfaces::mission_workspace::composer_model::ComposerState;
+use crate::surfaces::mission_workspace::feed_model::{message_text, FeedBlock};
+use crate::surfaces::side_panel::PanelViewId;
 use crate::*;
 
 const WORKSPACE_TABS_HEIGHT: f32 = 38.;
@@ -56,13 +59,6 @@ enum FeedRow {
 pub(crate) enum MissionTab {
     Feed,
     Session(String),
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum MissionRailView {
-    #[default]
-    Roles,
-    Meta,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -265,6 +261,14 @@ fn stop_all_title(running_count: usize) -> String {
 const STOP_ALL_BODY: &str =
     "ui.every_slot_s_pty_is_killed_and_whatever_turn_it_is_on_is_cut_off_the_mission_stays_open_ea";
 
+/// The text of a signal the feed shows in its own words.
+fn mission_signal_body(event: &Event) -> String {
+    crate::i18n::tf(
+        "format.runner_restarted_mid_turn",
+        &[("handle", event.from.clone())],
+    )
+}
+
 fn mission_signal_author(event: &Event) -> (&str, String) {
     match event.from.as_str() {
         "router" | "runner" => ("system", "system".into()),
@@ -408,9 +412,16 @@ pub(crate) struct MissionWorkspace {
     secondary: bool,
     duplicate_dismissed: bool,
     primary_label: Option<String>,
-    rail_view: MissionRailView,
+    rail_surfaces: crate::surfaces::side_panel::PanelSurfaces,
+    rail_open: Option<bool>,
+    rail_switched: bool,
+    rails_by_mission: HashMap<String, crate::surfaces::side_panel::SavedPanel>,
+    rail_files: crate::surfaces::files::FilesPanel,
     action_menu: Entity<PopoverMenu>,
     menu_actions: Vec<MissionMenuAction>,
+    /// The pin the header's menu offers to change, to redraw it when a
+    /// linked mission's group is pinned elsewhere.
+    menu_pinned: bool,
     pub(crate) rename_modal: Option<MissionRenameModal>,
     mission_id_copy: Entity<CopyValueButton>,
     session_key_copies: HashMap<String, Entity<CopyValueButton>>,

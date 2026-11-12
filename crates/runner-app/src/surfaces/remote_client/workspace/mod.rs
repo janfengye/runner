@@ -18,6 +18,7 @@ use std::sync::Mutex;
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) enum Item {
+    Launcher,
     Roles,
     Crews,
     Tab(String),
@@ -38,6 +39,7 @@ pub(crate) struct RemoteWindow {
     pub(crate) sidebar_collapsed: bool,
     pub(crate) sidebar_width: f32,
     _follow: Option<model::Follow>,
+    _usage: super::usage::UsageWatch,
     pub(crate) active: Option<Item>,
     pub(crate) layouts: HashMap<String, PaneLayout>,
     pub(crate) overview_revision: u64,
@@ -69,6 +71,9 @@ pub(crate) struct RemoteWindow {
     pub(crate) reopen_sessions: HashSet<String>,
     pub(crate) activate_tab: Option<String>,
     pub(crate) activate_mission: Option<String>,
+    /// Tabs in the order they were shown, the most recent last.
+    pub(crate) viewed_tabs: Vec<String>,
+    pub(crate) landed_at: Option<std::time::Instant>,
     pub(crate) form_generation: u64,
     pub(super) terminals: HashMap<String, RemotePane>,
     recovery: HashSet<String>,
@@ -107,12 +112,42 @@ impl RemoteWindow {
                     ids
                 })
                 .unwrap_or_default(),
-            None | Some(Item::Roles | Item::Crews) => Vec::new(),
+            None | Some(Item::Launcher | Item::Roles | Item::Crews) => Vec::new(),
         }
+    }
+
+    /// Running chats in open tabs keep their attachment while hidden and
+    /// connected, so switching back needs no attach, take or host resize, and
+    /// keep their recovery marker until they reattach. A hidden pane is not
+    /// drawn, so it sends no viewport or size.
+    fn open_sessions(&self, overview: &Overview) -> HashSet<String> {
+        self.layouts
+            .values()
+            .flat_map(PaneLayout::all_session_ids)
+            .filter(|id| {
+                overview.sessions.get(id).is_some_and(|session| {
+                    !matches!(
+                        session.status.status.effective(),
+                        Status::Stopped | Status::Error
+                    )
+                })
+            })
+            .collect()
     }
 }
 
 impl RemoteClient {
+    /// Changes whenever the host connection is reset or lost: a re-pair, a
+    /// host daemon restart, a dropped or restored connection.
+    pub(crate) fn connection_marker(&self) -> Option<(u64, bool)> {
+        self.workspace.as_ref().map(|remote| {
+            (
+                remote.attachment_generation,
+                remote.connection == Connection::Connected,
+            )
+        })
+    }
+
     pub(crate) fn report_remote_input_error(
         &mut self,
         address: &str,
@@ -142,6 +177,25 @@ impl RemoteClient {
             remote.action_error = Some(message);
             cx.notify();
         }
+    }
+
+    pub(crate) fn shows_remote_terminal(&self, address: &str, cx: &App) -> bool {
+        let Some((computer, session)) = runner_core::remote::terminal_target(address) else {
+            return false;
+        };
+        self.workspace.as_ref().is_some_and(|remote| {
+            remote.computer.id == computer
+                && state(&self.app_store, cx)
+                    .read(cx)
+                    .overviews
+                    .get(computer)
+                    .is_some_and(|overview| {
+                        remote
+                            .visible_sessions(overview, cx)
+                            .iter()
+                            .any(|id| id == session)
+                    })
+        })
     }
 
     pub(crate) fn remote_terminal_interactive(&self, id: &str, cx: &App) -> bool {
@@ -217,9 +271,6 @@ impl RemoteClient {
         window: &mut Window,
         cx: &mut Context<NativeRoot>,
     ) -> bool {
-        if !self.app_store.read(cx).remote_access_enabled() {
-            return false;
-        }
         if let Some(remote) = self
             .workspace
             .as_mut()
@@ -244,7 +295,7 @@ impl RemoteClient {
                 .send(Command::Retry(computer.id));
             return false;
         }
-        self.remember_remote_selection(cx);
+        self.remember_remote_selection();
         if let Some(remote) = &self.workspace {
             remote
                 .mission_workspace
@@ -254,6 +305,7 @@ impl RemoteClient {
         let epoch = self.ui.epoch;
         let clients = state(&self.app_store, cx);
         let follow = clients.read(cx).follow(computer.id.clone());
+        let usage = clients.read(cx).watch_usage(computer.id.clone(), false);
         let (wake, mut wakes) = futures::channel::mpsc::unbounded();
         cx.spawn(async move |weak, cx| {
             while let Some(id) = wakes.next().await {
@@ -299,14 +351,6 @@ impl RemoteClient {
         let sidebar =
             cx.new(|sidebar_cx| Sidebar::new(shell, self.app_store.clone(), None, sidebar_cx));
         sidebar.update(cx, |sidebar, cx| {
-            sidebar.remote_settings = selection.sidebar_settings.map(|saved| AppSettings {
-                sidebar_active_only: saved.sidebar_active_only,
-                sidebar_collapsed_projects: saved.sidebar_collapsed_projects,
-                sidebar_collapsed_active_groups: saved.sidebar_collapsed_active_groups,
-                sidebar_projects_open: saved.sidebar_projects_open,
-                sidebar_chats_open: saved.sidebar_chats_open,
-                ..self.settings(cx).clone()
-            });
             sidebar.set_front_page_target(front_page.clone(), cx)
         });
         let shell = cx.weak_entity();
@@ -328,6 +372,7 @@ impl RemoteClient {
             front_page,
             computer,
             _follow: Some(follow),
+            _usage: usage,
             active: selection.active,
             layouts: selection.layouts,
             overview_revision: 0,
@@ -368,6 +413,8 @@ impl RemoteClient {
             reopen_sessions: HashSet::new(),
             activate_tab: None,
             activate_mission: None,
+            viewed_tabs: Vec::new(),
+            landed_at: None,
             form_generation: 0,
             terminals: HashMap::new(),
             recovery: HashSet::new(),
@@ -393,7 +440,7 @@ impl RemoteClient {
         window: &mut Window,
         cx: &mut Context<NativeRoot>,
     ) {
-        self.remember_remote_selection(cx);
+        self.remember_remote_selection();
         if let Some(remote) = &self.workspace {
             remote
                 .mission_workspace
@@ -405,14 +452,13 @@ impl RemoteClient {
         cx.notify();
     }
 
-    pub(crate) fn remember_remote_selection(&mut self, cx: &App) {
+    pub(crate) fn remember_remote_selection(&mut self) {
         if let Some(remote) = &self.workspace {
             self.ui.selections.insert(
                 remote.computer.id.clone(),
                 RemoteSelection {
                     active: remote.active.clone(),
                     layouts: remote.layouts.clone(),
-                    sidebar_settings: remote.sidebar.read(cx).remote_settings.clone(),
                 },
             );
         }

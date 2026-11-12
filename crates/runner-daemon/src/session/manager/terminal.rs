@@ -5,11 +5,15 @@ use runner_core::protocol::terminal::{
     TerminalAttachment, TerminalFrame, TerminalMetadata, TerminalPalette, TerminalSubscription,
 };
 use runner_core::protocol::ClientError;
-use runner_terminal::terminal::{HostResult, ModelOptions, TerminalHost, TerminalModel};
+use runner_terminal::terminal::{
+    ClipboardTarget, HostResult, ModelOptions, TerminalHost, TerminalModel,
+};
 
 use super::*;
 
 const FRAME_CAPACITY: usize = 64;
+// A closed stream can detach after its session state was pruned and recreated.
+static NEXT_SUBSCRIBER_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Default, PartialEq)]
 pub(super) enum Controller {
@@ -162,6 +166,21 @@ impl CompanionTerminal {
     }
 }
 impl SessionState {
+    pub(super) fn release_terminal(&mut self) -> Vec<thread::JoinHandle<()>> {
+        self.finish_companion_terminals();
+        self.terminal_input.take();
+        let mut workers = self
+            .terminal
+            .take()
+            .map(|model| model.stop_workers())
+            .unwrap_or_default();
+        workers.extend(self.terminal_input_worker.take());
+        for (_, queue) in self.subscribers.drain(..) {
+            queue.close();
+        }
+        workers
+    }
+
     pub(super) fn finish_companion_terminals(&mut self) {
         for source in self
             .companion_terminals
@@ -235,6 +254,9 @@ impl TerminalHost for Host {
     }
     fn is_local_host(&self, host: &str) -> bool {
         crate::shell_integration::is_local_host(host)
+    }
+    fn clipboard_store(&self, id: &str, target: ClipboardTarget, text: &str) {
+        self.events.clipboard(id, target, text);
     }
 }
 
@@ -319,6 +341,12 @@ impl SessionManager {
         model.set_palette(*self.terminal_palette.lock().unwrap());
         Ok(model)
     }
+    pub(crate) fn terminal_output_sequence(&self, id: &str) -> u64 {
+        self.session_state(id)
+            .map(|state| state.lock().unwrap().output_seq)
+            .unwrap_or(0)
+    }
+
     pub fn terminal_model(&self, id: &str) -> Result<Arc<TerminalModel>> {
         let state = self
             .session_state(id)
@@ -376,8 +404,7 @@ impl SessionManager {
             .ok_or_else(|| Error::msg("terminal not found"))?;
         let mut snapshot = model.snapshot_with_history(state.output_seq, history);
         snapshot.controller = state.controller.wire();
-        state.next_subscriber_id += 1;
-        let subscriber_id = state.next_subscriber_id;
+        let subscriber_id = NEXT_SUBSCRIBER_ID.fetch_add(1, Ordering::Relaxed);
         let queue = Arc::new(FrameQueue::default());
         state.subscribers.push((subscriber_id, Arc::clone(&queue)));
         Ok(TerminalAttachment {

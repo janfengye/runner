@@ -20,10 +20,15 @@ struct FakeState {
     unknown: bool,
     moved: bool,
     unsent: bool,
+    held: bool,
     revision: u64,
     turn_started: u64,
+    prompted: bool,
     extra_rows: usize,
     ack_on_reserve: Option<Weak<Router>>,
+    confirmed: usize,
+    rechecks: usize,
+    recheck_releases: bool,
 }
 #[derive(Default)]
 struct Fake(Mutex<FakeState>);
@@ -43,7 +48,7 @@ impl StdinInjector for Fake {
     fn reserve_delivery(&self, session: &str) -> Result<DeliveryReservation> {
         if matches!(
             self.delivery_readiness(session),
-            DeliveryReadiness::Ready { .. }
+            DeliveryReadiness::Ready { .. } | DeliveryReadiness::Working
         ) {
             let ack = {
                 let mut state = self.0.lock().unwrap();
@@ -97,8 +102,10 @@ impl StdinInjector for Fake {
             generation: 1,
             input_revision: (state.revision, 0),
             turn_started: state.turn_started,
+            prompted: state.prompted,
             runtime: "fake".into(),
             unsent: state.unsent || state.readiness.get("W") == Some(&DeliveryReadiness::Unsent),
+            held: state.held,
         })
     }
     fn resubmit(
@@ -125,7 +132,35 @@ impl StdinInjector for Fake {
         self.0.lock().unwrap().busy += 1;
         Ok(())
     }
+    fn confirm_delivery(&self, _: &str, _: &DeliverySnapshot) {
+        self.0.lock().unwrap().confirmed += 1;
+    }
+    fn recheck_composer(&self, session: &str) {
+        let mut state = self.0.lock().unwrap();
+        state.rechecks += 1;
+        if state.recheck_releases {
+            state
+                .readiness
+                .insert(session.into(), DeliveryReadiness::Ready { idle: true });
+        }
+    }
     fn register_delivery_listener(&self, _: &str, _: Weak<dyn SessionDeliveryListener>) {}
+    fn report_readiness(&self, session: &str) -> DeliveryReadiness {
+        match self.delivery_readiness(session) {
+            DeliveryReadiness::Working => DeliveryReadiness::Ready { idle: false },
+            readiness => readiness,
+        }
+    }
+    fn reserve_report(&self, session: &str) -> Result<Option<u64>> {
+        if self.report_readiness(session) != (DeliveryReadiness::Ready { idle: true }) {
+            return Ok(None);
+        }
+        self.0.lock().unwrap().reserved.insert(session.into(), 1);
+        Ok(Some(1))
+    }
+    fn synthesize_report_busy(&self, _: &str) {
+        self.0.lock().unwrap().busy += 1;
+    }
 }
 impl RouterUiNotifier for Fake {
     fn delivery_blocked(&self, event: &DeliveryBlockedEvent) {
@@ -341,6 +376,125 @@ fn new_messages_wait_for_the_working_members_idle_transition() {
     assert!(f.writes()[0].contains("2 new messages"));
     f.after(SUBMIT_DELAY);
     assert_eq!(f.writes()[1], "\r");
+}
+
+#[test]
+fn a_working_members_wait_is_a_logged_hold_that_never_warns() {
+    let mut f = Fixture::new();
+    f.readiness(DeliveryReadiness::Ready { idle: false });
+    assert_eq!(f.dispatcher.hold_reason("worker"), None);
+    f.backlog(1);
+    assert_eq!(
+        f.dispatcher.hold_reason("worker"),
+        Some(DeliveryReadiness::Ready { idle: false })
+    );
+    f.after(Duration::from_secs(10 * 60));
+    f.after(Duration::from_secs(10 * 60));
+    assert!(f.writes().is_empty());
+    assert!(
+        f.warnings().is_empty(),
+        "a long turn is not a stall: {:?}",
+        f.warnings()
+    );
+    f.readiness(DeliveryReadiness::Ready { idle: true });
+    f.session(SessionDeliveryEvent::Idle);
+    assert_eq!(f.notices(), 1);
+    assert_eq!(f.dispatcher.hold_reason("worker"), None);
+}
+
+#[test]
+fn a_busy_nothing_confirms_warns_once_after_the_backoff_and_delivers_on_release() {
+    let mut f = Fixture::new();
+    f.readiness(DeliveryReadiness::Unconfirmed);
+    f.backlog(1);
+    assert_eq!(
+        f.dispatcher.hold_reason("worker"),
+        Some(DeliveryReadiness::Unconfirmed)
+    );
+    f.after(Duration::from_secs(119));
+    assert!(f.warnings().is_empty());
+    f.after(Duration::from_secs(1));
+    f.after(Duration::from_secs(300));
+    assert_eq!(
+        f.warnings(),
+        ["delivery to @worker is held: it shows busy but its agent has not reported a turn"]
+    );
+    assert!(f.writes().is_empty());
+    f.readiness(DeliveryReadiness::Ready { idle: true });
+    f.session(SessionDeliveryEvent::Idle);
+    assert_eq!(f.notices(), 1);
+    assert_eq!(f.warnings().len(), 1);
+    assert_eq!(f.dispatcher.hold_reason("worker"), None);
+}
+
+#[test]
+fn a_busy_that_the_agent_confirms_in_time_does_not_warn() {
+    let mut f = Fixture::new();
+    f.readiness(DeliveryReadiness::Unconfirmed);
+    f.backlog(1);
+    f.after(Duration::from_secs(100));
+    f.readiness(DeliveryReadiness::Ready { idle: false });
+    f.backlog(1);
+    f.after(Duration::from_secs(10 * 60));
+    assert!(f.warnings().is_empty(), "{:?}", f.warnings());
+    assert_eq!(
+        f.dispatcher.hold_reason("worker"),
+        Some(DeliveryReadiness::Ready { idle: false })
+    );
+}
+
+#[test]
+fn a_working_mid_turn_member_gets_each_new_message_at_once_but_no_redelivery() {
+    let mut f = Fixture::new();
+    f.readiness(DeliveryReadiness::Working);
+    f.backlog(1);
+    assert_eq!(f.notices(), 1);
+    assert!(f.writes()[0].contains("1 new messages"));
+    f.after(SUBMIT_DELAY);
+    assert_eq!(f.writes()[1], "\r");
+    f.after(dispatch::CONFIRM_WINDOW);
+    assert_eq!(f.port.0.lock().unwrap().busy, 1);
+    f.after(Duration::from_secs(10 * 60));
+    f.session(SessionDeliveryEvent::Idle);
+    assert_eq!(
+        f.writes().len(),
+        2,
+        "an unread backlog is not retyped mid-turn"
+    );
+    assert_eq!(f.dispatcher.hold_reason("worker"), None);
+    assert!(f.warnings().is_empty(), "{:?}", f.warnings());
+    f.backlog(2);
+    assert_eq!(f.notices(), 2);
+    assert!(f.writes().last().unwrap().contains("2 new messages"));
+}
+
+#[test]
+fn confirmation_and_unsent_detection_hold_for_a_working_target() {
+    let mut f = Fixture::new();
+    f.readiness(DeliveryReadiness::Working);
+    f.backlog(1);
+    f.after(SUBMIT_DELAY);
+    assert_eq!(f.port.0.lock().unwrap().busy, 0);
+    f.after(dispatch::CONFIRM_WINDOW);
+    assert_eq!(
+        f.port.0.lock().unwrap().busy,
+        1,
+        "a cleared composer confirms the notice"
+    );
+
+    let mut f = Fixture::new();
+    f.port.0.lock().unwrap().sticky = true;
+    f.readiness(DeliveryReadiness::Working);
+    f.backlog(1);
+    f.after(SUBMIT_DELAY);
+    f.after(dispatch::CONFIRM_WINDOW);
+    assert_eq!(f.writes().len(), 3, "one more Enter for an ignored one");
+    f.after(dispatch::CONFIRM_WINDOW);
+    assert_eq!(f.block_reason().as_deref(), Some("unsubmitted"));
+    assert_eq!(f.port.0.lock().unwrap().busy, 0);
+    f.backlog(2);
+    f.after(Duration::from_secs(10 * 60));
+    assert_eq!(f.notices(), 1, "a leftover notice is never retyped over");
 }
 
 #[test]
@@ -949,6 +1103,8 @@ fn a_leftover_notice_is_resubmitted_when_the_turn_ends_and_never_retyped() {
         f.readiness(DeliveryReadiness::Ready { idle: false });
         f.after(dispatch::CONFIRM_WINDOW);
         assert_eq!(f.port.0.lock().unwrap().busy, 1, "{leftover:?}");
+        assert_eq!(f.port.0.lock().unwrap().confirmed, 1, "{leftover:?}");
+        assert_eq!(f.port.0.lock().unwrap().rechecks, 0, "{leftover:?}");
         assert_eq!(f.block_reason(), None, "{leftover:?}");
         assert_eq!(f.notices(), 1, "{leftover:?}");
         assert!(f.warnings().is_empty(), "{leftover:?}");
@@ -1083,11 +1239,179 @@ fn unsent_readiness_without_a_leftover_is_never_typed_over() {
     f.session(SessionDeliveryEvent::Idle);
     f.after(Duration::from_secs(150));
     assert!(f.writes().is_empty());
+    assert!(f.port.0.lock().unwrap().rechecks > 0);
     assert_eq!(f.block_reason().as_deref(), Some("unsubmitted"));
     assert_eq!(
         f.warnings(),
         ["delivery to @worker is held: its inbox notice is still unsubmitted in its terminal"]
     );
+}
+
+#[test]
+fn a_stale_unsent_hold_without_a_leftover_is_delivered_once_rechecked() {
+    for backlog_while_held in [true, false] {
+        let mut f = Fixture::new();
+        f.readiness(DeliveryReadiness::Unsent);
+        f.port.0.lock().unwrap().recheck_releases = true;
+        if backlog_while_held {
+            f.backlog(1);
+        } else {
+            // The turn ends with nothing unread; the next message arrives while it idles.
+            f.session(SessionDeliveryEvent::Idle);
+            assert_eq!(f.port.0.lock().unwrap().rechecks, 0);
+            f.backlog(1);
+        }
+        assert_eq!(f.port.0.lock().unwrap().rechecks, 1);
+        assert_eq!(f.notices(), 1, "backlog_while_held={backlog_while_held}");
+        assert_eq!(f.block_reason(), None);
+        f.after(SUBMIT_DELAY);
+        f.after(dispatch::CONFIRM_WINDOW);
+        assert_eq!(f.port.0.lock().unwrap().confirmed, 1);
+        assert!(f.warnings().is_empty());
+    }
+}
+
+#[test]
+fn a_stale_draft_hold_is_rechecked_like_an_unsent_one() {
+    let mut f = Fixture::new();
+    f.readiness(DeliveryReadiness::Drafting);
+    f.backlog(1);
+    assert_eq!(f.port.0.lock().unwrap().rechecks, 1);
+    assert!(f.writes().is_empty(), "a real draft still holds the notice");
+
+    f.port.0.lock().unwrap().recheck_releases = true;
+    f.session(SessionDeliveryEvent::Idle);
+    f.after(Duration::from_secs(60));
+    assert_eq!(f.notices(), 1);
+}
+
+#[test]
+fn a_notice_the_transcript_keeps_stops_holding_once_its_turn_ran() {
+    let mut f = Fixture::new();
+    f.port.0.lock().unwrap().sticky = true;
+    f.backlog(1);
+    f.after(SUBMIT_DELAY);
+    {
+        let mut state = f.port.0.lock().unwrap();
+        state.unsent = true;
+        state.held = true;
+        state.turn_started += 1;
+        state.revision += 1;
+    }
+    f.after(dispatch::CONFIRM_WINDOW);
+    assert_eq!(f.port.0.lock().unwrap().confirmed, 0, "unverified");
+    f.tick(None);
+    assert_eq!(f.block_reason().as_deref(), Some("unsubmitted"));
+
+    f.port.0.lock().unwrap().unsent = false;
+    f.session(SessionDeliveryEvent::Idle);
+    assert_eq!(f.block_reason(), None);
+}
+
+#[test]
+fn a_notice_the_tracker_let_go_of_before_the_check_does_not_hold() {
+    let mut f = Fixture::new();
+    f.port.0.lock().unwrap().sticky = true;
+    f.backlog(1);
+    f.after(SUBMIT_DELAY);
+    {
+        let mut state = f.port.0.lock().unwrap();
+        state.held = true;
+        state.turn_started += 1;
+        state.revision += 1;
+    }
+    f.after(dispatch::CONFIRM_WINDOW);
+    assert_eq!(f.port.0.lock().unwrap().confirmed, 0, "unverified");
+    f.session(SessionDeliveryEvent::Idle);
+    f.after(Duration::from_secs(60));
+    assert_eq!(f.block_reason(), None);
+}
+
+#[test]
+fn a_turn_does_not_take_a_notice_the_tracker_never_held() {
+    for before_check in [false, true] {
+        let mut f = Fixture::new();
+        f.port.0.lock().unwrap().sticky = true;
+        f.backlog(1);
+        f.after(SUBMIT_DELAY);
+        f.port.0.lock().unwrap().revision += 1;
+        if before_check {
+            f.port.0.lock().unwrap().turn_started += 1;
+        }
+        f.after(dispatch::CONFIRM_WINDOW);
+        assert_eq!(f.port.0.lock().unwrap().confirmed, 0, "{before_check}");
+        if !before_check {
+            f.port.0.lock().unwrap().turn_started += 1;
+        }
+        f.session(SessionDeliveryEvent::Idle);
+        f.after(Duration::from_secs(60));
+        assert_eq!(
+            f.block_reason().as_deref(),
+            Some("unsubmitted"),
+            "{before_check}"
+        );
+        assert_eq!(f.notices(), 1, "{before_check}");
+    }
+}
+
+#[test]
+fn a_turn_reporting_the_notice_as_its_prompt_confirms_it_despite_a_key() {
+    for prompted in [true, false] {
+        let mut f = Fixture::new();
+        f.backlog(1);
+        f.after(SUBMIT_DELAY);
+        {
+            let mut state = f.port.0.lock().unwrap();
+            state.unknown = true;
+            state.revision += 1;
+            state.turn_started += 1;
+            state.prompted = prompted;
+        }
+        f.after(dispatch::CONFIRM_WINDOW);
+        let state = f.port.0.lock().unwrap();
+        assert_eq!(
+            (state.confirmed, state.busy),
+            if prompted { (1, 1) } else { (0, 0) },
+            "prompted={prompted}"
+        );
+    }
+}
+
+#[test]
+fn a_prompt_reported_after_the_check_releases_a_notice_the_tracker_never_held() {
+    let mut f = Fixture::new();
+    f.port.0.lock().unwrap().sticky = true;
+    f.backlog(1);
+    f.after(SUBMIT_DELAY);
+    f.port.0.lock().unwrap().revision += 1;
+    f.after(dispatch::CONFIRM_WINDOW);
+    assert_eq!(f.port.0.lock().unwrap().confirmed, 0, "unverified");
+    f.tick(None);
+    assert_eq!(f.block_reason().as_deref(), Some("unsubmitted"));
+    {
+        let mut state = f.port.0.lock().unwrap();
+        state.turn_started += 1;
+        state.prompted = true;
+    }
+    f.session(SessionDeliveryEvent::Idle);
+    assert_eq!(f.block_reason(), None);
+}
+
+#[test]
+fn only_a_confirmed_attempt_ends_the_sessions_ownership_of_its_notice() {
+    for sticky in [false, true] {
+        let mut f = Fixture::new();
+        f.port.0.lock().unwrap().sticky = sticky;
+        f.backlog(1);
+        f.after(SUBMIT_DELAY);
+        f.after(dispatch::CONFIRM_WINDOW);
+        f.after(dispatch::CONFIRM_WINDOW);
+        assert_eq!(
+            f.port.0.lock().unwrap().confirmed,
+            usize::from(!sticky),
+            "sticky={sticky}"
+        );
+    }
 }
 
 #[test]
@@ -1283,6 +1607,106 @@ fn targeted_and_untargeted_human_said_use_the_stream_without_a_lead_fallback() {
     );
     assert!(messages.iter().all(|entry| entry.event.from == "human"));
     assert!(f.port.0.lock().unwrap().pushes.is_empty());
+}
+
+fn answered(payload: impl FnOnce(&str) -> serde_json::Value, recover: bool) -> String {
+    let f = Fixture::new();
+    f.signal(
+        "worker",
+        "ask_human",
+        serde_json::json!({"prompt":"continue?"}),
+    );
+    let question = f
+        .router
+        .log
+        .read_from(0)
+        .unwrap()
+        .last()
+        .unwrap()
+        .event
+        .id
+        .clone();
+    let payload = payload(&question);
+    if recover {
+        f.router
+            .log
+            .append(EventDraft::signal(
+                None,
+                "mission",
+                "human",
+                SignalType::new("human_response"),
+                payload,
+            ))
+            .unwrap();
+        f.router.reconstruct_from_log().unwrap();
+        f.router.reconstruct_from_log().unwrap();
+    } else {
+        f.signal("human", "human_response", payload);
+    }
+    let mut messages = f
+        .router
+        .log
+        .read_from(0)
+        .unwrap()
+        .into_iter()
+        .filter(|entry| entry.event.kind == EventKind::Message)
+        .collect::<Vec<_>>();
+    assert_eq!(messages.len(), 1);
+    let answer = messages.remove(0).event;
+    assert_eq!(
+        answer.recipients().first().map(String::as_str),
+        Some("worker")
+    );
+    assert_eq!(answer.payload["question_id"], question.as_str());
+    assert_eq!(f.router.pending_ask_count(), 0);
+    answer.payload["text"].as_str().unwrap().to_owned()
+}
+
+#[test]
+fn an_answer_with_a_note_delivers_the_choice_and_the_note_in_one_message() {
+    for recover in [false, true] {
+        assert_eq!(
+            answered(
+                |id| serde_json::json!({"question_id":id,"choice":"yes","note":"Only on Friday","delivery":"inbox"}),
+                recover,
+            ),
+            "Answer to \"continue?\": yes — Only on Friday",
+            "recover={recover}"
+        );
+    }
+}
+
+#[test]
+fn an_answer_without_a_usable_note_keeps_todays_text() {
+    let unusable = [
+        None,
+        Some(serde_json::Value::Null),
+        Some(serde_json::json!("")),
+        Some(serde_json::json!(" \n\t ")),
+        Some(serde_json::json!(7)),
+        Some(serde_json::json!(true)),
+        Some(serde_json::json!(["Only on Friday"])),
+        Some(serde_json::json!({"text":"Only on Friday"})),
+    ];
+    for recover in [false, true] {
+        for note in &unusable {
+            let text = answered(
+                |id| {
+                    let mut payload =
+                        serde_json::json!({"question_id":id,"choice":"yes","delivery":"inbox"});
+                    if let Some(note) = note {
+                        payload["note"] = note.clone();
+                    }
+                    payload
+                },
+                recover,
+            );
+            assert_eq!(
+                text, "Answer to \"continue?\": yes",
+                "recover={recover} note={note:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1567,5 +1991,601 @@ fn multi_target_human_messages_keep_recipients_live_and_during_reopen_repair() {
     for entry in messages {
         assert_eq!(entry.event.recipients(), &["lead", "worker"]);
         assert!(!entry.event.addresses("qa"));
+    }
+}
+
+mod report {
+    use super::super::report::{Line, ReportDispatcher, ReportKind, ReportSource};
+    use super::*;
+
+    #[derive(Default)]
+    struct Lines {
+        closed: Mutex<bool>,
+        stale: Mutex<Vec<String>>,
+        unknown: Mutex<Vec<String>>,
+    }
+    impl ReportSource for Lines {
+        fn line(&self, _: &str, mission: &str, kind: ReportKind) -> Line {
+            if self.stale.lock().unwrap().iter().any(|m| m == mission) {
+                Line::Drop
+            } else if self.unknown.lock().unwrap().iter().any(|m| m == mission) {
+                Line::Wait
+            } else {
+                Line::Send(format!("[runner] Mission {mission} {kind:?}"))
+            }
+        }
+        fn chat_open(&self, _: &str) -> bool {
+            !*self.closed.lock().unwrap()
+        }
+    }
+
+    struct Reports {
+        port: Fake,
+        lines: Lines,
+        dispatcher: ReportDispatcher,
+        now: Instant,
+    }
+    impl Reports {
+        fn new() -> Self {
+            Self {
+                port: Fake::default(),
+                lines: Lines::default(),
+                dispatcher: ReportDispatcher::default(),
+                now: Instant::now(),
+            }
+        }
+        fn tick(&mut self) -> Option<Instant> {
+            self.dispatcher.advance(&self.port, &self.lines, self.now)
+        }
+        fn wait(&mut self, by: Duration) -> Option<Instant> {
+            self.now += by;
+            self.tick()
+        }
+        /// Type, press Enter and confirm one report.
+        fn deliver(&mut self) {
+            self.tick();
+            self.wait(SUBMIT_DELAY);
+            self.wait(super::super::dispatch::CONFIRM_WINDOW);
+        }
+        fn readiness(&self, readiness: DeliveryReadiness) {
+            self.port
+                .0
+                .lock()
+                .unwrap()
+                .readiness
+                .insert("C".into(), readiness);
+        }
+        fn typed(&self) -> Vec<String> {
+            self.port
+                .0
+                .lock()
+                .unwrap()
+                .pushes
+                .iter()
+                .filter(|(_, bytes)| bytes != b"\r")
+                .map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned())
+                .collect()
+        }
+        fn enters(&self) -> usize {
+            self.port
+                .0
+                .lock()
+                .unwrap()
+                .pushes
+                .iter()
+                .filter(|(_, bytes)| bytes == b"\r")
+                .count()
+        }
+    }
+
+    #[test]
+    fn a_report_is_typed_submitted_and_confirmed_once() {
+        let mut r = Reports::new();
+        r.dispatcher.queue("C", "m1", ReportKind::State);
+
+        assert_eq!(r.tick(), Some(r.now + SUBMIT_DELAY));
+        assert_eq!(r.typed(), ["[runner] Mission m1 State"]);
+        assert_eq!(r.enters(), 0, "Enter waits for SUBMIT_DELAY");
+        r.wait(SUBMIT_DELAY);
+        assert_eq!(r.enters(), 1);
+        r.wait(super::super::dispatch::CONFIRM_WINDOW);
+
+        let state = r.port.0.lock().unwrap();
+        assert_eq!((state.confirmed, state.busy), (1, 1));
+        drop(state);
+        assert!(r.dispatcher.pending("C").is_empty());
+        r.wait(Duration::from_secs(60));
+        assert_eq!(r.typed().len(), 1);
+    }
+
+    #[test]
+    fn a_report_waits_for_an_idle_chat_on_every_runtime() {
+        let mut r = Reports::new();
+        r.dispatcher.queue("C", "m1", ReportKind::State);
+        for held in [
+            DeliveryReadiness::Working,
+            DeliveryReadiness::Ready { idle: false },
+            DeliveryReadiness::Unconfirmed,
+            DeliveryReadiness::Drafting,
+            DeliveryReadiness::Unsent,
+            DeliveryReadiness::NeedsYou,
+            DeliveryReadiness::Starting,
+            DeliveryReadiness::Unavailable,
+        ] {
+            r.readiness(held);
+            r.wait(Duration::from_secs(3600));
+            assert!(r.typed().is_empty(), "{held:?}");
+        }
+        r.readiness(DeliveryReadiness::RecentlyTyping(Duration::from_secs(2)));
+        assert_eq!(r.wait(Duration::ZERO), Some(r.now + Duration::from_secs(2)));
+        r.readiness(DeliveryReadiness::Ready { idle: true });
+        r.wait(Duration::from_secs(2));
+        assert_eq!(r.typed().len(), 1);
+    }
+
+    #[test]
+    fn reports_go_one_at_a_time_oldest_first_and_a_later_change_replaces_one_waiting() {
+        let mut r = Reports::new();
+        r.dispatcher.queue("C", "m1", ReportKind::State);
+        r.dispatcher.queue("C", "m2", ReportKind::Linked);
+        r.dispatcher.queue("C", "m1", ReportKind::Linked);
+        assert_eq!(
+            r.dispatcher.pending("C"),
+            [
+                ("m1".to_owned(), ReportKind::Linked),
+                ("m2".to_owned(), ReportKind::Linked)
+            ]
+        );
+
+        r.deliver();
+        assert_eq!(r.typed(), ["[runner] Mission m1 Linked"]);
+        r.readiness(DeliveryReadiness::Ready { idle: false });
+        r.wait(Duration::from_secs(60));
+        assert_eq!(
+            r.typed().len(),
+            1,
+            "the next report waits for the chat to be idle again"
+        );
+        r.readiness(DeliveryReadiness::Ready { idle: true });
+        r.dispatcher
+            .session_event(&r.port, "C", SessionDeliveryEvent::Idle);
+        r.deliver();
+        assert_eq!(
+            r.typed(),
+            ["[runner] Mission m1 Linked", "[runner] Mission m2 Linked"]
+        );
+        assert!(r.dispatcher.pending("C").is_empty());
+    }
+
+    #[test]
+    fn an_unsubmitted_line_pauses_the_chat_until_it_is_cleared() {
+        let mut r = Reports::new();
+        r.port.0.lock().unwrap().sticky = true;
+        r.dispatcher.queue("C", "m1", ReportKind::State);
+        r.deliver();
+        r.wait(super::super::dispatch::CONFIRM_WINDOW);
+        assert_eq!(
+            r.enters(),
+            2,
+            "one extra Enter, then the line is unsubmitted"
+        );
+        for _ in 0..5 {
+            r.wait(Duration::from_secs(60));
+        }
+        assert_eq!(r.typed().len(), 1, "no second line stacks on the first");
+        assert_eq!(r.dispatcher.pending("C").len(), 1);
+
+        r.port.0.lock().unwrap().input.clear();
+        r.wait(Duration::ZERO);
+        assert_eq!(
+            r.typed().len(),
+            2,
+            "cleared without a turn: the report is retried"
+        );
+
+        let mut sent = Reports::new();
+        sent.port.0.lock().unwrap().sticky = true;
+        sent.dispatcher.queue("C", "m1", ReportKind::State);
+        sent.deliver();
+        sent.wait(super::super::dispatch::CONFIRM_WINDOW);
+        {
+            let mut state = sent.port.0.lock().unwrap();
+            state.input.clear();
+            state.turn_started += 1;
+        }
+        sent.wait(Duration::ZERO);
+        assert!(
+            sent.dispatcher.pending("C").is_empty(),
+            "the person sent the line: the chat has the report"
+        );
+        assert_eq!(sent.typed().len(), 1);
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Leftover {
+        UnverifiedThenVisible,
+        UnverifiedTrackerOnly,
+    }
+
+    /// An attempt whose confirmation could not see the composer.
+    fn leave_unverified_line(r: &mut Reports, leftover: Leftover) {
+        r.port.0.lock().unwrap().sticky = true;
+        r.dispatcher.queue("C", "m1", ReportKind::State);
+        r.tick();
+        r.wait(SUBMIT_DELAY);
+        r.port.0.lock().unwrap().unknown = true;
+        r.wait(super::super::dispatch::CONFIRM_WINDOW);
+        assert_eq!(
+            r.enters(),
+            1,
+            "{leftover:?}: no second Enter without seeing the line"
+        );
+        match leftover {
+            Leftover::UnverifiedThenVisible => r.port.0.lock().unwrap().unknown = false,
+            Leftover::UnverifiedTrackerOnly => r.port.0.lock().unwrap().unsent = true,
+        }
+    }
+
+    #[test]
+    fn an_unverified_line_that_is_still_there_is_never_typed_over() {
+        for leftover in [
+            Leftover::UnverifiedThenVisible,
+            Leftover::UnverifiedTrackerOnly,
+        ] {
+            let mut r = Reports::new();
+            leave_unverified_line(&mut r, leftover);
+            r.dispatcher.queue("C", "m2", ReportKind::State);
+            for _ in 0..5 {
+                r.dispatcher
+                    .session_event(&r.port, "C", SessionDeliveryEvent::Idle);
+                r.wait(Duration::from_secs(60));
+            }
+            assert_eq!(r.typed().len(), 1, "{leftover:?}");
+            assert_eq!(r.dispatcher.pending("C").len(), 2, "{leftover:?}");
+            assert_eq!(r.port.0.lock().unwrap().rechecks, 0, "{leftover:?}");
+
+            {
+                let mut state = r.port.0.lock().unwrap();
+                state.input.clear();
+                state.unsent = false;
+                state.unknown = false;
+            }
+            r.wait(Duration::ZERO);
+            assert_eq!(
+                r.typed(),
+                ["[runner] Mission m1 State", "[runner] Mission m1 State"],
+                "{leftover:?}: once the line is gone the report is retried"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unverified_line_whose_turn_starts_late_is_not_typed_again() {
+        for (person_typed, prompted) in [(false, false), (true, false), (true, true)] {
+            let mut r = Reports::new();
+            r.dispatcher.queue("C", "m1", ReportKind::Linked);
+            r.tick();
+            r.wait(SUBMIT_DELAY);
+            // A native Codex fork's first turn reports after the window (QA run 5).
+            r.port.0.lock().unwrap().unknown = true;
+            r.wait(super::super::dispatch::CONFIRM_WINDOW);
+            assert_eq!(r.port.0.lock().unwrap().confirmed, 0, "unverified");
+            // The composer shows the line gone and the chat busy before its turn is reported.
+            r.port.0.lock().unwrap().unknown = false;
+            r.readiness(DeliveryReadiness::Ready { idle: false });
+            r.wait(super::super::dispatch::CONFIRM_WINDOW);
+            assert_eq!(r.dispatcher.pending("C").len(), 1);
+            {
+                let mut state = r.port.0.lock().unwrap();
+                state.turn_started += 1;
+                state.prompted = prompted;
+                if person_typed {
+                    state.revision += 1;
+                }
+            }
+            r.dispatcher
+                .session_event(&r.port, "C", SessionDeliveryEvent::Idle);
+            r.wait(Duration::from_secs(5));
+            r.readiness(DeliveryReadiness::Ready { idle: true });
+            r.dispatcher
+                .session_event(&r.port, "C", SessionDeliveryEvent::Idle);
+            r.wait(Duration::from_secs(5));
+            if person_typed && !prompted {
+                assert_eq!(
+                    r.typed().len(),
+                    2,
+                    "after the person's own input the turn may be theirs: retried"
+                );
+            } else {
+                assert_eq!(r.typed().len(), 1, "the line's own turn: not typed again");
+                assert!(r.dispatcher.pending("C").is_empty());
+                assert_eq!(r.port.0.lock().unwrap().confirmed, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn a_deferred_retry_keeps_the_late_turn_evidence() {
+        let mut r = Reports::new();
+        r.dispatcher.queue("C", "m1", ReportKind::Linked);
+        r.tick();
+        r.wait(SUBMIT_DELAY);
+        r.port.0.lock().unwrap().unknown = true;
+        r.wait(super::super::dispatch::CONFIRM_WINDOW);
+        r.port.0.lock().unwrap().unknown = false;
+        r.readiness(DeliveryReadiness::Ready { idle: false });
+        r.wait(super::super::dispatch::CONFIRM_WINDOW);
+        // A ready pass before the turn shows defers the retry without typing.
+        r.lines.unknown.lock().unwrap().push("m1".into());
+        r.readiness(DeliveryReadiness::Ready { idle: true });
+        r.dispatcher
+            .session_event(&r.port, "C", SessionDeliveryEvent::Idle);
+        r.wait(Duration::ZERO);
+        assert_eq!(r.typed().len(), 1);
+        r.port.0.lock().unwrap().turn_started += 1;
+        r.lines.unknown.lock().unwrap().clear();
+        r.dispatcher
+            .session_event(&r.port, "C", SessionDeliveryEvent::Idle);
+        r.wait(Duration::from_secs(5));
+        assert_eq!(r.typed().len(), 1, "not typed again after the deferral");
+        assert!(r.dispatcher.pending("C").is_empty());
+        assert_eq!(r.port.0.lock().unwrap().confirmed, 1);
+    }
+
+    #[test]
+    fn a_stale_unsent_hold_without_a_leftover_is_delivered_once_rechecked() {
+        let mut r = Reports::new();
+        r.readiness(DeliveryReadiness::Unsent);
+        r.port.0.lock().unwrap().recheck_releases = true;
+        r.dispatcher.queue("C", "m1", ReportKind::State);
+
+        r.tick();
+        assert_eq!(r.port.0.lock().unwrap().rechecks, 1);
+        assert_eq!(r.typed(), ["[runner] Mission m1 State"]);
+        r.wait(SUBMIT_DELAY);
+        r.wait(super::super::dispatch::CONFIRM_WINDOW);
+        assert_eq!(r.port.0.lock().unwrap().confirmed, 1);
+        assert!(r.dispatcher.pending("C").is_empty());
+    }
+
+    /// #1225: Claude Code keeps the submitted line as a transcript row at the composer's row,
+    /// which reads as the line still sitting there.
+    #[test]
+    fn a_line_the_transcript_keeps_stops_holding_the_chat_once_its_turn_ran() {
+        let mut r = Reports::new();
+        r.port.0.lock().unwrap().sticky = true;
+        r.dispatcher.queue("C", "m1", ReportKind::Linked);
+        r.tick();
+        r.wait(SUBMIT_DELAY);
+        {
+            let mut state = r.port.0.lock().unwrap();
+            state.unsent = true;
+            state.held = true;
+            state.turn_started += 1;
+            // A key the person pressed during the confirmation window.
+            state.revision += 1;
+        }
+        r.wait(super::super::dispatch::CONFIRM_WINDOW);
+        assert_eq!(r.port.0.lock().unwrap().confirmed, 0, "unverified");
+        r.dispatcher.queue("C", "m1", ReportKind::State);
+        r.wait(Duration::from_secs(60));
+        assert_eq!(
+            r.typed().len(),
+            1,
+            "held while the tracker still reads the row as the composer"
+        );
+
+        // The turn ends with the cursor back at the empty composer.
+        r.port.0.lock().unwrap().unsent = false;
+        r.dispatcher
+            .session_event(&r.port, "C", SessionDeliveryEvent::Idle);
+        r.port.0.lock().unwrap().sticky = false;
+        r.deliver();
+        assert_eq!(
+            r.typed(),
+            ["[runner] Mission m1 Linked", "[runner] Mission m1 State"]
+        );
+        assert!(r.dispatcher.pending("C").is_empty());
+    }
+
+    #[test]
+    fn a_line_the_tracker_let_go_of_before_the_check_does_not_hold_the_chat() {
+        let mut r = Reports::new();
+        r.port.0.lock().unwrap().sticky = true;
+        r.dispatcher.queue("C", "m1", ReportKind::Linked);
+        r.tick();
+        r.wait(SUBMIT_DELAY);
+        {
+            // The tracker held the line, then saw the empty composer before the check.
+            let mut state = r.port.0.lock().unwrap();
+            state.held = true;
+            state.turn_started += 1;
+            state.revision += 1;
+        }
+        r.wait(super::super::dispatch::CONFIRM_WINDOW);
+        assert_eq!(r.port.0.lock().unwrap().confirmed, 0, "unverified");
+        r.dispatcher.queue("C", "m1", ReportKind::State);
+        r.port.0.lock().unwrap().sticky = false;
+        r.dispatcher
+            .session_event(&r.port, "C", SessionDeliveryEvent::Idle);
+        r.wait(super::super::dispatch::CONFIRM_WINDOW);
+        r.wait(SUBMIT_DELAY);
+        r.wait(super::super::dispatch::CONFIRM_WINDOW);
+        assert_eq!(
+            r.typed(),
+            ["[runner] Mission m1 Linked", "[runner] Mission m1 State"]
+        );
+        assert!(r.dispatcher.pending("C").is_empty());
+    }
+
+    #[test]
+    fn a_turn_does_not_take_a_line_the_tracker_never_held() {
+        // A turn that did not take the line, as from a scheduled wakeup, on either side of the
+        // confirmation check.
+        for before_check in [false, true] {
+            let mut r = Reports::new();
+            r.port.0.lock().unwrap().sticky = true;
+            r.dispatcher.queue("C", "m1", ReportKind::State);
+            r.tick();
+            r.wait(SUBMIT_DELAY);
+            r.port.0.lock().unwrap().revision += 1;
+            if before_check {
+                r.port.0.lock().unwrap().turn_started += 1;
+            }
+            r.wait(super::super::dispatch::CONFIRM_WINDOW);
+            assert_eq!(r.port.0.lock().unwrap().confirmed, 0, "{before_check}");
+            if !before_check {
+                r.port.0.lock().unwrap().turn_started += 1;
+            }
+            r.dispatcher.queue("C", "m2", ReportKind::State);
+            for _ in 0..3 {
+                r.dispatcher
+                    .session_event(&r.port, "C", SessionDeliveryEvent::Idle);
+                r.wait(Duration::from_secs(60));
+            }
+            assert_eq!(r.typed().len(), 1, "nothing stacks on the line");
+            assert_eq!(r.dispatcher.pending("C").len(), 2, "{before_check}");
+        }
+    }
+
+    /// #1225 L2: a key in the window moved the input revision and neither the probe nor the
+    /// tracker could place the line. Only a turn reporting the line as its prompt confirms it.
+    #[test]
+    fn a_turn_reporting_the_line_as_its_prompt_confirms_it_despite_a_key() {
+        for prompted in [true, false] {
+            let mut r = Reports::new();
+            r.dispatcher.queue("C", "m1", ReportKind::Linked);
+            r.tick();
+            r.wait(SUBMIT_DELAY);
+            {
+                let mut state = r.port.0.lock().unwrap();
+                state.unknown = true;
+                state.revision += 1;
+                state.turn_started += 1;
+                state.prompted = prompted;
+            }
+            r.wait(super::super::dispatch::CONFIRM_WINDOW);
+            assert_eq!(
+                r.port.0.lock().unwrap().confirmed,
+                usize::from(prompted),
+                "prompted={prompted}"
+            );
+            if !prompted {
+                assert_eq!(r.dispatcher.pending("C").len(), 1);
+                continue;
+            }
+            assert!(r.dispatcher.pending("C").is_empty());
+            {
+                let mut state = r.port.0.lock().unwrap();
+                state.unknown = false;
+                state.prompted = false;
+            }
+            r.dispatcher
+                .session_event(&r.port, "C", SessionDeliveryEvent::Idle);
+            r.wait(Duration::from_secs(5));
+            assert_eq!(r.typed().len(), 1, "not typed again");
+            r.dispatcher.queue("C", "m1", ReportKind::State);
+            r.deliver();
+            assert_eq!(
+                r.typed(),
+                ["[runner] Mission m1 Linked", "[runner] Mission m1 State"]
+            );
+        }
+    }
+
+    #[test]
+    fn a_prompt_reported_after_the_check_releases_a_line_the_tracker_never_held() {
+        let mut r = Reports::new();
+        r.port.0.lock().unwrap().sticky = true;
+        r.dispatcher.queue("C", "m1", ReportKind::Linked);
+        r.tick();
+        r.wait(SUBMIT_DELAY);
+        r.port.0.lock().unwrap().revision += 1;
+        r.wait(super::super::dispatch::CONFIRM_WINDOW);
+        assert_eq!(r.port.0.lock().unwrap().confirmed, 0, "unverified");
+        {
+            let mut state = r.port.0.lock().unwrap();
+            state.turn_started += 1;
+            state.prompted = true;
+        }
+        r.wait(super::super::dispatch::CONFIRM_WINDOW);
+        assert!(r.dispatcher.pending("C").is_empty());
+        assert_eq!(r.typed().len(), 1);
+    }
+
+    #[test]
+    fn a_draft_hold_is_rechecked_and_released_once_the_composer_is_empty() {
+        let mut r = Reports::new();
+        r.readiness(DeliveryReadiness::Drafting);
+        r.dispatcher.queue("C", "m1", ReportKind::State);
+        r.tick();
+        assert_eq!(r.port.0.lock().unwrap().rechecks, 1);
+        r.dispatcher
+            .session_event(&r.port, "C", SessionDeliveryEvent::Idle);
+        r.wait(Duration::from_secs(60));
+        assert!(r.typed().is_empty(), "a real draft still holds the report");
+        assert_eq!(r.port.0.lock().unwrap().rechecks, 2);
+
+        r.port.0.lock().unwrap().recheck_releases = true;
+        r.dispatcher
+            .session_event(&r.port, "C", SessionDeliveryEvent::Idle);
+        r.deliver();
+        assert_eq!(r.typed(), ["[runner] Mission m1 State"]);
+        assert!(r.dispatcher.pending("C").is_empty());
+    }
+
+    #[test]
+    fn a_stopped_chat_receives_its_report_when_it_resumes() {
+        let mut r = Reports::new();
+        r.readiness(DeliveryReadiness::Unavailable);
+        r.dispatcher.queue("C", "m1", ReportKind::State);
+        assert_eq!(r.tick(), None, "nothing to time while the chat is stopped");
+        assert!(r.typed().is_empty());
+
+        r.readiness(DeliveryReadiness::Ready { idle: true });
+        r.dispatcher
+            .session_event(&r.port, "C", SessionDeliveryEvent::Respawned);
+        r.tick();
+        assert_eq!(r.typed().len(), 1);
+    }
+
+    #[test]
+    fn a_closed_chat_or_a_stale_report_sends_nothing() {
+        let mut r = Reports::new();
+        r.dispatcher.queue("C", "m1", ReportKind::State);
+        r.tick();
+        *r.lines.closed.lock().unwrap() = true;
+        r.wait(SUBMIT_DELAY);
+        assert!(r.dispatcher.pending("C").is_empty());
+        assert_eq!(r.enters(), 0);
+        assert!(
+            r.port.0.lock().unwrap().reserved.is_empty(),
+            "the input gate is released"
+        );
+
+        let mut stale = Reports::new();
+        stale.lines.stale.lock().unwrap().push("m1".into());
+        stale.dispatcher.queue("C", "m1", ReportKind::State);
+        stale.dispatcher.queue("C", "m2", ReportKind::State);
+        stale.tick();
+        assert_eq!(stale.typed(), ["[runner] Mission m2 State"]);
+        assert_eq!(
+            stale.dispatcher.pending("C"),
+            [("m2".to_owned(), ReportKind::State)]
+        );
+
+        let mut unknown = Reports::new();
+        unknown.lines.unknown.lock().unwrap().push("m1".into());
+        unknown.dispatcher.queue("C", "m1", ReportKind::Linked);
+        assert_eq!(unknown.tick(), Some(unknown.now + Duration::from_secs(1)));
+        assert!(unknown.typed().is_empty());
+        assert_eq!(
+            unknown.dispatcher.pending("C").len(),
+            1,
+            "a mission not read yet waits"
+        );
+        unknown.lines.unknown.lock().unwrap().clear();
+        unknown.wait(Duration::from_secs(1));
+        assert_eq!(unknown.typed(), ["[runner] Mission m1 Linked"]);
     }
 }

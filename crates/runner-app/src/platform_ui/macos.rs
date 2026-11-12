@@ -125,17 +125,6 @@ pub(crate) fn sidebar_section() -> Div {
     div().flex_none()
 }
 
-pub(crate) fn update_hint_tooltip(version: &str) -> String {
-    crate::i18n::tf(
-        "format.runner_is_ready_to_install",
-        &[("version", (version).to_string())],
-    )
-}
-
-pub(crate) fn activate_update_hint(updater: &Entity<Updater>, cx: &mut App) {
-    updater.read(cx).check_for_updates();
-}
-
 pub(crate) fn finish_window_close(_window: &mut Window) -> bool {
     true
 }
@@ -166,7 +155,7 @@ pub(crate) fn take_titlebar_actions() -> Vec<TitlebarAction> {
 
 pub(crate) fn titlebar_mouse_down(event: &gpui::MouseDownEvent, window: &mut Window, cx: &mut App) {
     cx.stop_propagation();
-    let action = if event.click_count == 2 {
+    let action = if super::titlebar_double_click(event.click_count) {
         TitlebarAction::Zoom
     } else {
         TitlebarAction::Move
@@ -217,14 +206,7 @@ impl NativeRoot {
         &self,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let library = matches!(
-            self.remote_client.active_item(),
-            Some(
-                crate::surfaces::remote_client::RemoteItem::Roles
-                    | crate::surfaces::remote_client::RemoteItem::Crews
-            )
-        );
-        let height = if self.front_page_has_islands() && !library {
+        let height = if self.front_page_has_islands() {
             TITLEBAR_DRAG_HEIGHT
         } else {
             WORKSPACE_HEADER_HEIGHT

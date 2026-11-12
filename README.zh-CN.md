@@ -32,7 +32,7 @@
 </p>
 
 <p align="center">
-  <img src="assets/hero.png" alt="Runner 起始页 — 在同一个工作区新建聊天、终端或 crew mission" width="100%" />
+  <img src="assets/hero.png" alt="Runner 起始页 — 一个启动器启动最近用过的 agent 和角色、终端或 crew mission" width="100%" />
 </p>
 
 <p align="center">
@@ -51,7 +51,7 @@
   <a href="./CONTRIBUTING.md">参与贡献</a>
 </p>
 
-> Alpha · 原生支持 macOS（Apple Silicon）和 Windows（x64），Linux（ARM64、x86_64）处于 beta 阶段。
+> Alpha · 原生支持 macOS（Apple Silicon 和 Intel）和 Windows（x64），Linux（ARM64、x86_64）处于 beta 阶段。
 
 Linux 支持自 Runner 0.18.2 起进入 beta：提供 ARM64 和 x86_64 的签名 `.deb` 与 tarball 包，并支持应用内更新。目前已在 Ubuntu 26.04 ARM64 虚拟机上试用，原生硬件、x86_64 和其他发行版尚未验证。请参阅 [Linux 构建与安装说明](docs/arch/linux.md) 和 [验证状态](docs/tests/archive/823-linux-support.md)。
 
@@ -71,7 +71,7 @@ Runner 让命令行编码 agent 通过可复用的 crew、真实终端和共享 
   </tr>
   <tr>
     <td width="50%" valign="middle">
-      <a href="assets/mission_feed.png"><img src="assets/mission_feed.png" alt="mission feed 中 coder、reviewer 和 QA 在协作，一个问题正等待你回答" width="100%" /></a>
+      <a href="assets/mission_feed.png"><img src="assets/mission_feed.png" alt="mission feed 中的目标和 coder 交给 reviewer 的评审请求，旁边是 crew 的会话卡片" width="100%" /></a>
     </td>
     <td width="50%" valign="middle">
       <h3>Mission 与协作</h3>
@@ -80,7 +80,16 @@ Runner 让命令行编码 agent 通过可复用的 crew、真实终端和共享 
   </tr>
   <tr>
     <td width="50%" valign="middle">
-      <a href="assets/remote_control.png"><img src="assets/remote_control.png" alt="Runner 的电脑选择器列出这台 Mac 和同一账号下的另一台电脑" width="100%" /></a>
+      <a href="assets/mission-link-reports.png"><img src="assets/mission-link-reports.png" alt="Claude Code chat 收到两条 [runner] 汇报并逐条回答，两个 mission 分组显示在侧边栏的 chat 下面" width="100%" /></a>
+    </td>
+    <td width="50%" valign="middle">
+      <h3>Mission 向 chat 汇报</h3>
+      <p>从 chat 启动的 mission 会关联到这个 chat，并在侧边栏归到它下面，agent 可以直接结束这一轮，不用再盯着。mission 需要你处理、失败或进入稳定状态时，Runner 会向 chat 输入一行提示，agent 再去读 mission 发生了什么。别处启动的 mission 也可以拖到 chat 上关联。<a href="./docs/guide/zh-CN/concepts/missions.md#关联聊天与汇报">关联聊天与汇报 →</a></p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="middle">
+      <a href="assets/remote_control.png"><img src="assets/remote_control.png" alt="侧边栏底部的主机按钮已展开，这台 Mac 排在首位，下面是同一账号下的其他电脑" width="100%" /></a>
     </td>
     <td width="50%" valign="middle">
       <h3>远程控制</h3>
@@ -90,16 +99,16 @@ Runner 让命令行编码 agent 通过可复用的 crew、真实终端和共享 
   </tr>
   <tr>
     <td width="50%" valign="middle">
-      <a href="assets/mission_terminal.png"><img src="assets/mission_terminal.png" alt="mission 里一个槽位自己的终端：coder 的 Codex 会话，旁边是 crew 的会话卡片" width="100%" /></a>
+      <a href="assets/mission_terminal.png"><img src="assets/mission_terminal.png" alt="mission 里一个槽位自己的终端：coder 的 Claude Code 会话，旁边是 crew 的会话卡片" width="100%" /></a>
     </td>
     <td width="50%" valign="middle">
       <h3>真实终端</h3>
-      <p>每个 agent 都在真实 PTY 里保留自己的 TUI，跑在 GPU 绘制的 <code>alacritty_terminal</code> 网格上：鼠标上报、输入法（包括拼音）、文件路径粘贴和点击打开，每个 chat 和 mission 下面还有一个终端抽屉。</p>
+      <p>每个 agent 都在真实 PTY 里保留自己的 TUI，跑在 GPU 绘制的 <code>alacritty_terminal</code> 网格上：鼠标上报、输入法（包括拼音）、文件路径粘贴和点击打开，每个 mission 下面还有一个终端抽屉。</p>
     </td>
   </tr>
   <tr>
     <td width="50%" valign="middle">
-      <a href="assets/chat_split.png"><img src="assets/chat_split.png" alt="一个标签页分成四栏：Codex、Claude Code、Antigravity CLI 和 pi 并排运行" width="100%" /></a>
+      <a href="assets/chat_split.png"><img src="assets/chat_split.png" alt="一个标签页分成四栏：Codex、Claude Code、Grok 和 pi，每栏各自是一个岛屿" width="100%" /></a>
     </td>
     <td width="50%" valign="middle">
       <h3>分栏与多窗口</h3>
@@ -108,9 +117,19 @@ Runner 让命令行编码 agent 通过可复用的 crew、真实终端和共享 
   </tr>
   <tr>
     <td width="50%" valign="middle">
+      <a href="assets/files_view.png"><img src="assets/files_view.png" alt="Claude Code chat 旁边是侧面板的 Files 视图：worktree 的文件树带着 git 状态，一个文件在标签页中打开" width="100%" /></a>
+    </td>
+    <td width="50%" valign="middle">
+      <h3>在 agent 旁边看文件</h3>
+      <p>侧面板的 Files 视图显示 agent 所在的 checkout 及其 git 状态，不离开 Runner 就能看清改了什么：代码带语法高亮，Markdown 直接渲染，<code>⇧⌘O</code> 按文件名查找。在终端里 ⌘-点击文件路径，会在对应行打开。文件只读，编辑仍交给 agent 和你的编辑器。<a href="./docs/guide/zh-CN/guides/chats-and-windows.md#在侧面板中浏览文件">文件指南 →</a></p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="middle">
       <pre><code>runner crew list
 runner mission start \
   --crew "Pair coding crew" \
+  --title "Fix the login bug" \
   --goal-file brief.md
 runner mission feed &lt;mission-id&gt; --follow
 runner help agents</code></pre>
