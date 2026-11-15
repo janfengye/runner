@@ -322,6 +322,7 @@ impl SessionEvents for CoreSessionEvents {
     }
     fn status(&self, ev: &SessionActivityEvent) {
         if ev.source != StatusSource::CodexAttention
+            && ev.source != StatusSource::Unavailable
             && ev.status.observation.outcome != Some(TurnOutcome::Interrupted)
             && ev.status.observation.outcome != Some(TurnOutcome::Failed)
         {
@@ -394,6 +395,7 @@ pub struct SessionSpawnedEvent {
     pub mission_id: Option<String>,
     pub cols: u16,
     pub rows: u16,
+    pub output_seq: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Eq, PartialEq)]

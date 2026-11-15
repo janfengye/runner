@@ -387,6 +387,7 @@ impl Transport for Fake {
             subscriber_id: 17,
             snapshot: TerminalSnapshot {
                 seq: 1,
+                activity: None,
                 cols,
                 rows,
                 controller: self.controller.lock().unwrap().clone(),
@@ -7889,6 +7890,7 @@ pub(crate) fn completed_update() -> serde_json::Value {
     serde_json::to_value(runner_core::protocol::RuntimeUpdateTask {
         id: "host-update".into(),
         runtime: runner_core::protocol::Runtime::Codex,
+        kind: runner_core::protocol::RuntimeTaskKind::Update,
         state: runner_core::protocol::RuntimeUpdateState::Succeeded,
         from_version: Some("0.147.0".into()),
         to_version: Some("0.167.0".into()),

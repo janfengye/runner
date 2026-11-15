@@ -13,7 +13,7 @@ fn subject(context: &PanelContext) -> FilesSubject {
 
 /// The last two parts of a missing path, so the message names the folder
 /// without the whole path: `…/.worktrees/fix-1116`.
-fn compact_missing_path(path: &Path) -> String {
+pub(crate) fn compact_missing_path(path: &Path) -> String {
     let parts = path
         .components()
         .map(|part| part.as_os_str().to_string_lossy().into_owned())
@@ -97,7 +97,18 @@ impl FilesView {
                     return;
                 }
                 match result {
-                    Ok(outcome) => this.apply_outcome(Ok(outcome), cx),
+                    Ok(outcome) => {
+                        let panel_subject = this.context.subject.clone();
+                        let origin = cx.entity_id();
+                        let client = this.client.clone();
+                        this.apply_outcome(Ok(outcome), cx);
+                        crate::surfaces::files::hub(&client, cx).update(cx, |_, cx| {
+                            cx.emit(FilesEvent::RootChanged {
+                                subject: panel_subject,
+                                origin,
+                            });
+                        });
+                    }
                     Err(error) => {
                         this.error = Some(error.to_string().into());
                         cx.notify();
@@ -136,6 +147,8 @@ impl FilesView {
                         tree,
                         listed: Default::default(),
                         next_listing: 0,
+                        uncommitted_paths: None,
+                        uncommitted_seq: 0,
                     }));
                     self.scroll = UniformListScrollHandle::new();
                     let owner = cx.entity_id();
@@ -160,6 +173,7 @@ impl FilesView {
         }
         if same {
             self.read_again_after_resolve(cx);
+            self.refresh_uncommitted_paths(true, cx);
         }
         if !self.searchable() {
             self.finder = None;
@@ -586,6 +600,13 @@ impl FilesView {
 
     pub(in super::super) fn root_is_git(&self) -> bool {
         matches!(&self.body, Body::Root(state) if state.root.git.is_some())
+    }
+
+    pub(in super::super) fn root_has_head(&self) -> bool {
+        matches!(
+            &self.body,
+            Body::Root(state) if state.root.git.as_ref().is_some_and(|git| git.commit.is_some())
+        )
     }
 
     pub(super) fn render_picker(

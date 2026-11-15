@@ -1863,10 +1863,11 @@ fn mission_panel_header_keeps_sessions_first_and_adds_info_and_files_from_plus()
         assert_text(&mut visual, "PANEL_TAB_INK Sessions", theme::text());
     }
 
-    // `+` offers Info and Files, never Sessions, with nothing checked.
+    // `+` offers Info, Files and Changes, never Sessions, with nothing checked.
     click(&mut visual, "PANEL_ADD_SURFACE");
     assert!(visual.debug_bounds("PANEL_MENU_ROW Info").is_some());
     assert!(visual.debug_bounds("PANEL_MENU_ROW Files").is_some());
+    assert!(visual.debug_bounds("PANEL_MENU_ROW Changes").is_some());
     assert!(visual.debug_bounds("PANEL_MENU_ROW Sessions").is_none());
     assert!(visual.debug_bounds("PANEL_MENU_CHECK Info").is_none());
     click(&mut visual, "PANEL_MENU_ROW Files");
@@ -1925,7 +1926,7 @@ fn mission_panel_header_keeps_sessions_first_and_adds_info_and_files_from_plus()
     assert!(visual.debug_bounds("MISSION_ROLES_SCROLL").is_some());
     assert!(visual.debug_bounds("PANEL_EMPTY").is_none(), "never empty");
 
-    // Settings → Side panel turning Info and Files off leaves Sessions,
+    // Settings → Side panel turning Info, Files and Changes off leaves Sessions,
     // with no `+`, and closes an open Files tab.
     click(&mut visual, "PANEL_ADD_SURFACE");
     click(&mut visual, "PANEL_MENU_ROW Files");
@@ -1934,6 +1935,7 @@ fn mission_panel_header_keeps_sessions_first_and_adds_info_and_files_from_plus()
             |settings| {
                 settings.info_view = false;
                 settings.files_view = false;
+                settings.changes_view = false;
                 true
             },
             false,
@@ -1950,6 +1952,7 @@ fn mission_panel_header_keeps_sessions_first_and_adds_info_and_files_from_plus()
             |settings| {
                 settings.info_view = true;
                 settings.files_view = true;
+                settings.changes_view = true;
                 true
             },
             false,
@@ -5028,4 +5031,91 @@ fn remote_mission_refusals_keep_resume_and_restart_distinct_through_update() {
             );
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn maximized_mission_rail_hides_center_toggles_on_shortcut_and_restores_when_selecting_session() {
+    let _theme = crate::theme_snapshot::ThemeGuard::new();
+    let (_temp, mut cx, host, _fake) = suspended_mission_test();
+    host.update(&mut cx, |root, window, cx| {
+        root.open_mission("test-mission".into(), window, cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let mut visual = gpui::VisualTestContext::from_window(host.into(), &cx);
+    visual.run_until_parked();
+
+    let max_btn = visual
+        .debug_bounds("SIDE_PANEL_MAXIMIZE")
+        .expect("mission rail maximize button");
+    visual.simulate_click(max_btn.center(), Default::default());
+    visual.run_until_parked();
+
+    host.read_with(&visual, |root, cx| {
+        let ws = root.mission_workspace.read(cx);
+        assert!(ws.rail_maximized);
+        assert!(ws.shown_terminals("test-mission", cx).is_empty());
+    })
+    .unwrap();
+    assert!(
+        visual.debug_bounds("SIDE_PANEL_MAXIMIZE active").is_some(),
+        "Restore chat button stays active while rail is maximized"
+    );
+
+    // Clicking a session card in maximized Sessions exits rail maximize, reveals center,
+    // selects that session tab, and focuses its visible terminal.
+    let card = visual
+        .debug_bounds("MISSION_CARD mission-agent")
+        .expect("session card in maximized Sessions");
+    visual.simulate_click(card.center(), Default::default());
+    visual.run_until_parked();
+
+    host.update(&mut visual, |root, window, cx| {
+        let ws = root.mission_workspace.read(cx);
+        assert!(!ws.rail_maximized);
+        assert_eq!(ws.active_tab, MissionTab::Session("mission-agent".into()));
+        assert_eq!(ws.shown_terminals("test-mission", cx), ["mission-agent"]);
+        let terminal_focus = &ws
+            .attached
+            .get("mission-agent")
+            .expect("attached mission-agent")
+            .terminal_focus;
+        assert!(terminal_focus.is_focused(window));
+    })
+    .unwrap();
+
+    // Focusing the mission rail and dispatching ToggleMaximizePane (⇧⌘↩) maximizes again,
+    // and pressing Enter on a session card also restores the center and focuses its terminal.
+    host.update(&mut visual, |root, window, cx| {
+        let focus = root.mission_workspace.read(cx).rail_focus.clone();
+        focus.focus(window, cx);
+    })
+    .unwrap();
+    visual.dispatch_action(crate::ToggleMaximizePane);
+    visual.run_until_parked();
+    host.read_with(&visual, |root, cx| {
+        assert!(root.mission_workspace.read(cx).rail_maximized);
+    })
+    .unwrap();
+
+    host.update(&mut visual, |root, window, cx| {
+        root.mission_workspace.update(cx, |ws, cx| {
+            ws.select_mission_session("mission-shell", window, cx);
+        });
+        let ws = root.mission_workspace.read(cx);
+        assert!(!ws.rail_maximized);
+        assert_eq!(ws.active_tab, MissionTab::Session("mission-shell".into()));
+        assert!(ws
+            .attached
+            .get("mission-shell")
+            .expect("attached mission-shell")
+            .terminal_focus
+            .is_focused(window));
+    })
+    .unwrap();
+
+    host.update(&mut visual, |_, window, _| window.remove_window())
+        .unwrap();
 }

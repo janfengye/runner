@@ -58,8 +58,14 @@ impl NativeRoot {
         if revisions.settings != previous.settings {
             let settings = self.settings(cx).clone();
             self.chat_surfaces.open.close_off(&settings, false);
+            if !settings.show_side_panel {
+                self.chat_panel_maximized = false;
+            }
             for panel in self.chat_panels_by_tab.values_mut() {
                 panel.surfaces.close_off(&settings, false);
+                if !settings.show_side_panel {
+                    panel.maximized = false;
+                }
             }
             self.sync_role_page_size(cx);
             self.sync_crew_page_size(cx);
@@ -100,6 +106,10 @@ impl NativeRoot {
             }
             if store.daemon_disconnected {
                 self.maximized_panes.clear();
+                self.chat_panel_maximized = false;
+                for panel in self.chat_panels_by_tab.values_mut() {
+                    panel.maximized = false;
+                }
                 self.toasts.dismiss();
             } else if store.daemon_notice.is_some() || store.error.is_none() {
                 self.chat_error = None;
@@ -159,6 +169,14 @@ impl NativeRoot {
         }
         if reactions.apply_terminal_settings {
             self.apply_terminal_settings(cx);
+        }
+
+        if (revisions.settings != previous.settings
+            || revisions.onboarding != previous.onboarding
+            || revisions.crews != previous.crews)
+            && self.setup_visible(cx)
+        {
+            self.refresh_setup_data(cx);
         }
 
         if reactions.notify_shell() || (reactions.terminal_wake && self.route.terminal_visible()) {

@@ -164,6 +164,17 @@ impl MarkdownOpenAs {
     }
 }
 
+/// How changed files render in Changes and Files' in-place diff; remembered in
+/// `ui-settings.json` and shared between both surfaces.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DiffViewMode {
+    Split,
+    #[default]
+    #[serde(other)]
+    Unified,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FileLinkEditor {
@@ -382,9 +393,12 @@ pub struct AppSettings {
     /// Settings → Side panel → Panel: off hides every tab's panel and its
     /// toggle, keeping the open state and the view switches below.
     pub show_side_panel: bool,
-    /// Whether the `+` menu offers Info and Files.
+    /// Whether the `+` menu offers Info, Files and Changes.
     pub info_view: bool,
     pub files_view: bool,
+    pub changes_view: bool,
+    pub changes_tree_view: bool,
+    pub changes_diff_mode: DiffViewMode,
     pub file_icons: crate::file_icons::IconSet,
     /// `None` follows the terminal's Font family.
     pub files_font_family: Option<TerminalFontFamily>,
@@ -455,6 +469,9 @@ impl Default for AppSettings {
             show_side_panel: true,
             info_view: true,
             files_view: true,
+            changes_view: true,
+            changes_tree_view: false,
+            changes_diff_mode: DiffViewMode::Unified,
             file_icons: Default::default(),
             files_font_family: None,
             files_font_size: None,
@@ -1668,4 +1685,21 @@ fn usage_preferences_defaults_roundtrip_and_fetching_rules() {
             }
         }
     }
+}
+
+#[test]
+fn changes_diff_mode_defaults_to_unified_and_round_trips_split() {
+    let defaults: AppSettings = serde_json::from_str("{}").unwrap();
+    assert_eq!(defaults.changes_diff_mode, DiffViewMode::Unified);
+
+    let mut settings = defaults;
+    settings.changes_diff_mode = DiffViewMode::Split;
+    let json = serde_json::to_value(&settings).unwrap();
+    assert_eq!(json["changesDiffMode"], "split");
+
+    let reloaded: AppSettings = serde_json::from_value(json).unwrap();
+    assert_eq!(reloaded.changes_diff_mode, DiffViewMode::Split);
+
+    let unknown: AppSettings = serde_json::from_str(r#"{"changesDiffMode":"future"}"#).unwrap();
+    assert_eq!(unknown.changes_diff_mode, DiffViewMode::Unified);
 }
