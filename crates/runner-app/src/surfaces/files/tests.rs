@@ -1126,8 +1126,7 @@ impl Harness {
     }
 }
 
-fn viewer(context: PanelContext) -> Harness {
-    let mut h = harness(Some(context));
+fn configure_viewer(h: &mut Harness) {
     h.visual.simulate_resize(size(px(900.), px(700.)));
     h.visual.update(|_, cx| {
         cx.bind_keys([gpui::KeyBinding::new(
@@ -1137,7 +1136,54 @@ fn viewer(context: PanelContext) -> Harness {
         )]);
         crate::keymap::install_file_viewer_bindings(cx);
     });
+}
+
+fn viewer(context: PanelContext) -> Harness {
+    let mut h = harness(Some(context));
+    configure_viewer(&mut h);
     h.wait("the root", |h| h.has("FILES_ROW a.txt"));
+    h
+}
+
+/// Shows `context` and waits until the background watcher's initial
+/// `FILES_STATUS_EVENT` has been emitted and applied by the view, so later
+/// `receive_status` calls cannot race with startup status delivery.
+fn wait_for_startup_watcher(h: &mut Harness, context: PanelContext) {
+    use runner_core::protocol::files::{FilesStatusChanged, GitStatus, FILES_STATUS_EVENT};
+    let events = h
+        .store
+        .read_with(&h.visual, |store, _| store.test_core.events.clone());
+    let mut sent = events.subscribe();
+    h.show(Some(context));
+    h.wait("the status", |h| h.status_read());
+    let root = h.read(|view| view.root().unwrap().path.clone());
+
+    h.wait("the watcher's first status", |_| {
+        std::iter::from_fn(|| sent.try_recv().ok()).any(|event| {
+            event.name == FILES_STATUS_EVENT
+                && serde_json::from_value::<FilesStatusChanged>(event.payload)
+                    .is_ok_and(|update| update.root == root)
+        })
+    });
+    let marker = GitStatus::new(Vec::new(), vec!["marker".into()]);
+    events.emit(
+        FILES_STATUS_EVENT,
+        &FilesStatusChanged {
+            root,
+            status: marker.clone(),
+        },
+    );
+    h.wait("the status sent after it", |h| {
+        h.read(|view| view.git_status().as_ref() == Some(&marker))
+    });
+}
+
+fn viewer_after_startup_watcher(context: PanelContext) -> Harness {
+    let mut h = harness(None);
+    configure_viewer(&mut h);
+    wait_for_startup_watcher(&mut h, context);
+    h.wait("the root", |h| h.has("FILES_ROW a.txt"));
+    receive_status(&mut h, runner_core::protocol::files::GitStatus::default());
     h
 }
 
@@ -2896,6 +2942,178 @@ fn a_selection_left_elsewhere_does_not_block_clicking_a_linked_image() {
     });
 }
 
+#[test]
+fn an_unchanged_change_event_during_markdown_drag_preserves_selection_and_copy() {
+    let mut h = viewer(chat("in-project"));
+    std::fs::create_dir_all(h.repo.join("docs")).unwrap();
+    std::fs::write(
+        h.repo.join("docs/a.svg"),
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="80" height="40"><rect width="80" height="40"/></svg>"#,
+    )
+    .unwrap();
+    std::fs::write(
+        h.repo.join("DRAG.md"),
+        "First paragraph here.\n\n![A](docs/a.svg)\n\nSecond paragraph here.\n",
+    )
+    .unwrap();
+    h.open("DRAG.md");
+    h.wait("the page", |h| h.has("FILE_MD_IMAGE"));
+    let root = h.read(|view| view.root().unwrap().path.clone());
+    let view = h.view();
+    let emit_changed = |h: &mut Harness| {
+        view.update(&mut h.visual, |view, cx| {
+            view.receive(
+                FilesEvent::Changed(runner_core::protocol::files::FilesChanged {
+                    root: root.clone(),
+                    folders: vec![String::new()],
+                    paths: vec!["DRAG.md".into()],
+                }),
+                cx,
+            );
+        });
+        h.settle();
+    };
+
+    let first = h.visual.debug_bounds("FILE_MD_TEXT 0").unwrap();
+    let start = gpui::point(first.left() + px(1.), first.center().y);
+    let end = gpui::point(first.left() + px(96.), first.center().y);
+    h.visual
+        .simulate_mouse_down(start, gpui::MouseButton::Left, Modifiers::default());
+    h.visual
+        .simulate_mouse_move(end, Some(gpui::MouseButton::Left), Modifiers::default());
+    h.settle();
+
+    // A watcher flush arriving mid-drag for the untouched file must not drop selection.
+    emit_changed(&mut h);
+    h.visual
+        .simulate_mouse_up(end, gpui::MouseButton::Left, Modifiers::default());
+    h.settle();
+
+    let page = h.read(|view| view.rendered_view()).unwrap();
+    let selected = page.read_with(&h.visual, |page, _| page.selected_text());
+    let selected_text = selected.expect("selected text after mid-drag unchanged change event");
+    assert!(!selected_text.is_empty());
+
+    // A second unchanged reload after mouse-up must still preserve selection for copy.
+    emit_changed(&mut h);
+    h.visual.simulate_keystrokes(&primary("c"));
+    h.settle();
+    assert_eq!(
+        h.visual
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .as_deref(),
+        Some(selected_text.as_str())
+    );
+
+    // Direct `set_page` keeps selection when page text matches and clears it when text changes.
+    let (same_page, images) = page.read_with(&h.visual, |page, _| {
+        (page.page().clone(), page.images().clone())
+    });
+    page.update(&mut h.visual, |page, cx| {
+        page.set_page(same_page, images.clone(), cx)
+    });
+    assert_eq!(
+        page.read_with(&h.visual, |page, _| page.selected_text()),
+        Some(selected_text)
+    );
+    let edited = Arc::new(super::markdown::Page::parse(
+        "Different content.\n",
+        "DRAG.md",
+    ));
+    page.update(&mut h.visual, |page, cx| page.set_page(edited, images, cx));
+    assert_eq!(
+        page.read_with(&h.visual, |page, _| page.selected_text()),
+        None
+    );
+}
+
+#[test]
+fn a_link_target_or_formatting_edit_updates_page_while_preserving_selection() {
+    let mut h = viewer(chat("in-project"));
+    std::fs::write(
+        h.repo.join("EDIT.md"),
+        "[site](https://old.example)\n\n- [ ] Plain task\n",
+    )
+    .unwrap();
+    h.open("EDIT.md");
+    h.wait("initial markdown", |h| {
+        h.has("FILE_MD_TEXT 0") && h.has("FILE_MD_TASK")
+    });
+    let root = h.read(|view| view.root().unwrap().path.clone());
+    let view = h.view();
+    let emit_changed = |h: &mut Harness| {
+        view.update(&mut h.visual, |view, cx| {
+            view.receive(
+                FilesEvent::Changed(runner_core::protocol::files::FilesChanged {
+                    root: root.clone(),
+                    folders: vec![String::new()],
+                    paths: vec!["EDIT.md".into()],
+                }),
+                cx,
+            );
+        });
+        h.settle();
+    };
+
+    let link_bounds = h.visual.debug_bounds("FILE_MD_TEXT 0").unwrap();
+    let from = gpui::point(link_bounds.left() + px(1.), link_bounds.center().y);
+    let to = gpui::point(link_bounds.left() + px(24.), link_bounds.center().y);
+    h.visual
+        .simulate_mouse_down(from, gpui::MouseButton::Left, Modifiers::default());
+    h.visual
+        .simulate_mouse_move(to, Some(gpui::MouseButton::Left), Modifiers::default());
+    h.settle();
+    h.visual
+        .simulate_mouse_up(to, gpui::MouseButton::Left, Modifiers::default());
+    h.settle();
+    let page = h.read(|view| view.rendered_view()).unwrap();
+    let selected = page
+        .read_with(&h.visual, |page, _| page.selected_text())
+        .expect("selected text before edits");
+
+    // 1. Same-label link destination edit updates the link target while keeping selection.
+    std::fs::write(
+        h.repo.join("EDIT.md"),
+        "[site](https://new.example)\n\n- [ ] Plain task\n",
+    )
+    .unwrap();
+    emit_changed(&mut h);
+    assert_eq!(
+        page.read_with(&h.visual, |page, _| page.selected_text()),
+        Some(selected.clone())
+    );
+
+    // 2. Formatting and task-checkbox edits with matching row text render while keeping selection.
+    std::fs::write(
+        h.repo.join("EDIT.md"),
+        "[site](https://new.example)\n\n- [x] **Plain** task\n",
+    )
+    .unwrap();
+    emit_changed(&mut h);
+    h.wait("updated task checkbox", |h| h.has("FILE_MD_TASK_DONE"));
+    assert_eq!(
+        page.read_with(&h.visual, |page, _| page.selected_text()),
+        Some(selected)
+    );
+    let has_strong = page.read_with(&h.visual, |page, _| {
+        matches!(
+            &page.page().rows[1].kind,
+            super::markdown::RowKind::Paragraph(inline)
+                if inline.styles.iter().any(|(_, style)| style.strong)
+        )
+    });
+    assert!(has_strong, "bold formatting must render on updated row");
+
+    let link_bounds = h.visual.debug_bounds("FILE_MD_TEXT 0").unwrap();
+    h.visual.simulate_click(
+        gpui::point(link_bounds.left() + px(12.), link_bounds.center().y),
+        Modifiers::default(),
+    );
+    h.settle();
+    assert_eq!(h.read(|view| view.opened_urls()), ["https://new.example"]);
+}
+
 // ── Settings → Side panel → Files ──────────────────────────────────────
 
 impl Harness {
@@ -4384,38 +4602,11 @@ fn a_hidden_view_does_no_work_for_its_root_and_catches_up_when_shown() {
 
 #[test]
 fn a_status_that_arrives_clears_the_error_of_one_that_failed() {
-    use runner_core::protocol::files::{FilesStatusChanged, GitStatus, FILES_STATUS_EVENT};
+    use runner_core::protocol::files::GitStatus;
     let mut h = harness(None);
-    let events = h
-        .store
-        .read_with(&h.visual, |store, _| store.test_core.events.clone());
-    let mut sent = events.subscribe();
-    h.show(Some(chat("in-project")));
-    h.wait("the status", |h| h.status_read());
+    wait_for_startup_watcher(&mut h, chat("in-project"));
     let view = h.view();
     let root = h.read(|view| view.root().unwrap().path.clone());
-
-    // The watcher reports its first status on its own, after the read above,
-    // and would clear the error below whenever it landed. Wait until it is
-    // sent, then until a status sent after it has reached the view.
-    h.wait("the watcher's first status", |_| {
-        std::iter::from_fn(|| sent.try_recv().ok()).any(|event| {
-            event.name == FILES_STATUS_EVENT
-                && serde_json::from_value::<FilesStatusChanged>(event.payload)
-                    .is_ok_and(|update| update.root == root)
-        })
-    });
-    let marker = GitStatus::new(Vec::new(), vec!["marker".into()]);
-    events.emit(
-        FILES_STATUS_EVENT,
-        &FilesStatusChanged {
-            root: root.clone(),
-            status: marker.clone(),
-        },
-    );
-    h.wait("the status sent after it", |h| {
-        h.read(|view| view.git_status().as_ref() == Some(&marker))
-    });
 
     let deadline = |view: &mut FilesView, cx: &mut Context<FilesView>| {
         view.status_error = Some("runnerd request deadline exceeded".into());
@@ -4456,7 +4647,7 @@ fn files_diff_toggle_swaps_changed_tab_in_place_shares_split_mode_and_resets_whe
     use crate::app_settings::DiffViewMode;
     use runner_core::protocol::files::{FileStatus, GitStatus, StatusEntry};
 
-    let mut h = viewer(chat("in-project"));
+    let mut h = viewer_after_startup_watcher(chat("in-project"));
     h.store.update(&mut h.visual, |store, cx| {
         store.update_settings(
             |settings| {
@@ -4468,15 +4659,15 @@ fn files_diff_toggle_swaps_changed_tab_in_place_shares_split_mode_and_resets_whe
             cx,
         );
     });
-    h.wait("initial git status", |h| h.status_read());
 
     // Clean file tab has no Diff button.
     h.open("a.txt");
     h.wait("clean file code and uncommitted paths settled", |h| {
-        h.has("FILE_CODE") && h.read(|v| v.has_uncommitted_diff("a.txt") == Some(false))
+        h.has("FILE_CODE")
+            && h.read(|v| v.has_uncommitted_diff("a.txt") == Some(false))
+            && !h.has("FILE_DIFF_TOGGLE")
+            && !h.read(|v| v.showing_diff())
     });
-    assert!(!h.has("FILE_DIFF_TOGGLE"));
-    assert!(!h.read(|v| v.showing_diff()));
 
     // Edit `src/deep/x.rs` on disk and report modified status.
     std::fs::write(
@@ -4501,16 +4692,22 @@ fn files_diff_toggle_swaps_changed_tab_in_place_shares_split_mode_and_resets_whe
 
     // Switching back to clean `a.txt` hides the Diff button; switching back shows it again.
     h.click("FILE_TAB a.txt");
-    assert!(!h.has("FILE_DIFF_TOGGLE"));
+    h.wait("Diff button hidden on clean a.txt", |h| {
+        !h.has("FILE_DIFF_TOGGLE")
+    });
     h.click("FILE_TAB src/deep/x.rs");
-    assert!(h.has("FILE_DIFF_TOGGLE"));
+    h.wait("Diff button shown on dirty src/deep/x.rs", |h| {
+        h.has("FILE_DIFF_TOGGLE")
+    });
 
     // Toggle Diff in place: shows diff header + code, omits Viewed checkbox, disables Find bar.
     h.click("FILE_DIFF_TOGGLE");
     h.wait("in-place file diff loaded", |h| {
-        h.has("FILE_DIFF_COLUMN") && h.has("CHANGES_DIFF_HEADER") && h.has("CHANGES_DIFF_CODE")
+        h.has("FILE_DIFF_COLUMN")
+            && h.has("CHANGES_DIFF_HEADER")
+            && h.has("CHANGES_DIFF_CODE")
+            && h.read(|v| v.showing_diff())
     });
-    assert!(h.read(|v| v.showing_diff()));
     assert!(
         !h.has("CHANGES_DIFF_VIEWED"),
         "Files' in-place diff has no Viewed checkbox"
@@ -4546,11 +4743,13 @@ fn files_diff_toggle_swaps_changed_tab_in_place_shares_split_mode_and_resets_whe
 
     // Per-tab state: switching to `a.txt` shows the file, switching back restores the diff.
     h.click("FILE_TAB a.txt");
-    assert!(!h.read(|v| v.showing_diff()));
-    assert!(h.has("FILE_CODE"));
+    h.wait("clean a.txt shows file code", |h| {
+        !h.read(|v| v.showing_diff()) && h.has("FILE_CODE")
+    });
     h.click("FILE_TAB src/deep/x.rs");
-    assert!(h.read(|v| v.showing_diff()));
-    assert!(h.has("FILE_DIFF_COLUMN"));
+    h.wait("dirty src/deep/x.rs restores diff", |h| {
+        h.read(|v| v.showing_diff()) && h.has("FILE_DIFF_COLUMN")
+    });
 
     // When uncommitted changes clear, hide Diff button and return the tab to the file viewer.
     git(&h.repo, &["checkout", "--", "src/deep/x.rs"]);
@@ -4569,8 +4768,7 @@ fn files_diff_toggle_swaps_changed_tab_in_place_shares_split_mode_and_resets_whe
 fn files_diff_toggle_reflects_working_tree_vs_head_when_staged_edit_is_reverted_on_disk() {
     use runner_core::protocol::files::{FileStatus, GitStatus, StatusEntry};
 
-    let mut h = viewer(chat("in-project"));
-    h.wait("initial git status", |h| h.status_read());
+    let mut h = viewer_after_startup_watcher(chat("in-project"));
 
     let path = h.repo.join("src/deep/x.rs");
     let head_content = std::fs::read_to_string(&path).unwrap();
