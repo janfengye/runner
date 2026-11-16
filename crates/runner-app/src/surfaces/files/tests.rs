@@ -1526,67 +1526,102 @@ fn the_tree_toggle_hides_the_tree_beside_an_open_file() {
 
 #[test]
 fn an_open_file_widens_the_panel_into_the_room_the_mission_leaves() {
+    use crate::surfaces::side_panel::{PanelSurfaces, PanelViewId};
     let mut h = viewer(mission("on-worktree"));
     let subject = PanelSubject::Mission("on-worktree".into());
-    let layout = |h: &mut Harness, surface: f32| {
+    let surfaces = h
+        .visual
+        .update(|_, cx| PanelSurfaces::new(Default::default(), cx));
+    let settings = crate::app_settings::AppSettings::default();
+    let panel_at = |h: &mut Harness, surfaces: &PanelSurfaces, surface: f32| {
         h.host
             .read_with(&h.visual, |host, cx| {
                 host.panel.surface.set(surface);
-                host.panel.layout(
+                host.panel.panel_layout(
+                    PanelSurface::Mission,
+                    &settings,
+                    surfaces,
                     Some(&subject),
-                    FilesSurface::Shown,
                     288.,
-                    440.,
-                    240.,
                     6.,
+                    false,
                     cx,
                 )
             })
             .unwrap()
     };
-    let beside = |h: &mut Harness, files: FilesSurface| {
-        h.host
-            .read_with(&h.visual, |host, cx| {
-                host.panel.surface.set(1200.);
-                host.panel
-                    .layout(Some(&subject), files, 288., 440., 240., 6., cx)
-                    .0
-            })
-            .unwrap()
-    };
     assert_eq!(
-        beside(&mut h, FilesSurface::Open),
-        288.,
-        "no file and another surface showing, the standard width"
+        panel_at(&mut h, &surfaces, 1200.),
+        (288., None),
+        "before Files or Changes widens the mission rail, the standard width"
     );
+    let mut surfaces = surfaces;
+    surfaces.open.open(PanelViewId::Files);
     assert!(
-        layout(&mut h, 1200.).0 > 288.,
+        panel_at(&mut h, &surfaces, 1200.).0 > 288.,
         "Files showing a root is wide before a file opens"
     );
+    surfaces.open.select(PanelViewId::Sessions);
+    assert_eq!(
+        panel_at(&mut h, &surfaces, 1200.).0,
+        680.,
+        "switching to Sessions with no open file tab retains the widened width"
+    );
+    surfaces.open.select(PanelViewId::Files);
     h.open("a.txt");
     h.wait("the file", |h| h.has("FILE_CODE"));
     // 6 + 420 + 440 + 240: the tree fits beside the file.
-    let (width, widened) = layout(&mut h, 1106.);
+    let (width, widened) = panel_at(&mut h, &surfaces, 1106.);
     assert_eq!(width, 680.);
     assert!(widened.unwrap().tree);
     // Narrower: the file gives way to the mission first, and the tree stays.
-    let (width, widened) = layout(&mut h, 1105.);
+    let (width, widened) = panel_at(&mut h, &surfaces, 1105.);
     assert_eq!(width, 679.);
     assert!(widened.unwrap().tree);
-    assert_eq!(layout(&mut h, 1000.).0, 574.);
+    assert_eq!(panel_at(&mut h, &surfaces, 1000.).0, 574.);
     assert_eq!(
-        layout(&mut h, 600.).0,
+        panel_at(&mut h, &surfaces, 600.).0,
         528.,
         "the file never below the standard width, the tree still shown"
     );
-    assert!(layout(&mut h, 600.).1.unwrap().tree);
+    assert!(panel_at(&mut h, &surfaces, 600.).1.unwrap().tree);
 
-    // A file left open keeps the width while another surface shows, and
-    // closing Files gives it back, with the file tabs kept for reopening.
-    assert!(beside(&mut h, FilesSurface::Open) > 288.);
-    assert_eq!(beside(&mut h, FilesSurface::Closed), 288.);
+    // Switching away or closing Files retains the widened width, with file tabs kept;
+    // only a fresh/reset surface state starts back at the standard width.
+    surfaces.open.select(PanelViewId::Sessions);
+    assert_eq!(panel_at(&mut h, &surfaces, 1200.).0, 680.);
+    surfaces.open.close(PanelViewId::Files, true);
+    assert_eq!(panel_at(&mut h, &surfaces, 1200.).0, 680.);
     assert!(h.read(|view| view.has_tabs()));
-    assert!(beside(&mut h, FilesSurface::Shown) > 288.);
+    surfaces.reset(Default::default());
+    assert_eq!(panel_at(&mut h, &surfaces, 1200.), (288., None));
+    surfaces.open.open(PanelViewId::Files);
+    assert_eq!(panel_at(&mut h, &surfaces, 1200.).0, 680.);
+
+    // An inactive tree-hidden Files tab does not override a tree-on retained width (unmaximized or maximized).
+    h.click("FILE_TREE_TOGGLE");
+    assert_eq!(panel_at(&mut h, &surfaces, 1200.).0, 440.);
+    surfaces.set_widened_tree(Some(true));
+    surfaces.open.select(PanelViewId::Sessions);
+    assert_eq!(panel_at(&mut h, &surfaces, 1200.).0, 680.);
+    let max = h
+        .host
+        .read_with(&h.visual, |host, cx| {
+            host.panel.surface.set(1200.);
+            host.panel.panel_layout(
+                PanelSurface::Mission,
+                &settings,
+                &surfaces,
+                Some(&subject),
+                288.,
+                6.,
+                true,
+                cx,
+            )
+        })
+        .unwrap();
+    assert_eq!(max.0, 1200.);
+    assert!(max.1.unwrap().tree);
 }
 
 #[test]
@@ -3626,42 +3661,67 @@ fn a_tree_that_does_not_fit_takes_the_panel_until_a_file_opens() {
 
 #[test]
 fn the_layout_gives_a_tree_with_no_room_the_panel_until_a_file_opens() {
+    use crate::surfaces::side_panel::{OpenSurfaces, PanelSurfaces, PanelViewId};
     let mut h = viewer(chat("in-project"));
     let subject = PanelSubject::Session("in-project".into());
-    let layout = |h: &mut Harness, surface: f32| {
+    let settings = crate::app_settings::AppSettings::default();
+    let mut open_files = OpenSurfaces::default();
+    open_files.open(PanelViewId::Files);
+    let mut surfaces = h
+        .visual
+        .update(|_, cx| PanelSurfaces::new(open_files.clone(), cx));
+    let layout = |h: &mut Harness, surfaces: &PanelSurfaces, surface: f32| {
         h.host
             .read_with(&h.visual, |host, cx| {
                 host.panel.surface.set(surface);
-                host.panel.layout(
+                host.panel.panel_layout(
+                    PanelSurface::Chat,
+                    &settings,
+                    surfaces,
                     Some(&subject),
-                    FilesSurface::Shown,
                     288.,
-                    440.,
-                    240.,
                     6.,
+                    false,
                     cx,
                 )
             })
             .unwrap()
     };
     // 6 + 420 + 288 + 240: the narrowest that holds the file area and the tree.
-    assert!(layout(&mut h, 954.).1.is_some());
-    assert_eq!(layout(&mut h, 953.), (288., None));
+    assert_eq!(layout(&mut h, &surfaces, 953.), (288., None));
+    assert!(layout(&mut h, &surfaces, 954.).1.is_some());
+
+    surfaces.reset(open_files);
+    assert_eq!(layout(&mut h, &surfaces, 953.), (288., None));
 
     h.open("a.txt");
     h.wait("the file", |h| h.has("FILE_CODE"));
-    let (width, widened) = layout(&mut h, 953.);
+    let (width, widened) = layout(&mut h, &surfaces, 953.);
     assert_eq!(width, 528., "a file open keeps the tree beside it");
     assert!(widened.unwrap().tree);
 
     h.click("FILE_TAB_CLOSE a.txt");
-    assert_eq!(layout(&mut h, 953.), (288., None));
-    assert!(layout(&mut h, 954.).1.is_some());
+    let (width, widened) = layout(&mut h, &surfaces, 953.);
+    assert_eq!(
+        width, 528.,
+        "closing the last file tab keeps the widened panel"
+    );
+    assert!(widened.unwrap().tree);
 
     h.click("FILE_TREE_TOGGLE");
+    assert_eq!(h.read(|view| view.widening()), Some(false));
+    let (width, widened) = layout(&mut h, &surfaces, 1000.);
+    assert_eq!(width, 440.);
+    assert!(!widened.unwrap().tree);
     assert!(
-        layout(&mut h, 600.).1.is_some(),
+        layout(&mut h, &surfaces, 600.).1.is_some(),
         "with the tree toggled off there is no tree to give the panel"
+    );
+    surfaces.open.close(PanelViewId::Files, false);
+    assert_eq!(
+        layout(&mut h, &surfaces, 1000.).0,
+        440.,
+        "closing Files down to Open a surface keeps the tree-off widened width"
     );
 }
 
@@ -4412,7 +4472,9 @@ fn files_diff_toggle_swaps_changed_tab_in_place_shares_split_mode_and_resets_whe
 
     // Clean file tab has no Diff button.
     h.open("a.txt");
-    h.wait("clean file code", |h| h.has("FILE_CODE"));
+    h.wait("clean file code and uncommitted paths settled", |h| {
+        h.has("FILE_CODE") && h.read(|v| v.has_uncommitted_diff("a.txt") == Some(false))
+    });
     assert!(!h.has("FILE_DIFF_TOGGLE"));
     assert!(!h.read(|v| v.showing_diff()));
 
@@ -4494,10 +4556,13 @@ fn files_diff_toggle_swaps_changed_tab_in_place_shares_split_mode_and_resets_whe
     git(&h.repo, &["checkout", "--", "src/deep/x.rs"]);
     receive_status(&mut h, GitStatus::default());
     h.wait("tab returned to file after changes cleared", |h| {
-        h.has("FILE_CODE") && !h.has("FILE_DIFF_TOGGLE") && !h.has("FILE_DIFF_COLUMN")
+        h.has("FILE_CODE")
+            && h.read(|v| v.has_uncommitted_diff("src/deep/x.rs") == Some(false))
+            && !h.has("FILE_DIFF_TOGGLE")
+            && !h.has("FILE_DIFF_COLUMN")
+            && !h.read(|v| v.showing_diff())
+            && h.read(|v| v.tab_diff_view().is_none())
     });
-    assert!(!h.read(|v| v.showing_diff()));
-    assert!(h.read(|v| v.tab_diff_view()).is_none());
 }
 
 #[test]
@@ -4529,18 +4594,13 @@ fn files_diff_toggle_reflects_working_tree_vs_head_when_staged_edit_is_reverted_
 
     h.open("src/deep/x.rs");
     h.wait(
-        "reverted MM file code loaded and uncommitted paths settled",
+        "reverted MM file code loaded, tab keeps M badge, and Diff button stays hidden",
         |h| {
-            h.has("FILE_CODE") && h.read(|v| v.has_uncommitted_diff("src/deep/x.rs") == Some(false))
+            h.has("FILE_CODE")
+                && h.read(|v| v.has_uncommitted_diff("src/deep/x.rs") == Some(false))
+                && h.has("FILE_TAB_LETTER src/deep/x.rs M")
+                && !h.has("FILE_DIFF_TOGGLE")
         },
-    );
-    assert!(
-        h.has("FILE_TAB_LETTER src/deep/x.rs M"),
-        "tab keeps git status badge while staged index differs"
-    );
-    assert!(
-        !h.has("FILE_DIFF_TOGGLE"),
-        "Diff button stays hidden when working tree matches HEAD"
     );
 
     // Edit the working tree so it now differs from HEAD: Diff button appears and opens cleanly.
@@ -4556,8 +4616,8 @@ fn files_diff_toggle_reflects_working_tree_vs_head_when_staged_edit_is_reverted_
         ),
     );
     h.wait(
-        "Diff button appears once working tree differs from HEAD",
-        |h| h.has("FILE_DIFF_TOGGLE"),
+        "Diff button appears with M badge once working tree differs from HEAD",
+        |h| h.has("FILE_TAB_LETTER src/deep/x.rs M") && h.has("FILE_DIFF_TOGGLE"),
     );
     h.click("FILE_DIFF_TOGGLE");
     h.wait("in-place file diff loaded", |h| {
@@ -4578,8 +4638,14 @@ fn files_diff_toggle_reflects_working_tree_vs_head_when_staged_edit_is_reverted_
         ),
     );
     h.wait(
-        "tab returned to file and Diff button hidden once working tree matches HEAD",
-        |h| h.has("FILE_CODE") && !h.has("FILE_DIFF_TOGGLE") && !h.has("FILE_DIFF_COLUMN"),
+        "tab returned to file, keeps M badge, and Diff button hidden once working tree matches HEAD",
+        |h| {
+            h.has("FILE_CODE")
+                && h.read(|v| v.has_uncommitted_diff("src/deep/x.rs") == Some(false))
+                && h.has("FILE_TAB_LETTER src/deep/x.rs M")
+                && !h.has("FILE_DIFF_TOGGLE")
+                && !h.has("FILE_DIFF_COLUMN")
+                && !h.read(|v| v.showing_diff())
+        },
     );
-    assert!(!h.read(|v| v.showing_diff()));
 }
