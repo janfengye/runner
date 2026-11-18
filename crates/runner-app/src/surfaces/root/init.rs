@@ -339,6 +339,7 @@ impl NativeRoot {
             next_chat_transition_generation: 0,
             session_exit_codes: HashMap::new(),
             chat_error: None,
+            chat_restore_fallback: None,
             daemon_retrying: false,
             chat_warning: None,
             active_chat_detail,
@@ -354,6 +355,8 @@ impl NativeRoot {
             _pane_rename_focus_subscription: None,
             _pane_close_focus_subscription: None,
             terminal_close_confirm: None,
+            #[cfg(test)]
+            archive_check_gates: std::collections::VecDeque::new(),
             pending_pane_closes: HashMap::new(),
             pending_tab_close: None,
             tab_landed_at: None,
@@ -442,8 +445,31 @@ impl NativeRoot {
             }),
             _store_subscription: cx.observe_in(&app_store, window, |this, _, window, cx| {
                 this.leave_other_computers_when_signed_out(window, cx);
+                let prev_tab = (this.route == AppRoute::Chat && this.remote_client.is_local())
+                    .then(|| {
+                        this.tabs
+                            .active()
+                            .map(|layout| (layout.id.clone(), layout.all_session_ids()))
+                    })
+                    .flatten();
                 this.handle_app_store_update(cx);
+                if this.route == AppRoute::Chat && this.remote_client.is_local() {
+                    let next_tab = this
+                        .tabs
+                        .active()
+                        .map(|layout| (layout.id.clone(), layout.all_session_ids()));
+                    if next_tab != prev_tab {
+                        if let Err(error) = this.ensure_active_tab_attached(window, cx) {
+                            this.chat_error = Some(error.to_string().into());
+                        }
+                        this.ensure_active_chat_detail(cx);
+                        cx.notify();
+                    }
+                } else if prev_tab.is_some() && this.remote_client.is_local() {
+                    this.report_current_subjects(cx);
+                }
             }),
+            _focus_map_tasks: None,
             _event_tasks: [
                 chat_events_task,
                 chat_event_task,
@@ -471,6 +497,8 @@ impl NativeRoot {
             }));
         platform_ui::sync_traffic_lights(window, root.settings(cx).app_zoom);
         root.sync_theme(window, cx);
+        root.app_store
+            .update(cx, |store, _| store.open_window_queue(&root.window_label));
         // Subscribed before the window's first reports, so a runnerd that
         // reconnects after they fail still reaches the re-register.
         root.start_focus_map_listener(window, cx);

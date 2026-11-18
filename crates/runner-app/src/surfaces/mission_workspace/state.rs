@@ -250,6 +250,7 @@ impl MissionWorkspace {
             loading_overlay_visible: false,
             error: None,
             warning: None,
+            restore_fallback: None,
             active_tab: MissionTab::Feed,
             open_tabs: Vec::new(),
             last_measured_terminal_size: None,
@@ -282,6 +283,9 @@ impl MissionWorkspace {
             rename_modal: None,
             mission_id_copy,
             session_key_copies: HashMap::new(),
+            mark_viewed_in_flight: false,
+            pending_mark_viewed_session: None,
+            mark_viewed_task: None,
             _store_subscription: cx.observe_in(&app_store, window, |this, _, window, cx| {
                 this.handle_app_store_update(cx);
                 this.schedule_mission_grid_hint(window, cx);
@@ -319,6 +323,7 @@ impl MissionWorkspace {
             self.rail_maximized = false;
         }
         self.mission_id = Some(mission_id);
+        self.pending_mark_viewed_session = None;
         self.attached.clear();
         self.mission_node_id = None;
         self.layout = MissionLayout::default();
@@ -356,6 +361,7 @@ impl MissionWorkspace {
         self.loading_overlay_visible = false;
         self.error = None;
         self.warning = None;
+        self.restore_fallback = None;
         self.active_tab = MissionTab::Feed;
         self.open_tabs.clear();
         self.last_measured_terminal_size = None;
@@ -380,6 +386,9 @@ impl MissionWorkspace {
 
     pub(crate) fn release_window(&mut self, cx: &mut Context<Self>) {
         self.active = false;
+        self.mark_viewed_in_flight = false;
+        self.pending_mark_viewed_session = None;
+        self.mark_viewed_task = None;
         self.rail_files.release(cx);
         if self.presentation.release_feed() {
             self.generation += 1;
@@ -875,6 +884,7 @@ impl MissionWorkspace {
             .is_some_and(|mission| self.mission_pinned(&mission, cx) != self.menu_pinned);
         if revisions.locale != previous.locale
             || revisions.settings != previous.settings
+            || revisions.worktrees != previous.worktrees
             || (reactions.terminal_wake && self.is_active(cx))
             || pin_moved
         {

@@ -468,14 +468,25 @@ impl NativeRoot {
                         .get("exit_code")
                         .and_then(serde_json::Value::as_i64)
                         .and_then(|code| i32::try_from(code).ok());
+                    let is_drawer_shell =
+                        self.tabs.active().and_then(PaneLayout::active_drawer_shell)
+                            == Some(session_id.as_str());
+                    let is_pane_shell = !is_drawer_shell
+                        && self
+                            .session_entry(&session_id, cx)
+                            .and_then(|entry| Runtime::parse(&entry.agent_runtime))
+                            .is_some_and(Runtime::is_shell);
+                    if is_pane_shell {
+                        self.attached.remove(&session_id);
+                    }
                     self.session_exit_codes
                         .insert(session_id.clone(), exit_code);
                     self.chat_transitions.remove(&session_id);
                     let focus_on_completion = self.stopping_sessions.remove(&session_id)
                         || self.pending_pane_closes.contains_key(&session_id)
                         || self.sidebar.read(cx).session_archiving(&session_id);
-                    self.refresh_sessions(cx);
-                    self.sync_active_chat_detail(cx);
+                    self.refresh_store(StoreRefreshKind::All, cx);
+                    self.sync_cached_active_chat_detail(cx);
                     // A pending stop, close or archive settles focus at completion.
                     if self.route == AppRoute::Chat && !focus_on_completion {
                         if self
@@ -490,7 +501,9 @@ impl NativeRoot {
                             == Some(session_id.as_str())
                         {
                             self.chat_focus.focus(window, cx);
-                            self.mark_active_tab_viewed(window, cx);
+                            if !is_pane_shell {
+                                self.mark_active_tab_viewed(window, cx);
+                            }
                         }
                     }
                 }
@@ -501,8 +514,8 @@ impl NativeRoot {
                     self.session_exit_codes.remove(&session_id);
                     self.chat_transitions.remove(&session_id);
                     self.stopping_sessions.remove(&session_id);
-                    self.refresh_sessions(cx);
-                    self.sync_active_chat_detail(cx);
+                    self.refresh_store(StoreRefreshKind::All, cx);
+                    self.sync_cached_active_chat_detail(cx);
                 }
             }
             "session/spawned" => {
@@ -584,8 +597,8 @@ impl NativeRoot {
                 }
             }
             "session/updated" => {
-                self.refresh_sessions(cx);
-                self.sync_active_chat_detail(cx);
+                self.refresh_store(StoreRefreshKind::All, cx);
+                self.sync_cached_active_chat_detail(cx);
             }
             _ => {}
         }
@@ -597,7 +610,12 @@ impl NativeRoot {
         let focused = layout.focused_session_id().map(str::to_owned);
         let (session, chat) = self.panel_session_for(focused.as_deref(), cx)?;
         if chat {
-            self.panel_chat_by_tab.insert(tab_id, session.clone());
+            if self.remote_client.is_active() {
+                self.remote_client
+                    .remember_panel_chat(tab_id, session.clone());
+            } else {
+                self.panel_chat_by_tab.insert(tab_id, session.clone());
+            }
         }
         Some(session)
     }
@@ -624,8 +642,12 @@ impl NativeRoot {
         if let Some(focused) = focused.filter(|id| chats.iter().any(|chat| chat.as_str() == *id)) {
             return Some((focused.to_owned(), true));
         }
-        self.panel_chat_by_tab
-            .get(&layout.id)
+        let remembered = if self.remote_client.is_active() {
+            self.remote_client.panel_chat_for(&layout.id)
+        } else {
+            self.panel_chat_by_tab.get(&layout.id)
+        };
+        remembered
             .filter(|id| chats.contains(id))
             .or_else(|| chats.first())
             .cloned()
@@ -651,11 +673,29 @@ impl NativeRoot {
             .update(cx, |copy, copy_cx| copy.set_value(session_key, copy_cx));
     }
 
-    pub(crate) fn ensure_active_chat_detail(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn sync_cached_active_chat_detail(&mut self, cx: &mut Context<Self>) {
+        self.sync_chat_panel(cx);
         if self.remote_client.is_active() {
             return;
         }
+        let selected = self.panel_session_id(cx);
+        self.active_chat_detail = selected
+            .as_ref()
+            .and_then(|id| self.app_store.read(cx).session_details.get(id))
+            .cloned();
+        let session_key = self
+            .active_chat_detail
+            .as_ref()
+            .and_then(|entry| entry.agent_session_key.clone());
+        self.session_key_copy
+            .update(cx, |copy, copy_cx| copy.set_value(session_key, copy_cx));
+    }
+
+    pub(crate) fn ensure_active_chat_detail(&mut self, cx: &mut Context<Self>) {
         let active = self.panel_session_id(cx);
+        if self.remote_client.is_active() {
+            return;
+        }
         let loaded = self
             .active_chat_detail
             .as_ref()

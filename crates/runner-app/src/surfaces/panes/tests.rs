@@ -126,6 +126,7 @@ fn dragging_an_empty_pane_grip_preserves_its_id_and_sibling_chat() {
         }
         store.refresh(crate::app_store::StoreRefreshKind::All, cx);
     });
+    cx.run_until_parked();
     let window = cx.add_window(|window, cx| {
         let mut root = crate::NativeRoot::new(
             "empty-pane-drag".into(),
@@ -257,6 +258,7 @@ fn split_header_keeps_its_grip_and_actions_within_narrow_zoomed_panes() {
             drop(conn);
             store.refresh(crate::app_store::StoreRefreshKind::All, cx);
         });
+    cx.run_until_parked();
     let window = cx.add_window(|window, cx| {
         let mut root = crate::NativeRoot::new(
             "split-grip-budget".into(),
@@ -318,6 +320,7 @@ fn a_maximized_pane_fills_the_tab_and_its_toggle_restores_the_split() {
         store.refresh(crate::app_store::StoreRefreshKind::All, cx);
         other
     });
+    cx.run_until_parked();
     let other_island: &str = Box::leak(format!("PANE_ISLAND:{other}").into_boxed_str());
     let other_toggle: &str = Box::leak(format!("PANE_MAXIMIZE:{other}").into_boxed_str());
     let window = cx.add_window(|window, cx| {
@@ -453,6 +456,7 @@ fn title_clicks_select_their_pane_and_maximize_respects_split_floors_and_disconn
             store.refresh(crate::app_store::StoreRefreshKind::All, cx);
             right
         });
+    cx.run_until_parked();
     let window = cx.add_window(|window, cx| {
         let mut root = crate::NativeRoot::new(
             "title-focus".into(),
@@ -629,6 +633,7 @@ fn clicking_away_from_an_inline_rename_saves_it() {
             drop(conn);
             store.refresh(crate::app_store::StoreRefreshKind::All, cx);
         });
+    cx.run_until_parked();
     let window = cx.add_window(|window, cx| {
         let mut root = crate::NativeRoot::new(
             "rename-blur".into(),
@@ -711,6 +716,7 @@ fn pane_title_menu_labels_fit_one_line() {
                             store.refresh(crate::app_store::StoreRefreshKind::All, cx);
                             store.sync_locale(cx);
                         });
+                    cx.run_until_parked();
                     let window = cx.add_window(|window, cx| {
                         let mut root = crate::NativeRoot::new(
                             "pane-menu-fit".into(),
@@ -806,6 +812,9 @@ fn island_status_details_truncate_inside_the_header_without_displacing_controls(
             store.settings.chat_panel_open = false;
             store.settings.sidebar_collapsed = false;
             store.refresh(crate::app_store::StoreRefreshKind::All, cx);
+        });
+        cx.run_until_parked();
+        store.update(&mut cx, |store, _| {
             store.session_statuses.insert(
                 "direct-agent".into(),
                 AgentStatus {
@@ -980,6 +989,7 @@ fn status_grows_leftward_and_the_lifecycle_slot_never_moves() {
         store.settings.sidebar_collapsed = false;
         store.refresh(crate::app_store::StoreRefreshKind::All, cx);
     });
+    cx.run_until_parked();
     let sidebar_width = store.read_with(&cx, |store, _| store.settings.sidebar_width);
     let host = cx.add_window(|window, cx| {
         let mut root = crate::NativeRoot::new(
@@ -1131,6 +1141,7 @@ fn side_panel_keeps_the_last_focused_chat_while_a_split_terminal_has_focus() {
             store.refresh(crate::app_store::StoreRefreshKind::All, cx);
             store.settings.chat_panel_open = true;
         });
+    cx.run_until_parked();
     let host = cx.add_window(|window, cx| {
         let mut root = NativeRoot::new(
             "side-panel-terminal-split".into(),
@@ -1238,6 +1249,7 @@ fn a_hovered_link_names_the_panel_its_own_pane_will_show() {
             store.refresh(crate::app_store::StoreRefreshKind::All, cx);
             store.settings.chat_panel_open = true;
         });
+    cx.run_until_parked();
     let host = cx.add_window(|window, cx| {
         let mut root = NativeRoot::new(
             "link-two-chats".into(),
@@ -1358,6 +1370,7 @@ fn panel_root(
         store.refresh(crate::app_store::StoreRefreshKind::All, cx);
         store.settings.chat_panel_open = true;
     });
+    cx.run_until_parked();
     let host = cx.add_window(|window, cx| {
         let mut root = crate::NativeRoot::new(
             "side-panel-views".into(),
@@ -2047,6 +2060,7 @@ fn the_finder_key_goes_back_to_the_terminal_when_there_is_no_view_to_search() {
         store.refresh(crate::app_store::StoreRefreshKind::All, cx);
         store.settings.files_view = false;
     });
+    cx.run_until_parked();
     cx.update(|cx| {
         cx.bind_keys([gpui::KeyBinding::new(
             "ctrl-shift-o",
@@ -2424,6 +2438,7 @@ fn cached_chat_header_spans_the_chat_column_with_or_without_the_side_panel() {
                 store.settings.chat_panel_open = panel_open;
                 store.settings.app_zoom = zoom;
             });
+            cx.run_until_parked();
             let host = cx.add_window(|window, cx| {
                 let mut root = NativeRoot::new(
                     "chat-header-width".into(),
@@ -2520,6 +2535,7 @@ impl gpui::Render for ChatPanel {
                         account.folder.clone(),
                     )
                 }),
+                None,
                 cx,
             ))
     }
@@ -2563,6 +2579,7 @@ fn claude_header_preserves_account_spacing_and_controls_in_narrow_panes() {
             store.settings.keymap_overrides.insert("resume-session".into(), Some(crate::keymap::KeyCombo { meta: false, ctrl: false, alt: false, shift: false, code: "F8".into(), label: None, shift_optional: false }));
             store.refresh(crate::app_store::StoreRefreshKind::All,cx);
         });
+    cx.run_until_parked();
     let sidebar_width = store.read_with(&cx, |store, _| store.settings.sidebar_width);
     let panel_width = store.read_with(&cx, |store, _| store.settings.chat_panel_width);
     let host = cx.add_window(|window, cx| {
@@ -3576,6 +3593,7 @@ fn start_surface_column_stays_440_pixels_wide_and_centred() {
         let _ = runner_daemon::ops::onboarding::complete(&store.test_core);
         store.refresh(crate::app_store::StoreRefreshKind::Onboarding, cx);
     });
+    cx.run_until_parked();
     let host = cx.add_window(|window, cx| {
         let mut root = NativeRoot::new(
             "start-surface-width".into(),
@@ -3860,7 +3878,18 @@ fn dropped_files_focus_the_pane_they_land_on() {
     visual.simulate_event(FileDropEvent::Submit {
         position: target.center(),
     });
-    visual.run_until_parked();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while host
+        .read_with(&cx, |root, _| root.chat_error.is_none())
+        .unwrap()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for dropped-file input error on direct-agent"
+        );
+        std::thread::yield_now();
+        visual.run_until_parked();
+    }
 
     host.update(&mut cx, |root, window, _| {
         assert_eq!(root.tabs.active().unwrap().focused_pane_id, target_pane);
@@ -4304,4 +4333,157 @@ fn chat_panel_retains_widened_width_across_tab_switches_closes_and_divider_drag(
     assert!((panel_width(&mut visual) - 320.).abs() <= 1.);
     switch("direct-agent", &mut visual);
     assert!((panel_width(&mut visual) - 740.).abs() <= 1.);
+}
+
+#[test]
+fn chat_info_panel_shows_branch_row_only_for_linked_worktrees() {
+    use std::time::{Duration, Instant};
+
+    let _theme = crate::theme_snapshot::ThemeGuard::new();
+    let temp = tempfile::Builder::new()
+        .prefix("1213-m2-chat-info-")
+        .tempdir()
+        .unwrap();
+    let repo = temp.path().join("repo");
+    let wt = repo.join(".worktrees").join("feat-info");
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    };
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "core.autocrlf", "false"]);
+    std::fs::write(repo.join("README.md"), "hello\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feat/info",
+            wt.to_str().unwrap(),
+            "main",
+        ],
+    );
+
+    let mut cx = gpui::TestAppContext::single();
+    let store = crate::app_store::test_lifecycle_store(&mut cx, temp.path());
+    let conn = store.read_with(&cx, |s, _| s.test_core.db.get().unwrap());
+    conn.execute_batch(&format!(
+        "INSERT INTO sessions (id, title, status, agent_runtime, agent_command, cwd)
+             VALUES ('main-chat', 'Main chat', 'stopped', 'claude-code', 'claude', '{repo}'),
+                    ('wt-chat', 'WT chat', 'stopped', 'claude-code', 'claude', '{wt}');",
+        repo = repo.to_string_lossy(),
+        wt = wt.to_string_lossy(),
+    ))
+    .unwrap();
+    let main_tab = runner_daemon::repo::node::create_tab(
+        &conn,
+        None,
+        "Main",
+        0,
+        &PaneLayout::single(Some("main-chat"), &["main-chat".into()])
+            .serialize()
+            .unwrap(),
+    )
+    .unwrap();
+    let wt_tab = runner_daemon::repo::node::create_tab(
+        &conn,
+        None,
+        "WT",
+        1,
+        &PaneLayout::single(Some("wt-chat"), &["wt-chat".into()])
+            .serialize()
+            .unwrap(),
+    )
+    .unwrap();
+    drop(conn);
+
+    store.update(&mut cx, |store, cx| {
+        store.settings.show_side_panel = true;
+        store.settings.chat_panel_open = true;
+        store.settings.info_view = true;
+        store.refresh(crate::app_store::StoreRefreshKind::All, cx);
+    });
+    cx.run_until_parked();
+    let host = crate::surfaces::remote_client::tests::add_window(
+        &mut cx,
+        &store,
+        temp.path(),
+        "chat-info-branch",
+    );
+    let mut visual = gpui::VisualTestContext::from_window(host.into(), &cx);
+    visual.simulate_resize(size(px(1400.), px(900.)));
+
+    let wait = |visual: &mut gpui::VisualTestContext,
+                what: &str,
+                pred: &dyn Fn(&mut gpui::VisualTestContext) -> bool| {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !pred(visual) {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::yield_now();
+            visual.run_until_parked();
+        }
+    };
+
+    // Main checkout: no branch row in Info.
+    host.update(&mut visual, |root, _, cx| {
+        root.set_chat_panel_open(true, cx);
+        let mut open = crate::surfaces::side_panel::OpenSurfaces::default();
+        open.open(crate::surfaces::side_panel::PanelViewId::Info);
+        root.chat_surfaces.reset(open);
+        root.apply_tab_rows(cx);
+        root.set_route(crate::AppRoute::Chat, cx);
+        root.tabs.activate(&main_tab.id);
+        root.sync_active_chat_detail(cx);
+        cx.notify();
+    })
+    .unwrap();
+    wait(
+        &mut visual,
+        "main chat checkout cached and cwd rendered",
+        &|v| {
+            store.read_with(v, |s, _| {
+                s.worktree_checkout_for(repo.to_string_lossy().as_ref(), None)
+                    .is_some()
+            }) && v.debug_bounds("CHAT_INFO_SCROLL").is_some()
+        },
+    );
+    assert!(visual.debug_bounds("CHAT_PANEL_BRANCH_ROW").is_none());
+
+    // Linked worktree: branch row + Worktree · from main marker.
+    host.update(&mut visual, |root, _, cx| {
+        root.set_route(crate::AppRoute::Chat, cx);
+        root.tabs.activate(&wt_tab.id);
+        root.sync_active_chat_detail(cx);
+        root.set_chat_panel_open(true, cx);
+        let mut open = crate::surfaces::side_panel::OpenSurfaces::default();
+        open.open(crate::surfaces::side_panel::PanelViewId::Info);
+        root.chat_surfaces.reset(open);
+        cx.notify();
+    })
+    .unwrap();
+    wait(
+        &mut visual,
+        "worktree chat branch row and auto_base",
+        &|v| {
+            v.debug_bounds("CHAT_PANEL_BRANCH_ROW").is_some()
+                && v.debug_bounds("CHAT_PANEL_META feat/info").is_some()
+                && v.debug_bounds("INFO_WORKTREE_MARKER Worktree · from main")
+                    .is_some()
+        },
+    );
+
+    host.update(&mut visual, |_, window, _| window.remove_window())
+        .unwrap();
 }

@@ -94,10 +94,66 @@ pub fn session_status_snapshot(
     state: &AppCore,
 ) -> Result<BTreeMap<String, crate::session::status::AgentStatus>> {
     use crate::session::status::{AgentStatus, Lifecycle};
+    #[cfg(test)]
+    let scope_buf = format!("core:{}", state.app_data_dir.display());
+    #[cfg(test)]
+    let scope = scope_buf.as_str();
+    #[cfg(not(test))]
+    let scope = "";
+    let total_timer = crate::slow_stage::StageClock::start(scope);
+
+    let live_timer = crate::slow_stage::StageClock::start(scope);
     let mut statuses = state.sessions.status_snapshot();
+    let live_ms = live_timer.elapsed().as_millis();
+
+    let routers_timer = crate::slow_stage::StageClock::start(scope);
     let interrupted = state.routers.interrupted_sessions();
-    let conn = state.db.get()?;
-    for row in repo::session::status_rows(&conn)? {
+    let routers_ms = routers_timer.elapsed().as_millis();
+
+    let checkout_timer = crate::slow_stage::StageClock::start(scope);
+    let conn = match state.db.get() {
+        Ok(conn) => conn,
+        Err(error) => {
+            let db_checkout_ms = checkout_timer.elapsed().as_millis();
+            let total = total_timer.elapsed();
+            crate::slow_stage::warn_if_slow(
+                scope,
+                total,
+                crate::slow_stage::SLOW_STAGE_THRESHOLD,
+                || {
+                    format!(
+                        "slow session_status_snapshot: total_ms={} live_ms={live_ms} routers_ms={routers_ms} db_checkout_ms={db_checkout_ms} rows_ms=0 outcome=db_checkout_error",
+                        total.as_millis()
+                    )
+                },
+            );
+            return Err(error.into());
+        }
+    };
+    let db_checkout_ms = checkout_timer.elapsed().as_millis();
+
+    let rows_timer = crate::slow_stage::StageClock::start(scope);
+    let rows = match repo::session::status_rows(&conn) {
+        Ok(rows) => rows,
+        Err(error) => {
+            let rows_ms = rows_timer.elapsed().as_millis();
+            let total = total_timer.elapsed();
+            crate::slow_stage::warn_if_slow(
+                scope,
+                total,
+                crate::slow_stage::SLOW_STAGE_THRESHOLD,
+                || {
+                    format!(
+                        "slow session_status_snapshot: total_ms={} live_ms={live_ms} routers_ms={routers_ms} db_checkout_ms={db_checkout_ms} rows_ms={rows_ms} outcome=status_rows_error",
+                        total.as_millis()
+                    )
+                },
+            );
+            return Err(error.into());
+        }
+    };
+    drop(conn);
+    for row in rows {
         let interrupted_since = interrupted.get(&row.id).copied();
         let status = statuses.entry(row.id).or_insert(AgentStatus {
             lifecycle: Lifecycle::Running,
@@ -129,6 +185,19 @@ pub fn session_status_snapshot(
             _ => status.interrupted_since = interrupted_since,
         }
     }
+    let rows_ms = rows_timer.elapsed().as_millis();
+    let total = total_timer.elapsed();
+    crate::slow_stage::warn_if_slow(
+        scope,
+        total,
+        crate::slow_stage::SLOW_STAGE_THRESHOLD,
+        || {
+            format!(
+                "slow session_status_snapshot: total_ms={} live_ms={live_ms} routers_ms={routers_ms} db_checkout_ms={db_checkout_ms} rows_ms={rows_ms} outcome=ok",
+                total.as_millis()
+            )
+        },
+    );
     Ok(statuses)
 }
 
@@ -141,8 +210,9 @@ pub fn session_activity_snapshot(state: &AppCore) -> BTreeMap<String, SessionAct
 /// each session row's runtime. A process without a row, such as a CLI
 /// update in Settings → Agents, is not a session and is not counted.
 pub fn live_session_counts(state: &AppCore) -> Result<HashMap<Runtime, usize>> {
+    let live_ids = state.sessions.live_session_ids();
     let conn = state.db.get()?;
-    count_by_runtime(&conn, &state.sessions.live_session_ids())
+    count_by_runtime(&conn, &live_ids)
 }
 
 fn count_by_runtime(
@@ -445,6 +515,7 @@ pub fn session_archive(state: &AppCore, session_id: &str) -> Result<()> {
     }
     repo::node::remove_session(&tx, session_id)?;
     tx.commit()?;
+    drop(conn);
     state.sessions.forget_session_state(session_id);
     state.session_events().archived(&SessionUpdatedEvent {
         session_id: session_id.to_owned(),
@@ -485,6 +556,34 @@ pub(crate) fn restore_missing_worktree_for_cwd(
     Ok(())
 }
 
+pub(crate) fn restore_main_checkout_for_cwd(
+    state: &AppCore,
+    cwd: Option<&str>,
+    project_id: Option<&str>,
+    extra_repo_hint: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(cwd) = cwd.map(str::trim).filter(|path| !path.is_empty()) else {
+        return Ok(None);
+    };
+    let project_cwd = match project_id {
+        Some(id) => {
+            let conn = state.db.get()?;
+            repo::project::get(&conn, id)?.map(|project| std::path::PathBuf::from(project.cwd))
+        }
+        None => None,
+    };
+    let hint = project_cwd.or_else(|| {
+        extra_repo_hint
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(std::path::PathBuf::from)
+    });
+    let resolved = state
+        .files
+        .resolve_main_checkout_fallback(std::path::Path::new(cwd), hint.as_deref())?;
+    Ok(resolved.map(|path| path.to_string_lossy().into_owned()))
+}
+
 fn effective_session_cwd_and_project(
     conn: &rusqlite::Connection,
     row: &repo::session::SessionRowDb,
@@ -505,7 +604,60 @@ fn effective_session_cwd_and_project(
     Ok((cwd, project_id, mission_archived))
 }
 
-pub fn session_unarchive(state: &AppCore, session_id: &str) -> Result<()> {
+pub(crate) fn acquire_mission_relocation_claims(
+    state: &AppCore,
+    conn: &rusqlite::Connection,
+    mission_id: &str,
+    exclude_session_id: Option<&str>,
+) -> Result<(
+    Vec<repo::session::MissionCwdRow>,
+    Vec<crate::session::manager::ResumeClaim>,
+)> {
+    let rows = repo::session::list_mission_cwd_rows(conn, mission_id)?;
+    let mut claims = Vec::new();
+    for row in &rows {
+        if exclude_session_id == Some(row.id.as_str()) {
+            continue;
+        }
+        if row.status == SessionStatus::Running {
+            return Err(Error::msg(
+                "cannot restore mission checkout to main while another mission member is running",
+            ));
+        }
+        let Some(claim) = state.sessions.try_claim_resume(&row.id) else {
+            return Err(Error::msg(
+                "cannot restore mission checkout to main while another mission member is resuming",
+            ));
+        };
+        claims.push(claim);
+    }
+    // Re-read after claiming so a sibling that finished spawning right as we
+    // acquired claims or was added before the write gate is caught before edits.
+    let rechecked = repo::session::list_mission_cwd_rows(conn, mission_id)?;
+    for row in &rechecked {
+        if exclude_session_id == Some(row.id.as_str()) {
+            continue;
+        }
+        if row.status == SessionStatus::Running {
+            return Err(Error::msg(
+                "cannot restore mission checkout to main while another mission member is running",
+            ));
+        }
+    }
+    if rechecked
+        .iter()
+        .filter(|row| exclude_session_id != Some(row.id.as_str()))
+        .count()
+        != claims.len()
+    {
+        return Err(Error::msg(
+            "cannot restore mission checkout to main while mission members are changing",
+        ));
+    }
+    Ok((rechecked, claims))
+}
+
+pub fn session_unarchive(state: &AppCore, session_id: &str, restore_in_main: bool) -> Result<()> {
     {
         let _reg_guard = state.files.worktree_gate().read();
         let preflight = {
@@ -522,20 +674,37 @@ pub fn session_unarchive(state: &AppCore, session_id: &str) -> Result<()> {
                 Some(row) => row,
             }
         };
-        if preflight.archived_at.is_some() {
-            restore_missing_worktree_for_cwd(
-                state,
-                preflight.cwd.as_deref(),
-                preflight.project_id.as_deref(),
-            )?;
-        }
+        let new_cwd = if preflight.archived_at.is_some() {
+            if restore_in_main {
+                restore_main_checkout_for_cwd(
+                    state,
+                    preflight.cwd.as_deref(),
+                    preflight.project_id.as_deref(),
+                    None,
+                )?
+            } else {
+                restore_missing_worktree_for_cwd(
+                    state,
+                    preflight.cwd.as_deref(),
+                    preflight.project_id.as_deref(),
+                )?;
+                None
+            }
+        } else {
+            None
+        };
         #[cfg(test)]
         state.files.worktree_gate().fire_before_registration();
-        let conn = state.db.get()?;
-        let updated = repo::session::unarchive_direct(&conn, session_id)?;
-        if updated == 0 && repo::session::get_row(&conn, session_id)?.is_none() {
+        let mut conn = state.db.get()?;
+        let tx = conn.transaction()?;
+        if let Some(ref cwd) = new_cwd {
+            repo::session::set_cwd(&tx, session_id, cwd)?;
+        }
+        let updated = repo::session::unarchive_direct(&tx, session_id)?;
+        if updated == 0 && repo::session::get_row(&tx, session_id)?.is_none() {
             return Err(Error::msg(format!("session not found: {session_id}")));
         }
+        tx.commit()?;
     }
     state.events.emit(
         "session/updated",
@@ -840,43 +1009,129 @@ pub fn session_resume(
     session_id: &str,
     cols: Option<u16>,
     rows: Option<u16>,
+    restore_in_main: bool,
 ) -> Result<SpawnedSession> {
     // Dims decide the PTY fork size; None uses the persisted last-applied
     // size before falling back to 80×24. Logged so a garbled-pane report
     // can be traced back to its resume geometry.
-    log::info!("session_resume: session={session_id} cols={cols:?} rows={rows:?}");
-    let restore_target = {
-        let conn = state.db.get()?;
-        if let Some(row) = repo::session::get_row(&conn, session_id)? {
-            if row.archived_at.is_none() && row.status != SessionStatus::Running {
-                let (cwd, project_id, mission_archived) =
-                    effective_session_cwd_and_project(&conn, &row)?;
-                if !mission_archived {
-                    Some((cwd, project_id))
+    log::info!(
+        "session_resume: session={session_id} cols={cols:?} rows={rows:?} restore_in_main={restore_in_main}"
+    );
+    let target_claim = state
+        .sessions
+        .try_claim_resume(session_id)
+        .ok_or_else(|| Error::msg(format!("session {session_id} is already being resumed")))?;
+    let mission_changed = {
+        let _write_guard = restore_in_main.then(|| state.files.worktree_gate().write());
+        let _read_guard = (!restore_in_main).then(|| state.files.worktree_gate().read());
+        let preflight = {
+            let conn = state.db.get()?;
+            if let Some(row) = repo::session::get_row(&conn, session_id)? {
+                if row.archived_at.is_none() && row.status != SessionStatus::Running {
+                    let (cwd, project_id, mission_archived) =
+                        effective_session_cwd_and_project(&conn, &row)?;
+                    if !mission_archived {
+                        let mission = row
+                            .mission_id
+                            .as_deref()
+                            .map(|id| repo::mission::get(&conn, id))
+                            .transpose()?
+                            .flatten();
+                        Some((cwd, project_id, mission))
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
             } else {
                 None
             }
+        };
+        if let Some((cwd, project_id, mission)) = preflight {
+            if restore_in_main {
+                let (sibling_rows, _sibling_claims) = if let Some(ref m) = mission {
+                    let conn = state.db.get()?;
+                    acquire_mission_relocation_claims(state, &conn, &m.id, Some(session_id))?
+                } else {
+                    (Vec::new(), Vec::new())
+                };
+                let extra_hint = mission.as_ref().and_then(|m| m.cwd.as_deref());
+                let new_session_cwd = restore_main_checkout_for_cwd(
+                    state,
+                    cwd.as_deref(),
+                    project_id.as_deref(),
+                    extra_hint,
+                )?;
+                let mut new_mission_cwd: Option<(String, String)> = None;
+                let mut sibling_updates: Vec<(String, String)> = Vec::new();
+                if let Some(ref m) = mission {
+                    if let Some(target) = restore_main_checkout_for_cwd(
+                        state,
+                        m.cwd.as_deref(),
+                        m.project_id.as_deref().or(project_id.as_deref()),
+                        None,
+                    )? {
+                        let hint = m.cwd.as_deref().or(Some(target.as_str()));
+                        for sibling in sibling_rows {
+                            if sibling.id == session_id {
+                                continue;
+                            }
+                            if let Some(starget) = restore_main_checkout_for_cwd(
+                                state,
+                                sibling.cwd.as_deref(),
+                                sibling.project_id.as_deref().or(m.project_id.as_deref()),
+                                Some(hint.unwrap_or(target.as_str())),
+                            )? {
+                                sibling_updates.push((sibling.id, starget));
+                            }
+                        }
+                        new_mission_cwd = Some((m.id.clone(), target));
+                    }
+                }
+                #[cfg(test)]
+                state.files.worktree_gate().fire_before_registration();
+                let has_mission_update = new_mission_cwd.is_some();
+                if new_session_cwd.is_some()
+                    || new_mission_cwd.is_some()
+                    || !sibling_updates.is_empty()
+                {
+                    let mut conn = state.db.get()?;
+                    let tx = conn.transaction()?;
+                    if let Some(ref target) = new_session_cwd {
+                        repo::session::set_cwd(&tx, session_id, target)?;
+                    }
+                    if let Some((ref mid, ref target)) = new_mission_cwd {
+                        repo::mission::set_cwd(&tx, mid, target)?;
+                    }
+                    for (sid, target) in sibling_updates {
+                        repo::session::set_cwd(&tx, &sid, &target)?;
+                    }
+                    tx.commit()?;
+                }
+                has_mission_update
+            } else {
+                restore_missing_worktree_for_cwd(state, cwd.as_deref(), project_id.as_deref())
+                    .map_err(|e| e.context("session_resume"))?;
+                false
+            }
         } else {
-            None
+            false
         }
     };
-    if let Some((cwd, project_id)) = restore_target {
-        restore_missing_worktree_for_cwd(state, cwd.as_deref(), project_id.as_deref())
-            .map_err(|e| e.context("session_resume"))?;
-    }
     let emitter: Arc<dyn SessionEvents> = Arc::new(state.session_events());
     let spawned = state
         .sessions
-        .resume(
+        .resume_claimed(
+            target_claim,
             session_id,
             cols,
             rows,
             &state.app_data_dir,
             state.db.clone(),
             emitter,
+            true,
+            false,
         )
         .map_err(|e| e.context("session_resume"))?;
     state.events.emit(
@@ -886,6 +1141,9 @@ pub fn session_resume(
             mission_id: spawned.mission_id.clone(),
         },
     );
+    if mission_changed {
+        state.events.emit("mission/changed", &());
+    }
     Ok(spawned)
 }
 
