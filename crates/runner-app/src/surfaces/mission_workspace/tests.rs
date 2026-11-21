@@ -763,6 +763,8 @@ fn sidebar_and_mission_fills_follow_carbon_and_runner_light() {
         },
         handle: "archived".into(),
         runtime: "codex".into(),
+        agent_model: None,
+        agent_effort: None,
         role_handle: String::new(),
         lead: false,
         agent_session_key: None,
@@ -1334,6 +1336,8 @@ fn cached_mission_header_tabs_and_feed_span_the_content_column() {
                     role_handle: String::new(),
                     lead: false,
                     runtime: "codex".into(),
+                    agent_model: None,
+                    agent_effort: None,
                     live_title: None,
                     agent_session_key: None,
                 })
@@ -1481,6 +1485,8 @@ fn mission_rail_scrolls_long_roster_and_goal_above_corner_padding() {
                     role_handle: String::new(),
                     lead: index == 0,
                     runtime: "shell".into(),
+                    agent_model: None,
+                    agent_effort: None,
                     live_title: None,
                     agent_session_key: None,
                 })
@@ -1495,41 +1501,37 @@ fn mission_rail_scrolls_long_roster_and_goal_above_corner_padding() {
     let mut visual = VisualTestContext::from_window(host.into(), &cx);
     visual.simulate_resize(size(px(960.), px(300.)));
     visual.run_until_parked();
-    for (view, viewport_selector, final_selector) in [
-        (
-            PanelViewId::Sessions,
-            "MISSION_ROLES_SCROLL",
-            "MISSION_CARD slot-19",
-        ),
-        (PanelViewId::Info, "MISSION_META_SCROLL", "MISSION_META_END"),
-    ] {
-        host.update(&mut visual, |host, _, cx| {
-            host.workspace
-                .update(cx, |workspace, _| workspace.rail_surfaces.open.open(view));
-            cx.notify();
-        })
-        .unwrap();
-        visual.run_until_parked();
-        let rail = visual.debug_bounds("MISSION_RAIL").unwrap();
-        let viewport = visual.debug_bounds(viewport_selector).unwrap();
-        assert_eq!(viewport.bottom(), rail.bottom() - px(9.));
-        let last = visual.debug_bounds(final_selector).unwrap();
-        assert!(
-            last.bottom() > viewport.bottom(),
-            "{view:?}: {last:?} {viewport:?}"
-        );
-        visual.simulate_event(ScrollWheelEvent {
-            position: viewport.center(),
-            delta: ScrollDelta::Lines(point(0., -1000.)),
-            ..Default::default()
-        });
-        visual.run_until_parked();
-        let last = visual.debug_bounds(final_selector).unwrap();
-        assert!(
-            last.top() >= viewport.top() && last.bottom() <= viewport.bottom(),
-            "{view:?}: {last:?} {viewport:?}"
-        );
-    }
+    let (view, viewport_selector, final_selector) = (
+        PanelViewId::Sessions,
+        "MISSION_ROLES_SCROLL",
+        "MISSION_CARD slot-19",
+    );
+    host.update(&mut visual, |host, _, cx| {
+        host.workspace
+            .update(cx, |workspace, _| workspace.rail_surfaces.select(view));
+        cx.notify();
+    })
+    .unwrap();
+    visual.run_until_parked();
+    let rail = visual.debug_bounds("MISSION_RAIL").unwrap();
+    let viewport = visual.debug_bounds(viewport_selector).unwrap();
+    assert_eq!(viewport.bottom(), rail.bottom() - px(9.));
+    let last = visual.debug_bounds(final_selector).unwrap();
+    assert!(
+        last.bottom() > viewport.bottom(),
+        "{view:?}: {last:?} {viewport:?}"
+    );
+    visual.simulate_event(ScrollWheelEvent {
+        position: viewport.center(),
+        delta: ScrollDelta::Lines(point(0., -1000.)),
+        ..Default::default()
+    });
+    visual.run_until_parked();
+    let last = visual.debug_bounds(final_selector).unwrap();
+    assert!(
+        last.top() >= viewport.top() && last.bottom() <= viewport.bottom(),
+        "{view:?}: {last:?} {viewport:?}"
+    );
 }
 
 #[cfg(unix)]
@@ -1574,6 +1576,8 @@ fn a_rail_widened_by_an_open_file_lays_the_roster_two_per_row() {
                     role_handle: String::new(),
                     lead: index == 0,
                     runtime: "shell".into(),
+                    agent_model: None,
+                    agent_effort: None,
                     live_title: None,
                     agent_session_key: None,
                 })
@@ -1659,7 +1663,7 @@ fn rail_header_window(
 
 #[test]
 fn local_missions_keep_separate_rail_surfaces_and_collapse_choices() {
-    use crate::surfaces::side_panel::{self, PanelSurface};
+    use crate::surfaces::side_panel::{self, PanelSelection, PanelSurface};
 
     let temp = tempfile::tempdir().unwrap();
     let mut cx = gpui::TestAppContext::single();
@@ -1669,42 +1673,46 @@ fn local_missions_keep_separate_rail_surfaces_and_collapse_choices() {
         .unwrap();
     workspace.update(&mut cx, |workspace, cx| {
         workspace.prepare_mission("first".into());
-        workspace.rail_surfaces.open.open(PanelViewId::Info);
-        workspace.rail_surfaces.open.open(PanelViewId::Files);
+        workspace.rail_surfaces.select(PanelViewId::Files);
         workspace.set_rail_open(true, cx);
+
         workspace.prepare_mission("second".into());
-        assert_eq!(workspace.rail_surfaces.open, Default::default());
+        assert_eq!(workspace.rail_surfaces.selection, PanelSelection::default());
         assert!(
             workspace.rail_is_open(cx),
-            "a new mission follows the last choice"
+            "a new wide mission defaults open independently"
         );
-        workspace.rail_surfaces.open.open(PanelViewId::Info);
+        workspace.rail_surfaces.select(PanelViewId::Changes);
         workspace.set_rail_open(false, cx);
+
         workspace.prepare_mission("first".into());
         assert!(workspace.rail_is_open(cx));
         assert_eq!(
             side_panel::shown(
                 PanelSurface::Mission,
                 workspace.settings(cx),
-                &workspace.rail_surfaces.open
+                &workspace.rail_surfaces.selection
             ),
             Some(PanelViewId::Files)
         );
+
         workspace.prepare_mission("second".into());
         assert!(!workspace.rail_is_open(cx));
         assert_eq!(
             side_panel::shown(
                 PanelSurface::Mission,
                 workspace.settings(cx),
-                &workspace.rail_surfaces.open
+                &workspace.rail_surfaces.selection
             ),
-            Some(PanelViewId::Info)
+            Some(PanelViewId::Changes)
         );
+
+        // Collapsing "second" never mutates future missions (#1403 per-tab isolation).
         workspace.prepare_mission("new".into());
-        assert!(!workspace.rail_is_open(cx));
-        assert_eq!(workspace.rail_surfaces.open, Default::default());
+        assert!(workspace.rail_is_open(cx));
+        assert_eq!(workspace.rail_surfaces.selection, PanelSelection::default());
         workspace.prepare_mission("second".into());
-        workspace.rail_surfaces.open.open(PanelViewId::Files);
+        workspace.rail_surfaces.select(PanelViewId::Files);
     });
     store.update(&mut cx, |store, cx| {
         store.update_settings(
@@ -1718,9 +1726,23 @@ fn local_missions_keep_separate_rail_surfaces_and_collapse_choices() {
     });
     cx.run_until_parked();
     workspace.update(&mut cx, |workspace, cx| {
-        assert_eq!(workspace.rail_surfaces.open.ids().0, &[PanelViewId::Info]);
+        assert_eq!(
+            side_panel::shown(
+                PanelSurface::Mission,
+                workspace.settings(cx),
+                &workspace.rail_surfaces.selection
+            ),
+            Some(PanelViewId::Sessions)
+        );
         workspace.prepare_mission("first".into());
-        assert_eq!(workspace.rail_surfaces.open.ids().0, &[PanelViewId::Info]);
+        assert_eq!(
+            side_panel::shown(
+                PanelSurface::Mission,
+                workspace.settings(cx),
+                &workspace.rail_surfaces.selection
+            ),
+            Some(PanelViewId::Sessions)
+        );
         assert!(
             workspace.rail_is_open(cx),
             "Settings preserves each mission's collapse choice"
@@ -1729,7 +1751,7 @@ fn local_missions_keep_separate_rail_surfaces_and_collapse_choices() {
 }
 
 #[test]
-fn mission_rail_toggles_notify_even_when_the_default_already_matches() {
+fn mission_rail_toggles_remain_per_mission_without_mutating_settings() {
     let temp = tempfile::tempdir().unwrap();
     let mut cx = gpui::TestAppContext::single();
     let (store, host) = rail_header_window(&mut cx, &temp);
@@ -1737,44 +1759,31 @@ fn mission_rail_toggles_notify_even_when_the_default_already_matches() {
         .read_with(&cx, |host, _| host.workspace.clone())
         .unwrap();
     workspace.update(&mut cx, |workspace, cx| {
+        let initial_rev = store.read(cx).revisions.settings;
         workspace.prepare_mission("open".into());
         workspace.set_rail_open(true, cx);
         workspace.prepare_mission("collapsed".into());
         workspace.set_rail_open(false, cx);
-        workspace.prepare_mission("open".into());
-        assert!(!workspace.settings(cx).mission_rail_open);
-        let before = store.read(cx).revisions.settings;
-        workspace.set_rail_open(false, cx);
-        let collapsed = store.read(cx).revisions.settings;
-        assert_ne!(
-            before, collapsed,
-            "the grid hint observer needs the toggle notification"
-        );
-        workspace.set_rail_open(false, cx);
         assert_eq!(
             store.read(cx).revisions.settings,
-            collapsed,
-            "a no-op skips the save"
+            initial_rev,
+            "toggling one mission's rail never mutates global settings"
         );
 
-        workspace.prepare_mission("other".into());
-        workspace.set_rail_open(true, cx);
-        workspace.prepare_mission("collapsed".into());
-        assert!(workspace.settings(cx).mission_rail_open);
+        workspace.prepare_mission("open".into());
+        assert!(workspace.rail_is_open(cx));
+        workspace.set_rail_open(false, cx);
         assert!(!workspace.rail_is_open(cx));
-        let before = store.read(cx).revisions.settings;
-        workspace.set_rail_open(true, cx);
-        let opened = store.read(cx).revisions.settings;
-        assert_ne!(
-            before, opened,
-            "opening a collapsed rail needs the same notification"
+
+        workspace.prepare_mission("fresh".into());
+        assert!(
+            workspace.rail_is_open(cx),
+            "collapsing earlier missions leaves a new mission open"
         );
+        workspace.prepare_mission("collapsed".into());
+        assert!(!workspace.rail_is_open(cx));
         workspace.set_rail_open(true, cx);
-        assert_eq!(
-            store.read(cx).revisions.settings,
-            opened,
-            "a repeated open skips the save"
-        );
+        assert!(workspace.rail_is_open(cx));
     });
 }
 
@@ -1797,7 +1806,6 @@ fn mission_terminal_estimates_follow_the_shown_missions_rail() {
             assert!(open_drawer.0 < collapsed_drawer.0);
 
             workspace.prepare_mission("collapsed".into());
-            assert!(workspace.settings(cx).mission_rail_open);
             assert_eq!(
                 workspace.estimated_mission_terminal_size(window, cx),
                 collapsed
@@ -1808,7 +1816,6 @@ fn mission_terminal_estimates_follow_the_shown_missions_rail() {
             );
             workspace.set_rail_open(false, cx);
             workspace.prepare_mission("open".into());
-            assert!(!workspace.settings(cx).mission_rail_open);
             assert_eq!(workspace.estimated_mission_terminal_size(window, cx), open);
             assert_eq!(
                 workspace.estimated_mission_drawer_terminal_size(window, cx),
@@ -1820,9 +1827,9 @@ fn mission_terminal_estimates_follow_the_shown_missions_rail() {
 }
 
 #[test]
-fn mission_panel_header_keeps_sessions_first_and_adds_info_and_files_from_plus() {
+fn mission_panel_activity_bar_keeps_sessions_first_and_switches_files_and_changes() {
     use crate::surfaces::side_panel::{PanelContext, PanelSubject};
-    use crate::theme_snapshot::{assert_fill_color, assert_text, ThemeGuard};
+    use crate::theme_snapshot::{assert_fill_color, ThemeGuard};
     use gpui::{Modifiers, TestAppContext, VisualTestContext};
     let _theme = ThemeGuard::new();
     let temp = tempfile::tempdir().unwrap();
@@ -1838,19 +1845,23 @@ fn mission_panel_header_keeps_sessions_first_and_adds_info_and_files_from_plus()
         visual.simulate_click(bounds.center(), Modifiers::default());
         visual.run_until_parked();
     };
-    // Sessions alone, permanent: no × and not in `+`.
+    // Sessions first and active by default; Files and Changes icons beside it; no `+` or Info.
     let rail = visual.debug_bounds("MISSION_RAIL").unwrap();
-    let sessions = visual.debug_bounds("PANEL_TAB Sessions").unwrap();
-    let add = visual.debug_bounds("PANEL_ADD_SURFACE").unwrap();
+    assert!(visual
+        .debug_bounds("PANEL_ACTIVITY Sessions active")
+        .is_some());
+    let sessions = visual.debug_bounds("PANEL_ACTIVITY Sessions").unwrap();
+    let files = visual.debug_bounds("PANEL_ACTIVITY Files").unwrap();
+    let changes = visual.debug_bounds("PANEL_ACTIVITY Changes").unwrap();
     assert!(
-        sessions.left() - rail.left() <= px(12.),
+        sessions.left() - rail.left() <= px(16.),
         "{sessions:?} {rail:?}"
     );
-    assert_eq!(sessions.size.height, px(28.));
-    assert!(sessions.right() < add.left());
-    assert_eq!(add.size, gpui::size(px(24.), px(24.)));
-    assert_eq!(sessions.center().y, add.center().y);
-    assert!(visual.debug_bounds("PANEL_TAB_CLOSE Sessions").is_none());
+    assert_eq!(sessions.size, gpui::size(px(28.), px(28.)));
+    assert!(sessions.right() < files.left());
+    assert!(files.right() < changes.left());
+    assert!(visual.debug_bounds("PANEL_ACTIVITY_BAR Sessions").is_some());
+    assert!(visual.debug_bounds("PANEL_ADD_SURFACE").is_none());
     assert!(visual.debug_bounds("PANEL_TAB Info").is_none());
     assert!(visual.debug_bounds("MISSION_ROLES_SCROLL").is_some());
     for variant in [
@@ -1860,37 +1871,29 @@ fn mission_panel_header_keeps_sessions_first_and_adds_info_and_files_from_plus()
         theme::set_active_variant(variant);
         visual.refresh().unwrap();
         visual.run_until_parked();
-        assert_fill_color(&mut visual, "PANEL_TAB Sessions", Some(theme::raised()));
-        assert_text(&mut visual, "PANEL_TAB_INK Sessions", theme::text());
+        assert_fill_color(
+            &mut visual,
+            "PANEL_ACTIVITY Sessions",
+            Some(theme::raised()),
+        );
+        assert_fill_color(&mut visual, "PANEL_ACTIVITY Files", None);
     }
 
-    // `+` offers Info, Files and Changes, never Sessions, with nothing checked.
-    click(&mut visual, "PANEL_ADD_SURFACE");
-    assert!(visual.debug_bounds("PANEL_MENU_ROW Info").is_some());
-    assert!(visual.debug_bounds("PANEL_MENU_ROW Files").is_some());
-    assert!(visual.debug_bounds("PANEL_MENU_ROW Changes").is_some());
-    assert!(visual.debug_bounds("PANEL_MENU_ROW Sessions").is_none());
-    assert!(visual.debug_bounds("PANEL_MENU_CHECK Info").is_none());
-    click(&mut visual, "PANEL_MENU_ROW Files");
-    assert!(
-        visual.debug_bounds("PANEL_MENU_ROW Files").is_none(),
-        "closed"
-    );
+    // One click switches to Files; one click switches to Changes; one click returns to Sessions.
+    click(&mut visual, "PANEL_ACTIVITY Files");
     let context = PanelContext {
         subject: PanelSubject::Mission("test-mission".into()),
         surface: crate::surfaces::side_panel::PanelSurface::Mission,
         cwd: Some("/tmp/panel-mission".into()),
         project: None,
         remote: false,
+        following: None,
     };
     assert!(visual
         .debug_bounds(format!("FILES_VIEW {context:?}").leak())
         .is_some());
     assert!(visual.debug_bounds("MISSION_ROLES_SCROLL").is_none());
-    let sessions = visual.debug_bounds("PANEL_TAB Sessions").unwrap();
-    let files = visual.debug_bounds("PANEL_TAB Files").unwrap();
-    assert!(sessions.right() < files.left());
-    assert!(visual.debug_bounds("PANEL_TAB_CLOSE Files").is_some());
+    assert!(visual.debug_bounds("PANEL_ACTIVITY_BAR Files").is_some());
     for variant in [
         theme::ThemeVariant::Carbon,
         theme::ThemeVariant::RunnerLight,
@@ -1898,43 +1901,24 @@ fn mission_panel_header_keeps_sessions_first_and_adds_info_and_files_from_plus()
         theme::set_active_variant(variant);
         visual.refresh().unwrap();
         visual.run_until_parked();
-        assert_fill_color(&mut visual, "PANEL_TAB Sessions", None);
-        assert_fill_color(&mut visual, "PANEL_TAB Files", Some(theme::raised()));
-        assert_text(&mut visual, "PANEL_TAB_INK Sessions", theme::muted());
+        assert_fill_color(&mut visual, "PANEL_ACTIVITY Sessions", None);
+        assert_fill_color(&mut visual, "PANEL_ACTIVITY Files", Some(theme::raised()));
     }
 
-    // Info opens after Files; Sessions switches back; closing returns to
-    // the tab before, and the first closable one to Sessions.
-    click(&mut visual, "PANEL_ADD_SURFACE");
-    assert!(visual.debug_bounds("PANEL_MENU_CHECK Files").is_some());
-    click(&mut visual, "PANEL_MENU_ROW Info");
-    assert!(visual.debug_bounds("MISSION_META_SCROLL").is_some());
-    let files = visual.debug_bounds("PANEL_TAB Files").unwrap();
-    let info = visual.debug_bounds("PANEL_TAB Info").unwrap();
-    assert!(
-        files.right() < info.left(),
-        "tabs keep the order they opened"
-    );
-    click(&mut visual, "PANEL_TAB Sessions");
-    assert!(visual.debug_bounds("MISSION_ROLES_SCROLL").is_some());
-    click(&mut visual, "PANEL_TAB Info");
-    click(&mut visual, "PANEL_TAB_CLOSE Info");
-    assert!(visual.debug_bounds("PANEL_TAB Info").is_none());
+    click(&mut visual, "PANEL_ACTIVITY Changes");
     assert!(visual
-        .debug_bounds(format!("FILES_VIEW {context:?}").leak())
+        .debug_bounds(format!("CHANGES_VIEW {context:?}").leak())
         .is_some());
-    click(&mut visual, "PANEL_TAB_CLOSE Files");
-    assert!(visual.debug_bounds("MISSION_ROLES_SCROLL").is_some());
-    assert!(visual.debug_bounds("PANEL_EMPTY").is_none(), "never empty");
+    assert!(visual.debug_bounds("PANEL_ACTIVITY_BAR Changes").is_some());
 
-    // Settings → Side panel turning Info, Files and Changes off leaves Sessions,
-    // with no `+`, and closes an open Files tab.
-    click(&mut visual, "PANEL_ADD_SURFACE");
-    click(&mut visual, "PANEL_MENU_ROW Files");
+    click(&mut visual, "PANEL_ACTIVITY Sessions");
+    assert!(visual.debug_bounds("MISSION_ROLES_SCROLL").is_some());
+
+    // Settings → Side panel turning Files and Changes off leaves Sessions alone.
+    click(&mut visual, "PANEL_ACTIVITY Files");
     store.update(&mut visual, |store, cx| {
         store.update_settings(
             |settings| {
-                settings.info_view = false;
                 settings.files_view = false;
                 settings.changes_view = false;
                 true
@@ -1945,13 +1929,16 @@ fn mission_panel_header_keeps_sessions_first_and_adds_info_and_files_from_plus()
     });
     visual.refresh().unwrap();
     visual.run_until_parked();
-    assert!(visual.debug_bounds("PANEL_TAB Sessions").is_some());
-    assert!(visual.debug_bounds("PANEL_TAB Files").is_none());
-    assert!(visual.debug_bounds("PANEL_ADD_SURFACE").is_none());
+    assert!(visual
+        .debug_bounds("PANEL_ACTIVITY Sessions active")
+        .is_some());
+    assert!(visual.debug_bounds("PANEL_ACTIVITY Files").is_none());
+    assert!(visual.debug_bounds("PANEL_ACTIVITY Changes").is_none());
+    assert!(visual.debug_bounds("MISSION_ROLES_SCROLL").is_some());
+
     store.update(&mut visual, |store, cx| {
         store.update_settings(
             |settings| {
-                settings.info_view = true;
                 settings.files_view = true;
                 settings.changes_view = true;
                 true
@@ -1962,15 +1949,12 @@ fn mission_panel_header_keeps_sessions_first_and_adds_info_and_files_from_plus()
     });
     visual.refresh().unwrap();
     visual.run_until_parked();
-    assert!(
-        visual.debug_bounds("PANEL_TAB Files").is_none(),
-        "turning Files back on does not reopen its tab"
-    );
-    assert!(visual.debug_bounds("MISSION_ROLES_SCROLL").is_some());
+    assert!(visual.debug_bounds("PANEL_ACTIVITY Files").is_some());
+    assert!(visual.debug_bounds("PANEL_ACTIVITY Changes").is_some());
 }
 
 #[test]
-fn mission_panel_header_keeps_plus_and_collapse_in_a_narrow_rail_in_both_locales() {
+fn mission_panel_activity_bar_fits_in_a_narrow_rail_in_both_locales() {
     use crate::i18n::{testing::with_locale, Locale};
     use crate::surfaces::side_panel::PanelViewId;
     use gpui::{Modifiers, TestAppContext, VisualTestContext};
@@ -1984,8 +1968,7 @@ fn mission_panel_header_keeps_plus_and_collapse_in_a_narrow_rail_in_both_locales
             visual.simulate_resize(size(px(960.), px(600.)));
             host.update(&mut visual, |host, _, cx| {
                 host.workspace.update(cx, |workspace, _| {
-                    workspace.rail_surfaces.open.open(PanelViewId::Files);
-                    workspace.rail_surfaces.open.open(PanelViewId::Info);
+                    workspace.rail_surfaces.select(PanelViewId::Files);
                 });
                 cx.notify();
             })
@@ -1998,33 +1981,25 @@ fn mission_panel_header_keeps_plus_and_collapse_in_a_narrow_rail_in_both_locales
                 .unwrap();
                 visual.run_until_parked();
                 let rail = visual.debug_bounds("MISSION_RAIL").unwrap();
-                let close = visual.debug_bounds("PANEL_TAB_CLOSE Info").unwrap();
-                let add = visual.debug_bounds("PANEL_ADD_SURFACE").unwrap();
+                let sessions = visual.debug_bounds("PANEL_ACTIVITY Sessions").unwrap();
+                let files = visual.debug_bounds("PANEL_ACTIVITY Files active").unwrap();
+                let changes = visual.debug_bounds("PANEL_ACTIVITY Changes").unwrap();
                 let collapse = visual.debug_bounds("PANEL_COLLAPSE").unwrap();
-                assert!(
-                    close.right() <= add.left(),
-                    "{locale:?} {width}: the shown tab's × before `+`: {close:?} {add:?}"
-                );
-                assert!(add.right() <= collapse.left(), "{locale:?} {width}");
+                assert!(sessions.left() >= rail.left(), "{locale:?} {width}");
+                assert!(sessions.right() < files.left(), "{locale:?} {width}");
+                assert!(files.right() < changes.left(), "{locale:?} {width}");
+                assert!(changes.right() <= collapse.left(), "{locale:?} {width}");
                 assert!(
                     collapse.right() <= rail.right(),
                     "{locale:?} {width}: {collapse:?} {rail:?}"
                 );
-                assert_eq!(add.size.width, px(24.), "{locale:?} {width}");
-                // `+` still opens its menu, and Sessions still switches.
-                visual.simulate_click(add.center(), Modifiers::default());
-                visual.run_until_parked();
-                assert!(visual.debug_bounds("PANEL_MENU_ROW Files").is_some());
-                visual.simulate_keystrokes("escape");
-                let sessions = visual.debug_bounds("PANEL_TAB Sessions").unwrap();
-                assert!(sessions.left() >= rail.left(), "{locale:?} {width}");
                 visual.simulate_click(sessions.center(), Modifiers::default());
                 visual.run_until_parked();
                 assert!(visual.debug_bounds("MISSION_ROLES_SCROLL").is_some());
-                let info = visual.debug_bounds("PANEL_TAB Info").unwrap();
-                visual.simulate_click(info.center(), Modifiers::default());
+                let files = visual.debug_bounds("PANEL_ACTIVITY Files").unwrap();
+                visual.simulate_click(files.center(), Modifiers::default());
                 visual.run_until_parked();
-                assert!(visual.debug_bounds("MISSION_META_SCROLL").is_some());
+                assert!(visual.debug_bounds("PANEL_ACTIVITY Files active").is_some());
             }
         });
     }
@@ -2034,10 +2009,15 @@ impl gpui::Render for MissionRailLayoutTest {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let rail = self.workspace.update(cx, |workspace, cx| {
             let layout = match self.width {
-                Some(width) => (width, None),
+                Some(width) => crate::surfaces::side_panel::PanelLayout {
+                    width,
+                    widened: None,
+                    presentation: crate::surfaces::side_panel::PanelPresentation::Docked,
+                    reserved_docked_width: 0.,
+                },
                 None => workspace.rail_layout(cx),
             };
-            workspace.render_mission_rail(layout, 1., true, window, cx)
+            workspace.render_mission_rail(layout, layout.width, 1., true, window, cx)
         });
         let handle_text = |selector: &'static str, text: &'static str| {
             div()
@@ -2076,6 +2056,14 @@ impl gpui::Render for MissionRailLayoutTest {
                         .text_size(theme::text_caption())
                         .line_height(gpui::rems(14. / 16.))
                         .child("01a119c9\n-4714-70"),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "RAIL_FULL_RUNTIME".into())
+                        .flex_none()
+                        .text_size(theme::text_meta())
+                        .line_height(gpui::rems(14. / 16.))
+                        .child("Codex · a-very-long-model-name-that-must-truncate · Extra high"),
                 )
                 .child(
                     div()
@@ -2179,6 +2167,9 @@ fn mission_rail_long_values_truncate_without_overlapping_fixed_controls() {
                     role_handle: "role".into(),
                     lead,
                     runtime: "codex".into(),
+                    agent_model: (id != "short")
+                        .then(|| "a-very-long-model-name-that-must-truncate".into()),
+                    agent_effort: (id != "short").then(|| "xhigh".into()),
                     live_title: None,
                     agent_session_key: (id != "short").then(|| session_key.into()),
                 })
@@ -2205,21 +2196,46 @@ fn mission_rail_long_values_truncate_without_overlapping_fixed_controls() {
         cx.run_until_parked();
         let full = visual.debug_bounds("RAIL_FULL_HANDLE").unwrap();
         let prefix = visual.debug_bounds("RAIL_VISIBLE_PREFIX").unwrap();
-        for (card_selector, handle_selector, controls_selector) in [
+        let full_runtime = visual.debug_bounds("RAIL_FULL_RUNTIME").unwrap();
+        for (
+            card_selector,
+            handle_selector,
+            status_selector,
+            controls_selector,
+            runtime_selector,
+            runtime_mark_selector,
+            runtime_text_selector,
+            key_selector,
+        ) in [
             (
                 "MISSION_CARD lead",
                 "MISSION_CARD_HANDLE lead",
+                "MISSION_CARD_STATUS lead",
                 "MISSION_CARD_CONTROLS lead",
+                "MISSION_CARD_RUNTIME lead",
+                "MISSION_CARD_RUNTIME_MARK lead",
+                "MISSION_CARD_RUNTIME_TEXT lead",
+                "MISSION_CARD_KEY lead",
             ),
             (
                 "MISSION_CARD worker",
                 "MISSION_CARD_HANDLE worker",
+                "MISSION_CARD_STATUS worker",
                 "MISSION_CARD_CONTROLS worker",
+                "MISSION_CARD_RUNTIME worker",
+                "MISSION_CARD_RUNTIME_MARK worker",
+                "MISSION_CARD_RUNTIME_TEXT worker",
+                "MISSION_CARD_KEY worker",
             ),
         ] {
             let card = visual.debug_bounds(card_selector).unwrap();
             let handle = visual.debug_bounds(handle_selector).unwrap();
+            let status = visual.debug_bounds(status_selector).unwrap();
             let controls = visual.debug_bounds(controls_selector).unwrap();
+            let runtime = visual.debug_bounds(runtime_selector).unwrap();
+            let runtime_mark = visual.debug_bounds(runtime_mark_selector).unwrap();
+            let runtime_text = visual.debug_bounds(runtime_text_selector).unwrap();
+            let key = visual.debug_bounds(key_selector).unwrap();
             assert!(
                 handle.size.width >= prefix.size.width,
                 "handle cannot retain its first character at rail width {width}: {handle:?}, prefix {prefix:?}"
@@ -2233,6 +2249,14 @@ fn mission_rail_long_values_truncate_without_overlapping_fixed_controls() {
                 "handle overlaps controls at rail width {width}"
             );
             assert!(
+                status.top() >= handle.bottom(),
+                "status should sit below handle at rail width {width}: handle {handle:?}, status {status:?}"
+            );
+            assert!(
+                status.right() <= controls.left(),
+                "status overlaps controls at rail width {width}: status {status:?}, controls {controls:?}"
+            );
+            assert!(
                 controls.right() <= card.right(),
                 "controls overflow at rail width {width}"
             );
@@ -2240,6 +2264,35 @@ fn mission_rail_long_values_truncate_without_overlapping_fixed_controls() {
                 controls.size.width,
                 px(80.),
                 "controls shrank at rail width {width}"
+            );
+            assert!(
+                runtime.top() >= status.bottom(),
+                "runtime line should sit below header status at rail width {width}: status {status:?}, runtime {runtime:?}"
+            );
+            assert!(
+                runtime.bottom() <= key.top(),
+                "runtime line should sit above session_key at rail width {width}: runtime {runtime:?}, key {key:?}"
+            );
+            assert!(
+                runtime.right() <= card.right(),
+                "runtime line overflows card at rail width {width}: runtime {runtime:?}, card {card:?}"
+            );
+            assert_eq!(
+                runtime_mark.size,
+                size(px(12.), px(12.)),
+                "runtime mark should stay 12px at rail width {width}: {runtime_mark:?}"
+            );
+            assert!(
+                runtime_text.size.width < full_runtime.size.width,
+                "long runtime line did not truncate at rail width {width}: {runtime_text:?}"
+            );
+            assert_eq!(
+                runtime_text.size.height, full_runtime.size.height,
+                "runtime line wrapped to multiple lines at rail width {width}: {runtime_text:?}"
+            );
+            assert!(
+                runtime_text.right() <= card.right(),
+                "runtime text overflows card at rail width {width}: {runtime_text:?}, card {card:?}"
             );
             if handle_selector == "MISSION_CARD_HANDLE lead" {
                 let avatar = visual.debug_bounds("MISSION_CARD_AVATAR lead").unwrap();
@@ -2251,6 +2304,10 @@ fn mission_rail_long_values_truncate_without_overlapping_fixed_controls() {
                     avatar.size.width,
                     px(25.),
                     "avatar shrank at rail width {width}"
+                );
+                assert!(
+                    status.left() >= avatar.right(),
+                    "status should sit beside avatar at rail width {width}: avatar {avatar:?}, status {status:?}"
                 );
             }
         }
@@ -2315,6 +2372,15 @@ fn mission_rail_long_values_truncate_without_overlapping_fixed_controls() {
             px(14.),
             "NULL gained a line at rail width {width}"
         );
+        assert_eq!(
+            visual
+                .debug_bounds("MISSION_CARD short")
+                .unwrap()
+                .size
+                .height,
+            px(108.),
+            "single-line NULL key card should match the spec's 108 px height at rail width {width}"
+        );
         for status in [MissionStatus::Running, MissionStatus::Completed] {
             let (short_handle, reference) = if status == MissionStatus::Running && width < 239. {
                 ("a", "RAIL_SHORTEST_LEAD_HANDLE")
@@ -2353,28 +2419,6 @@ fn mission_rail_long_values_truncate_without_overlapping_fixed_controls() {
                 status == MissionStatus::Running
             );
         }
-        host.update(&mut visual, |host, _, cx| {
-            host.workspace.update(cx, |workspace, cx| {
-                let mission_id = "01M4CWJGAR56HCBK0RNRQS8DV0";
-                workspace.mission.as_mut().unwrap().id = mission_id.into();
-                workspace.mission_id_copy.update(cx, |copy, cx| {
-                    copy.set_value(Some(mission_id.into()), cx);
-                });
-                workspace.rail_surfaces.open.open(PanelViewId::Info);
-            });
-            cx.notify();
-        })
-        .unwrap();
-        cx.run_until_parked();
-        assert!(
-            visual.debug_bounds("MISSION_META_ID").unwrap().size.height
-                <= visual
-                    .debug_bounds("RAIL_TWO_LINE_MISSION_ID")
-                    .unwrap()
-                    .size
-                    .height,
-            "mission ID exceeds two lines at rail width {width}"
-        );
     }
 }
 
@@ -4682,6 +4726,8 @@ fn osc52_visibility_follows_the_mission_terminals_a_window_draws() {
                 role_handle: String::new(),
                 lead: true,
                 runtime: "shell".into(),
+                agent_model: None,
+                agent_effort: None,
                 live_title: None,
                 agent_session_key: None,
             }];
@@ -4757,7 +4803,7 @@ fn a_file_link_in_a_mission_terminal_opens_the_rails_preview() {
     std::fs::write(&outside, "x\n").unwrap();
     let mut cx = TestAppContext::single();
     let store = crate::app_store::test_lifecycle_store(&mut cx, temp.path());
-    store.update(&mut cx, |store, cx| {
+    store.update(&mut cx, |store, _| {
         crate::app_store::seed_mixed_working_sessions(store);
         store
             .test_core
@@ -4769,14 +4815,6 @@ fn a_file_link_in_a_mission_terminal_opens_the_rails_preview() {
                 [root.to_string_lossy()],
             )
             .unwrap();
-        store.update_settings(
-            |settings| {
-                settings.mission_rail_open = false;
-                true
-            },
-            false,
-            cx,
-        );
     });
     let mission = store.read_with(&cx, |store, _| {
         runner_daemon::ops::mission::mission_get(&store.test_core, "test-mission").unwrap()
@@ -4847,37 +4885,34 @@ fn a_file_link_in_a_mission_terminal_opens_the_rails_preview() {
     assert_eq!(launched(), 0);
     assert!(workspace.read_with(&visual, |workspace, cx| workspace.rail_is_open(cx)));
     assert_eq!(
-        workspace.read_with(&visual, |workspace, _| workspace.rail_surfaces.open.clone()),
-        {
-            let mut files = crate::surfaces::side_panel::OpenSurfaces::default();
-            files.open(PanelViewId::Files);
-            files
-        },
-        "the closed Files tab opens"
+        workspace.read_with(&visual, |workspace, _| workspace.rail_surfaces.selection),
+        crate::surfaces::side_panel::PanelSelection::new(PanelViewId::Files),
+        "opening a file link selects Files"
     );
 
-    // Opening a file widens the rail across surfaces and after closing Files;
-    // resetting the mission's surface state starts back at standard width,
-    // while keeping the file's tab for when Files opens again.
+    // Opening a file widens the rail while Files is active; switching to Sessions
+    // returns to compact 300 px while keeping the file tab for when Files returns.
     let widened = |visual: &mut gpui::VisualTestContext| {
         workspace.read_with(visual, |workspace, cx| {
-            workspace.rail_layout(cx).1.is_some()
+            workspace.rail_layout(cx).widened.is_some()
         })
     };
     assert!(widened(&mut visual));
     workspace.update(&mut visual, |workspace, _| {
-        workspace.rail_surfaces.open.select(PanelViewId::Sessions)
+        workspace.rail_surfaces.select(PanelViewId::Sessions)
     });
-    assert!(widened(&mut visual), "another surface showing");
+    assert!(!widened(&mut visual), "Sessions stays compact at 300 px");
     workspace.update(&mut visual, |workspace, _| {
-        workspace.rail_surfaces.open.close(PanelViewId::Files, true)
+        workspace.rail_surfaces.select(PanelViewId::Files);
     });
-    assert!(widened(&mut visual), "Files closed keeps the widened rail");
+    assert!(
+        widened(&mut visual),
+        "returning to Files restores widened file viewer"
+    );
     workspace.update(&mut visual, |workspace, _| {
-        workspace.rail_surfaces.open.open(PanelViewId::Files);
         workspace.rail_surfaces.reset(Default::default());
     });
-    assert!(!widened(&mut visual), "the surface list reset");
+    assert!(!widened(&mut visual), "reset returns to compact Sessions");
     assert!(workspace.read_with(&visual, |workspace, cx| {
         workspace
             .rail_files
@@ -4886,7 +4921,7 @@ fn a_file_link_in_a_mission_terminal_opens_the_rails_preview() {
             == Some("lib.rs".into())
     }));
     workspace.update(&mut visual, |workspace, _| {
-        workspace.rail_surfaces.open.open(PanelViewId::Files)
+        workspace.rail_surfaces.select(PanelViewId::Files)
     });
     assert!(widened(&mut visual), "Files reopened, with its file");
 
@@ -5049,10 +5084,14 @@ fn maximized_mission_rail_hides_center_toggles_on_shortcut_and_restores_when_sel
     let mut visual = gpui::VisualTestContext::from_window(host.into(), &cx);
     visual.run_until_parked();
 
-    let max_btn = visual
-        .debug_bounds("SIDE_PANEL_MAXIMIZE")
-        .expect("mission rail maximize button");
-    visual.simulate_click(max_btn.center(), Default::default());
+    // Compact 300 px Sessions hides Maximize until widened or maximized via ⇧⌘↩.
+    assert!(visual.debug_bounds("SIDE_PANEL_MAXIMIZE").is_none());
+    host.update(&mut visual, |root, window, cx| {
+        let focus = root.mission_workspace.read(cx).rail_focus.clone();
+        focus.focus(window, cx);
+    })
+    .unwrap();
+    visual.dispatch_action(crate::ToggleMaximizePane);
     visual.run_until_parked();
 
     host.read_with(&visual, |root, cx| {
@@ -5124,7 +5163,7 @@ fn maximized_mission_rail_hides_center_toggles_on_shortcut_and_restores_when_sel
 
 #[cfg(unix)]
 #[test]
-fn mission_rail_retains_widened_width_across_surfaces_closes_and_divider_drag() {
+fn mission_rail_progressively_widens_on_file_or_diff_and_shrinks_back_to_300px() {
     use std::process::Command;
 
     let _theme = crate::theme_snapshot::ThemeGuard::new();
@@ -5172,6 +5211,12 @@ fn mission_rail_retains_widened_width_across_surfaces_closes_and_divider_drag() 
             .unwrap()
             .success());
     }
+    // Modify lib.rs so Changes has an uncommitted diff to open.
+    std::fs::write(
+        repo.join("lib.rs"),
+        "pub fn mission() { println!(\"ok\"); }\n",
+    )
+    .unwrap();
     let canonical = repo.canonicalize().unwrap();
     host.update(&mut cx, |root, window, cx| {
         root.app_store.update(cx, |store, cx| {
@@ -5212,104 +5257,78 @@ fn mission_rail_retains_widened_width_across_surfaces_closes_and_divider_drag() 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         while !ready(visual) {
             assert!(std::time::Instant::now() < deadline, "timed out: {what}");
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::yield_now();
+            visual.update(|window, _| window.refresh());
             visual.run_until_parked();
         }
     };
 
-    // Fresh mission rail starts at standard 288 px (single-column session cards).
-    assert!((rail_width(&mut visual) - 288.).abs() <= 1.);
+    // Fresh mission rail starts compact at 300 px on Sessions (single-column session cards).
+    assert!((rail_width(&mut visual) - 300.).abs() <= 1.);
+    // Mission activity bar is 40 px tall, and a fresh mission opened on Sessions probes the git
+    // checkout directly so PANEL_CHANGES_DIRTY_DOT appears without ever opening Files/Changes.
+    let rail_header = visual.debug_bounds("MISSION_RAIL_HEADER").unwrap();
+    assert!(
+        (f32::from(rail_header.size.height) - 40.).abs() <= 1.,
+        "mission activity bar height must be 40 px: {rail_header:?}"
+    );
+    wait(&mut visual, "fresh mission dirty dot on Sessions", &|v| {
+        v.debug_bounds("PANEL_CHANGES_DIRTY_DOT").is_some()
+    });
     let card_agent = visual.debug_bounds("MISSION_CARD mission-agent").unwrap();
     let card_shell = visual.debug_bounds("MISSION_CARD mission-shell").unwrap();
     assert!(card_agent.top() < card_shell.top());
 
-    // Opening Changes widens to 680 px; switching to Sessions/Info and closing Changes retains 680 px and two-up cards.
-    click(&mut visual, "PANEL_ADD_SURFACE");
-    click(&mut visual, "PANEL_MENU_ROW Changes");
-    wait(&mut visual, "Changes widens rail", &|v| {
-        (rail_width(v) - 680.).abs() <= 1.
+    // Clicking Changes stays compact at 300 px (C1 list-only) until a changed file is clicked,
+    // which widens smoothly to the signed-off ~740 px (500 diff + 240 list).
+    click(&mut visual, "PANEL_ACTIVITY Changes");
+    wait(&mut visual, "Changes list loaded", &|v| {
+        v.debug_bounds("CHANGES_ROW lib.rs").is_some()
     });
-    click(&mut visual, "PANEL_TAB Sessions");
-    assert!((rail_width(&mut visual) - 680.).abs() <= 1.);
-    let card_agent = visual.debug_bounds("MISSION_CARD mission-agent").unwrap();
-    let card_shell = visual.debug_bounds("MISSION_CARD mission-shell").unwrap();
-    assert_eq!(card_agent.top(), card_shell.top(), "two-up session cards");
-
-    click(&mut visual, "PANEL_ADD_SURFACE");
-    click(&mut visual, "PANEL_MENU_ROW Info");
-    assert!((rail_width(&mut visual) - 680.).abs() <= 1.);
-    click(&mut visual, "PANEL_TAB Changes");
-    click(&mut visual, "PANEL_TAB_CLOSE Changes");
-    assert!((rail_width(&mut visual) - 680.).abs() <= 1.);
-    click(&mut visual, "PANEL_TAB Info");
-    click(&mut visual, "PANEL_TAB_CLOSE Info");
-    assert!((rail_width(&mut visual) - 680.).abs() <= 1.);
-
-    // Resetting surfaces returns to 288 px; opening Files, closing the last file tab, and closing Files retains 680 px.
-    host.update(&mut visual, |root, _, cx| {
-        root.mission_workspace.update(cx, |ws, cx| {
-            ws.rail_surfaces.reset(Default::default());
-            cx.notify();
-        });
-    })
-    .unwrap();
-    visual.run_until_parked();
-    assert!((rail_width(&mut visual) - 288.).abs() <= 1.);
-
-    click(&mut visual, "PANEL_ADD_SURFACE");
-    click(&mut visual, "PANEL_MENU_ROW Files");
-    wait(&mut visual, "Files widens rail", &|v| {
-        v.debug_bounds("FILES_ROW lib.rs").is_some() && (rail_width(v) - 680.).abs() <= 1.
+    assert!((rail_width(&mut visual) - 300.).abs() <= 1.);
+    click(&mut visual, "CHANGES_ROW lib.rs");
+    wait(&mut visual, "Changes diff widens rail to 740 px", &|v| {
+        v.debug_bounds("CHANGES_CLOSE_DIFF").is_some() && (rail_width(v) - 740.).abs() <= 1.
     });
+    click(&mut visual, "CHANGES_CLOSE_DIFF");
+    wait(&mut visual, "Changes diff closes back to 300 px", &|v| {
+        v.debug_bounds("CHANGES_CLOSE_DIFF").is_none() && (rail_width(v) - 300.).abs() <= 1.
+    });
+
+    // Clicking Files stays compact at 300 px until clicking lib.rs widens smoothly to 680 px;
+    // tree toggle narrows to 440 px; dragging the rail gutter saves file_viewer_width;
+    // closing the last file tab shrinks back to 300 px.
+    click(&mut visual, "PANEL_ACTIVITY Files");
+    wait(&mut visual, "Files tree loaded", &|v| {
+        v.debug_bounds("FILES_ROW lib.rs").is_some()
+    });
+    assert!((rail_width(&mut visual) - 300.).abs() <= 1.);
     click(&mut visual, "FILES_ROW lib.rs");
-    wait(&mut visual, "lib.rs open", &|v| {
-        v.debug_bounds("FILE_CODE").is_some()
-    });
-    click(&mut visual, "FILE_TAB_CLOSE lib.rs");
-    assert!((rail_width(&mut visual) - 680.).abs() <= 1.);
-
-    // Combined Files (open file + tree hidden = 440 px) -> Changes (680 px) -> Sessions/Info & close Changes:
-    // inactive Files must not shrink the rail back to 440 px, and outer divider drags smoothly from 680 px.
-    wait(&mut visual, "main.rs row", &|v| {
-        v.debug_bounds("FILES_ROW main.rs").is_some()
-    });
-    click(&mut visual, "FILES_ROW main.rs");
-    wait(&mut visual, "main.rs open", &|v| {
-        v.debug_bounds("FILE_CODE").is_some()
+    wait(
+        &mut visual,
+        "lib.rs opens and widens rail to 680 px",
+        &|v| v.debug_bounds("FILE_CODE").is_some() && (rail_width(v) - 680.).abs() <= 1.,
+    );
+    click(&mut visual, "FILE_TREE_TOGGLE");
+    wait(&mut visual, "hiding tree narrows rail to 440 px", &|v| {
+        (rail_width(v) - 440.).abs() <= 1.
     });
     click(&mut visual, "FILE_TREE_TOGGLE");
-    assert!((rail_width(&mut visual) - 440.).abs() <= 1.);
-    click(&mut visual, "PANEL_ADD_SURFACE");
-    click(&mut visual, "PANEL_MENU_ROW Info");
-    assert!((rail_width(&mut visual) - 440.).abs() <= 1.);
-    click(&mut visual, "PANEL_ADD_SURFACE");
-    click(&mut visual, "PANEL_MENU_ROW Changes");
-    wait(&mut visual, "Changes widens rail back to 680", &|v| {
-        (rail_width(v) - 680.).abs() <= 1.
+    wait(&mut visual, "showing tree widens rail to 680 px", &|v| {
+        (rail_width(v) - 680.).abs() <= 0.5
+            && host
+                .read_with(v, |r, cx| {
+                    r.mission_workspace
+                        .read(cx)
+                        .rail_width_anim
+                        .started_at
+                        .is_none()
+                })
+                .unwrap()
     });
-    click(&mut visual, "PANEL_TAB Sessions");
-    assert!((rail_width(&mut visual) - 680.).abs() <= 1.);
-    click(&mut visual, "PANEL_TAB Info");
-    assert!((rail_width(&mut visual) - 680.).abs() <= 1.);
-    click(&mut visual, "PANEL_TAB Changes");
-    click(&mut visual, "PANEL_TAB_CLOSE Changes");
-    assert!((rail_width(&mut visual) - 680.).abs() <= 1.);
-    click(&mut visual, "PANEL_TAB Sessions");
-    assert!((rail_width(&mut visual) - 680.).abs() <= 1.);
 
-    // Dragging the outer rail divider on Sessions (with tree-hidden Files still open behind it)
-    // resizes smoothly without snapping to 440 px or 480 px.
     let start = visual.debug_bounds("MISSION_RAIL_GUTTER").unwrap().center();
     visual.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
-    for _ in 0..3 {
-        visual.simulate_mouse_move(
-            start + gpui::point(px(60.), px(0.)),
-            Some(gpui::MouseButton::Left),
-            gpui::Modifiers::default(),
-        );
-        visual.run_until_parked();
-    }
-    assert!((rail_width(&mut visual) - 620.).abs() <= 1.);
     for _ in 0..3 {
         visual.simulate_mouse_move(
             start + gpui::point(px(-40.), px(0.)),
@@ -5326,23 +5345,359 @@ fn mission_rail_retains_widened_width_across_surfaces_closes_and_divider_drag() 
     visual.run_until_parked();
     assert!((rail_width(&mut visual) - 720.).abs() <= 1.);
 
-    // Explicitly showing Files reflects its tree-hidden toggle (480 px) and toggling tree back on restores 720 px.
-    click(&mut visual, "PANEL_TAB Files");
-    assert!((rail_width(&mut visual) - 480.).abs() <= 1.);
-    click(&mut visual, "FILE_TREE_TOGGLE");
-    assert!((rail_width(&mut visual) - 720.).abs() <= 1.);
-    click(&mut visual, "PANEL_TAB_CLOSE Files");
-    assert!((rail_width(&mut visual) - 720.).abs() <= 1.);
-
     // Narrowing the window preserves MAIN_MIN_WIDTH = 420 px for the mission column.
     visual.simulate_resize(gpui::size(px(1260.), px(900.)));
-    visual.run_until_parked();
-    let mission_col = visual.debug_bounds("MISSION_COLUMN").unwrap();
-    assert!(
-        f32::from(mission_col.size.width) >= 419.5,
-        "mission column preserves MAIN_MIN_WIDTH: {mission_col:?}"
+    wait(
+        &mut visual,
+        "mission column preserves MAIN_MIN_WIDTH",
+        &|v| {
+            v.debug_bounds("MISSION_COLUMN")
+                .is_some_and(|c| f32::from(c.size.width) >= 419.5)
+        },
     );
     assert!(rail_width(&mut visual) > 528.);
+
+    // Closing the last file tab shrinks smoothly back to 300 px.
+    click(&mut visual, "FILE_TAB_CLOSE lib.rs");
+    wait(&mut visual, "closing file shrinks rail to 300 px", &|v| {
+        (rail_width(v) - 300.).abs() <= 1.
+    });
+
+    host.update(&mut visual, |_, window, _| window.remove_window())
+        .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn sessions_dirty_dot_watches_main_checkout_clean_dirty_clean_and_releases_watch() {
+    use runner_core::protocol::files::{
+        FilesChanged, FilesStatusChanged, FILES_CHANGED_EVENT, FILES_STATUS_EVENT,
+    };
+    use std::process::Command;
+
+    let _theme = crate::theme_snapshot::ThemeGuard::new();
+    let (temp, mut cx, host, _fake) = suspended_mission_test();
+    let repo = temp.path().join("mission-main-watch");
+    std::fs::create_dir_all(&repo).unwrap();
+    for args in [
+        &["init", "-q", "-b", "main"][..],
+        &["config", "core.autocrlf", "false"][..],
+    ] {
+        assert!(Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .status()
+            .unwrap()
+            .success());
+    }
+    std::fs::write(repo.join("lib.rs"), "pub fn clean() {}\n").unwrap();
+    for args in [
+        &["add", "-A"][..],
+        &[
+            "-c",
+            "user.name=Runner",
+            "-c",
+            "user.email=runner@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ][..],
+    ] {
+        assert!(Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .status()
+            .unwrap()
+            .success());
+    }
+    let canonical = if cfg!(windows) {
+        repo.clone()
+    } else {
+        repo.canonicalize().unwrap()
+    };
+    let store = host
+        .read_with(&cx, |root, _| root.app_store.clone())
+        .unwrap();
+    let events = store.read_with(&cx, |store, _| store.test_core.events.clone());
+    let mut sent = events.subscribe();
+
+    host.update(&mut cx, |root, window, cx| {
+        root.app_store.update(cx, |store, cx| {
+            store
+                .test_core
+                .db
+                .get()
+                .unwrap()
+                .execute(
+                    "UPDATE missions SET cwd = ?1, files_root = ?1 WHERE id = 'test-mission'",
+                    [canonical.to_string_lossy().as_ref()],
+                )
+                .unwrap();
+            store.refresh(crate::app_store::StoreRefreshKind::All, cx);
+        });
+        root.open_mission("test-mission".into(), window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let mut visual = gpui::VisualTestContext::from_window(host.into(), &cx);
+    visual.simulate_resize(gpui::size(px(1600.), px(900.)));
+    visual.run_until_parked();
+
+    let wait = |visual: &mut gpui::VisualTestContext,
+                what: &str,
+                ready: &dyn Fn(&mut gpui::VisualTestContext) -> bool| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !ready(visual) {
+            assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+            std::thread::yield_now();
+            visual.update(|window, _| window.refresh());
+            visual.run_until_parked();
+        }
+    };
+    let watched_roots = |visual: &gpui::VisualTestContext| {
+        store.read_with(visual, |store, _| store.test_core.files.watched_roots())
+    };
+
+    // 1. Mission opens on Sessions on a clean main checkout: DirtyTracker acquires a daemon watch
+    // and delivers its startup status event (subscribed before open_mission).
+    wait(
+        &mut visual,
+        "Sessions tracker watches main checkout",
+        &|v| {
+            watched_roots(v)
+                .iter()
+                .any(|p| runner_core::app_paths::same_checkout_path(p, &canonical))
+        },
+    );
+    let mut saw_startup = false;
+    let watcher_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::time::Instant::now() < watcher_deadline && !saw_startup {
+        visual.run_until_parked();
+        loop {
+            match sent.try_recv() {
+                Ok(event) if event.name == FILES_STATUS_EVENT => {
+                    if serde_json::from_value::<FilesStatusChanged>(event.payload).is_ok_and(
+                        |update| {
+                            runner_core::app_paths::same_checkout_path(&update.root, &canonical)
+                        },
+                    ) {
+                        saw_startup = true;
+                        break;
+                    }
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(_) => break,
+            }
+        }
+        if !saw_startup {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    assert!(
+        saw_startup,
+        "timed out waiting for startup FILES_STATUS_EVENT on main checkout"
+    );
+    assert!(
+        visual.debug_bounds("PANEL_CHANGES_DIRTY_DOT").is_none(),
+        "clean main checkout must not show dirty dot"
+    );
+
+    // Prove OS watcher delivery is live via an independent sentinel before touching `lib.rs`.
+    let sentinel = repo.join(".watch-ready");
+    std::fs::write(&sentinel, "ready\n").unwrap();
+    let mut saw_changed = false;
+    let mut saw_status = false;
+    let sentinel_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::time::Instant::now() < sentinel_deadline && !(saw_changed && saw_status) {
+        visual.run_until_parked();
+        loop {
+            match sent.try_recv() {
+                Ok(event) if event.name == FILES_CHANGED_EVENT => {
+                    if serde_json::from_value::<FilesChanged>(event.payload).is_ok_and(|changed| {
+                        runner_core::app_paths::same_checkout_path(&changed.root, &canonical)
+                            && (changed.paths.iter().any(|p| p == ".watch-ready")
+                                || (changed.paths.is_empty() && changed.folders == [""]))
+                    }) {
+                        saw_changed = true;
+                    }
+                }
+                Ok(event) if event.name == FILES_STATUS_EVENT => {
+                    if serde_json::from_value::<FilesStatusChanged>(event.payload).is_ok_and(
+                        |update| {
+                            runner_core::app_paths::same_checkout_path(&update.root, &canonical)
+                                && update
+                                    .status
+                                    .entries
+                                    .iter()
+                                    .any(|e| e.path == ".watch-ready")
+                        },
+                    ) {
+                        saw_status = true;
+                    }
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(_) => break,
+            }
+        }
+        if !(saw_changed && saw_status) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    assert!(
+        saw_changed && saw_status,
+        "timed out waiting for sentinel readiness (saw_changed={saw_changed}, saw_status={saw_status})"
+    );
+    wait(&mut visual, "sentinel dirties Sessions dot", &|v| {
+        v.debug_bounds("PANEL_CHANGES_DIRTY_DOT").is_some()
+    });
+    std::fs::remove_file(&sentinel).unwrap();
+    wait(
+        &mut visual,
+        "sentinel removed and main checkout returns clean",
+        &|v| v.debug_bounds("PANEL_CHANGES_DIRTY_DOT").is_none(),
+    );
+
+    // 2. Clean -> dirty -> clean with a single target write while staying on Sessions.
+    std::fs::write(repo.join("lib.rs"), "pub fn dirty() {}\n").unwrap();
+    wait(
+        &mut visual,
+        "Sessions dirty dot appears after single write to lib.rs",
+        &|v| v.debug_bounds("PANEL_CHANGES_DIRTY_DOT").is_some(),
+    );
+
+    assert!(Command::new("git")
+        .current_dir(&repo)
+        .args(["checkout", "--", "lib.rs"])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .status()
+        .unwrap()
+        .success());
+    wait(
+        &mut visual,
+        "Sessions dirty dot clears after cleaning main checkout",
+        &|v| v.debug_bounds("PANEL_CHANGES_DIRTY_DOT").is_none(),
+    );
+
+    // 3. Switching to Files transfers watch ownership and deactivates DirtyTracker (releasing its
+    // watch and FilesHub subscription); switching back to Sessions re-activates it.
+    let tracker_active = |visual: &gpui::VisualTestContext| {
+        host.read_with(visual, |root, cx| {
+            root.mission_workspace
+                .read(cx)
+                .rail_files
+                .dirty_tracker_active(cx)
+        })
+        .unwrap()
+    };
+    assert!(tracker_active(&visual));
+    let files_btn = visual
+        .debug_bounds("PANEL_ACTIVITY Files")
+        .expect("Files activity button");
+    visual.simulate_click(files_btn.center(), gpui::Modifiers::default());
+    wait(
+        &mut visual,
+        "Files takes over watch and deactivates DirtyTracker",
+        &|v| v.debug_bounds("FILES_ROW lib.rs").is_some() && !tracker_active(v),
+    );
+    let sessions_btn = visual
+        .debug_bounds("PANEL_ACTIVITY Sessions")
+        .expect("Sessions activity button");
+    visual.simulate_click(sessions_btn.center(), gpui::Modifiers::default());
+    wait(
+        &mut visual,
+        "returning to Sessions re-activates DirtyTracker watch",
+        &|v| {
+            tracker_active(v)
+                && watched_roots(v)
+                    .iter()
+                    .any(|p| runner_core::app_paths::same_checkout_path(p, &canonical))
+        },
+    );
+
+    // 4. Disabling Changes in settings releases the DirtyTracker watch cleanly.
+    store.update(&mut visual, |store, cx| {
+        store.update_settings(
+            |s| {
+                s.changes_view = false;
+                true
+            },
+            false,
+            cx,
+        );
+    });
+    wait(
+        &mut visual,
+        "disabling Changes releases Sessions dirty watch",
+        &|v| !tracker_active(v) && watched_roots(v).is_empty(),
+    );
+
+    // 5. Re-enabling Changes re-acquires the watch; collapsing the rail releases it.
+    store.update(&mut visual, |store, cx| {
+        store.update_settings(
+            |s| {
+                s.changes_view = true;
+                true
+            },
+            false,
+            cx,
+        );
+    });
+    wait(&mut visual, "re-enabling Changes re-acquires watch", &|v| {
+        tracker_active(v)
+            && watched_roots(v)
+                .iter()
+                .any(|p| runner_core::app_paths::same_checkout_path(p, &canonical))
+    });
+    host.update(&mut visual, |root, _, cx| {
+        root.mission_workspace.update(cx, |ws, cx| {
+            ws.set_rail_open(false, cx);
+            cx.notify();
+        });
+    })
+    .unwrap();
+    wait(
+        &mut visual,
+        "collapsing rail releases Sessions watch",
+        &|v| !tracker_active(v) && watched_roots(v).is_empty(),
+    );
+
+    // 6. Re-opening rail re-acquires the watch; navigating away from the mission hides workspace
+    // and releases the watch.
+    host.update(&mut visual, |root, _, cx| {
+        root.mission_workspace.update(cx, |ws, cx| {
+            ws.set_rail_open(true, cx);
+            cx.notify();
+        });
+    })
+    .unwrap();
+    wait(&mut visual, "re-opening rail re-acquires watch", &|v| {
+        tracker_active(v)
+            && watched_roots(v)
+                .iter()
+                .any(|p| runner_core::app_paths::same_checkout_path(p, &canonical))
+    });
+    host.update(&mut visual, |root, _, cx| {
+        root.set_route(crate::AppRoute::Roles, cx);
+        cx.notify();
+    })
+    .unwrap();
+    wait(
+        &mut visual,
+        "navigating away from mission releases Sessions watch",
+        &|v| !tracker_active(v) && watched_roots(v).is_empty(),
+    );
 
     host.update(&mut visual, |_, window, _| window.remove_window())
         .unwrap();
@@ -5409,7 +5764,6 @@ fn mission_rail_info_shows_branch_row_only_for_linked_worktree() {
 
     host.update(&mut cx, |root, window, cx| {
         root.app_store.update(cx, |store, cx| {
-            store.settings.mission_rail_open = true;
             store
                 .test_core
                 .db
@@ -5436,17 +5790,26 @@ fn mission_rail_info_shows_branch_row_only_for_linked_worktree() {
         while !ready(visual) {
             assert!(std::time::Instant::now() < deadline, "timed out: {what}");
             std::thread::yield_now();
+            visual.update(|window, _| window.refresh());
             visual.run_until_parked();
         }
     };
 
-    host.update(&mut visual, |root, _, cx| {
-        root.mission_workspace.update(cx, |workspace, cx| {
-            workspace.rail_surfaces.open.open(PanelViewId::Info);
-            cx.notify();
-        });
+    wait(&mut visual, "test-mission loaded", &|v| {
+        host.read_with(v, |root, cx| {
+            root.mission_workspace
+                .read(cx)
+                .mission_view()
+                .is_some_and(|m| m.id == "test-mission")
+        })
+        .unwrap()
+    });
+    host.update(&mut visual, |root, window, cx| {
+        root.root_focus.focus(window, cx);
     })
     .unwrap();
+    visual.run_until_parked();
+    visual.dispatch_action(crate::ToggleSessionInfo);
     wait(&mut visual, "main mission checkout resolved", &|v| {
         host.read_with(v, |root, cx| {
             root.app_store
@@ -5460,6 +5823,9 @@ fn mission_rail_info_shows_branch_row_only_for_linked_worktree() {
     assert!(visual.debug_bounds("MISSION_META_BRANCH").is_none());
 
     host.update(&mut visual, |root, window, cx| {
+        root.mission_workspace.update(cx, |workspace, cx| {
+            workspace.toggle_mission_info_popover(window, cx);
+        });
         root.app_store.update(cx, |store, cx| {
             store
                 .test_core
@@ -5475,8 +5841,20 @@ fn mission_rail_info_shows_branch_row_only_for_linked_worktree() {
             store.refresh(crate::app_store::StoreRefreshKind::All, cx);
         });
         root.open_mission("wt-mission".into(), window, cx);
+    })
+    .unwrap();
+    wait(&mut visual, "wt-mission loaded", &|v| {
+        host.read_with(v, |root, cx| {
+            root.mission_workspace
+                .read(cx)
+                .mission_view()
+                .is_some_and(|m| m.id == "wt-mission")
+        })
+        .unwrap()
+    });
+    host.update(&mut visual, |root, window, cx| {
         root.mission_workspace.update(cx, |workspace, cx| {
-            workspace.rail_surfaces.open.open(PanelViewId::Info);
+            workspace.toggle_mission_info_popover(window, cx);
             cx.notify();
         });
     })
@@ -6058,4 +6436,255 @@ fn local_mission_drawer_empty_focused_cmd_w_hides_and_non_drawer_actions_stay_in
         host.update(&mut visual, |_, window, _| window.remove_window())
             .unwrap();
     }
+}
+
+#[test]
+fn mission_card_runtime_line_formats_values_and_omits_unknown_and_shell() {
+    let member = |runtime: &str, model: Option<&str>, effort: Option<&str>| {
+        crate::surfaces::front_page::model::MissionMemberDisplay {
+            session: crate::surfaces::front_page::model::MissionMemberSession {
+                id: "s".into(),
+                status: SessionStatus::Running,
+                cwd: None,
+            },
+            handle: "coder".into(),
+            runtime: runtime.into(),
+            agent_model: model.map(str::to_owned),
+            agent_effort: effort.map(str::to_owned),
+            live_title: None,
+            agent_session_key: None,
+        }
+    };
+    assert_eq!(
+        rail::session_runtime_line(&member("codex", Some("gpt-6-astra"), Some("xhigh"))).as_deref(),
+        Some("Codex · gpt-6-astra · Extra high")
+    );
+    crate::i18n::testing::with_locale(crate::i18n::Locale::SimplifiedChinese, || {
+        assert_eq!(
+            rail::session_runtime_line(&member("codex", Some("gpt-6-astra"), Some("xhigh")))
+                .as_deref(),
+            Some("Codex · gpt-6-astra · 极高")
+        );
+    });
+    assert_eq!(
+        rail::session_runtime_line(&member("claude-code", Some("opus"), Some("high"))).as_deref(),
+        Some("Claude Code · opus · High")
+    );
+    assert_eq!(
+        rail::session_runtime_line(&member("pi", Some("deepseek-chat"), None)).as_deref(),
+        Some("pi · deepseek-chat")
+    );
+    assert_eq!(
+        rail::session_runtime_line(&member("codex", None, None)).as_deref(),
+        Some("Codex")
+    );
+    assert_eq!(
+        rail::session_runtime_line(&member("codex", None, Some("high"))).as_deref(),
+        Some("Codex · High")
+    );
+    assert_eq!(
+        rail::session_runtime_line(&member("codex", Some("  "), Some("default"))).as_deref(),
+        Some("Codex")
+    );
+    assert_eq!(
+        rail::session_runtime_line(&member("claude-code", Some("default"), Some("high")))
+            .as_deref(),
+        Some("Claude Code · High")
+    );
+    assert_eq!(
+        rail::session_runtime_line(&member("codex", Some("gpt-6-astra"), Some("DEFAULT")))
+            .as_deref(),
+        Some("Codex · gpt-6-astra")
+    );
+    assert_eq!(
+        rail::session_runtime_line(&member("codex", Some("gpt-6-astra"), Some(""))).as_deref(),
+        Some("Codex · gpt-6-astra")
+    );
+    assert_eq!(
+        rail::session_runtime_line(&member("future-agent", Some("v1"), Some("high"))).as_deref(),
+        Some("future-agent · v1 · High")
+    );
+    assert_eq!(
+        rail::session_runtime_line(&member("shell", Some("ignored"), Some("high"))),
+        None
+    );
+    assert_eq!(rail::session_runtime_line(&member("", None, None)), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn mission_rail_cards_show_runtime_line_omit_shell_and_fit_two_up() {
+    use crate::theme_snapshot::ThemeGuard;
+    use gpui::{TestAppContext, VisualTestContext};
+    let _theme = ThemeGuard::new();
+    let temp = tempfile::tempdir().unwrap();
+    let mut cx = TestAppContext::single();
+    let store = crate::app_store::test_lifecycle_store(&mut cx, temp.path());
+    store.update(&mut cx, |store, _| {
+        crate::app_store::seed_mixed_working_sessions(store)
+    });
+    let mission = store.read_with(&cx, |store, _| {
+        runner_daemon::ops::mission::mission_get(&store.test_core, "test-mission").unwrap()
+    });
+    let host = cx.add_window(|window, cx| {
+        window.set_rem_size(px(16.));
+        let workspace = cx.new(|cx| {
+            let mut workspace = MissionWorkspace::new(
+                "rail-runtime".into(),
+                WeakEntity::new_invalid(),
+                store,
+                window,
+                cx,
+            );
+            workspace.mission = Some(mission);
+            let wrapped_key = "01a119c9-4714-7091-8b75-81cec4ff360c";
+            workspace.sessions = [
+                (
+                    "coder",
+                    "claude-code",
+                    Some("opus"),
+                    Some("high"),
+                    Some("01kzmr6z"),
+                ),
+                ("qa", "pi", Some("deepseek-chat"), None, None),
+                ("bare", "codex", None, None, None),
+                ("shell", "shell", None, None, None),
+                (
+                    "reviewer",
+                    "codex",
+                    Some("a-very-long-model-name-that-must-truncate"),
+                    Some("xhigh"),
+                    Some(wrapped_key),
+                ),
+            ]
+            .into_iter()
+            .map(|(id, runtime, model, effort, key)| SessionRow {
+                session: runner_core::protocol::model::Session {
+                    id: id.into(),
+                    mission_id: Some("test-mission".into()),
+                    role_id: "test-shell-role".into(),
+                    slot_id: None,
+                    cwd: None,
+                    status: SessionStatus::Running,
+                    pid: None,
+                    started_at: None,
+                    stopped_at: None,
+                },
+                handle: id.into(),
+                role_handle: id.into(),
+                lead: false,
+                runtime: runtime.into(),
+                agent_model: model.map(str::to_owned),
+                agent_effort: effort.map(str::to_owned),
+                live_title: None,
+                agent_session_key: key.map(str::to_owned),
+            })
+            .collect();
+            workspace.sync_mission_copy_entities(cx);
+            workspace
+        });
+        MissionRailLayoutTest {
+            workspace,
+            width: None,
+        }
+    });
+    let mut visual = VisualTestContext::from_window(host.into(), &cx);
+    visual.simulate_resize(size(px(2400.), px(900.)));
+    for width in [app_settings::MISSION_RAIL_DEFAULT, 560., 680.] {
+        host.update(&mut visual, |host, _, cx| {
+            host.width = Some(width);
+            cx.notify();
+        })
+        .unwrap();
+        visual.run_until_parked();
+        let full_runtime = visual.debug_bounds("RAIL_FULL_RUNTIME").unwrap();
+        for id in ["coder", "qa", "bare", "reviewer"] {
+            let card = visual
+                .debug_bounds(format!("MISSION_CARD {id}").leak())
+                .unwrap();
+            let avatar = visual
+                .debug_bounds(format!("MISSION_CARD_AVATAR {id}").leak())
+                .unwrap();
+            let handle = visual
+                .debug_bounds(format!("MISSION_CARD_HANDLE {id}").leak())
+                .unwrap();
+            let status = visual
+                .debug_bounds(format!("MISSION_CARD_STATUS {id}").leak())
+                .unwrap();
+            let runtime = visual
+                .debug_bounds(format!("MISSION_CARD_RUNTIME {id}").leak())
+                .unwrap();
+            let mark = visual
+                .debug_bounds(format!("MISSION_CARD_RUNTIME_MARK {id}").leak())
+                .unwrap();
+            let text = visual
+                .debug_bounds(format!("MISSION_CARD_RUNTIME_TEXT {id}").leak())
+                .unwrap();
+            let key = visual
+                .debug_bounds(format!("MISSION_CARD_KEY {id}").leak())
+                .unwrap();
+            assert!(status.left() >= avatar.right(), "{id} at {width}");
+            assert!(status.top() >= handle.bottom(), "{id} at {width}");
+            assert!(runtime.top() >= status.bottom(), "{id} at {width}");
+            assert!(runtime.bottom() <= key.top(), "{id} at {width}");
+            assert!(runtime.right() <= card.right(), "{id} at {width}");
+            assert_eq!(mark.size, size(px(12.), px(12.)), "{id} at {width}");
+            assert_eq!(
+                text.size.height, full_runtime.size.height,
+                "{id} at {width}"
+            );
+            assert!(text.right() <= card.right(), "{id} at {width}");
+            if id == "reviewer" {
+                assert!(
+                    card.size.height > px(108.),
+                    "wrapped session_key card should grow beyond 108 px: {id} at {width}: {card:?}"
+                );
+            } else {
+                assert_eq!(
+                    card.size.height,
+                    px(108.),
+                    "single-line key card (populated or NULL) should match the spec's 108 px height: {id} at {width}: {card:?}"
+                );
+            }
+        }
+        for (id, expected_key) in [
+            ("coder", "01kzmr6z"),
+            ("reviewer", "01a119c9-4714-7091-8b75-81cec4ff360c"),
+        ] {
+            let card = visual
+                .debug_bounds(format!("MISSION_CARD {id}").leak())
+                .unwrap();
+            let key = visual
+                .debug_bounds(format!("MISSION_CARD_KEY {id}").leak())
+                .unwrap();
+            let copy = visual
+                .debug_bounds(format!("MISSION_CARD_KEY_COPY {id}").leak())
+                .unwrap();
+            assert_eq!(copy.size, size(px(20.), px(20.)), "{id} at {width}");
+            assert!(key.right() <= copy.left(), "{id} at {width}");
+            assert!(copy.right() <= card.right(), "{id} at {width}");
+            visual.simulate_click(copy.center(), gpui::Modifiers::default());
+            visual.run_until_parked();
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some(expected_key.into()),
+                "copy hit target failed for {id} at {width}"
+            );
+        }
+        let reviewer_text = visual
+            .debug_bounds("MISSION_CARD_RUNTIME_TEXT reviewer")
+            .unwrap();
+        assert!(
+            reviewer_text.size.width < full_runtime.size.width,
+            "reviewer long runtime line should truncate at {width}: {reviewer_text:?}"
+        );
+        assert!(visual.debug_bounds("MISSION_CARD shell").is_some());
+        assert!(visual.debug_bounds("MISSION_CARD_STATUS shell").is_none());
+        assert!(visual.debug_bounds("MISSION_CARD_RUNTIME shell").is_none());
+        assert!(visual
+            .debug_bounds("MISSION_CARD_RUNTIME_MARK shell")
+            .is_none());
+    }
+    host.update(&mut visual, |_, window, _| window.remove_window())
+        .unwrap();
 }
