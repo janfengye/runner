@@ -18,20 +18,11 @@ use crate::surfaces::side_panel::{self, PanelContext, PanelSubject, PanelSurface
 use crate::*;
 
 impl MissionWorkspace {
-    fn rail_available_width(&self) -> f32 {
-        let measured = self.rail_files.measured_width();
-        if measured > 0. {
-            (measured - 6.).max(0.)
-        } else {
-            0.
-        }
-    }
-
     pub(super) fn rail_is_open(&self, cx: &App) -> bool {
         side_panel::resolved_open(
             PanelSurface::Mission,
             self.rail_open,
-            self.rail_available_width(),
+            self.rail_files.available_width(),
             self.settings(cx).mission_rail_width,
             1,
         )
@@ -132,7 +123,6 @@ impl MissionWorkspace {
             &self.rail_surfaces.selection,
             subject.as_ref(),
             settings.mission_rail_width,
-            6.,
             1,
             self.rail_maximized && !self.presentation.is_remote(),
             cx,
@@ -239,6 +229,7 @@ impl MissionWorkspace {
         let maximize_root = cx.entity();
         let req_max_root = cx.entity();
         let settings = self.settings(cx).clone();
+        let zoom = settings.app_zoom;
         let shown = side_panel::shown(
             PanelSurface::Mission,
             &settings,
@@ -286,7 +277,6 @@ impl MissionWorkspace {
                     .min_h(px(0.))
                     .flex()
                     .flex_col()
-                    .pb(rems(8. / 16.))
                     .on_mouse_down(
                         gpui::MouseButton::Left,
                         cx.listener(|this, _, window, cx| {
@@ -374,7 +364,13 @@ impl MissionWorkspace {
         let rail = div()
             .relative()
             .when(maximized, |r| r.w_full().flex_1().min_w(px(0.)))
-            .when(!maximized, |r| r.w(rems(width / 16.)).flex_none())
+            .when(!maximized, |r| {
+                if sheet || visibility >= 1. {
+                    r.w_full()
+                } else {
+                    r.w(px(width * zoom - 2.)).flex_none()
+                }
+            })
             .h_full()
             .flex()
             .flex_col()

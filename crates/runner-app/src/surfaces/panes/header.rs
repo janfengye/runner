@@ -90,7 +90,7 @@ impl NativeRoot {
             self.active_chat_split_columns()
         };
         let is_sheet = side_panel::is_narrow(
-            self.chat_panel_available_width(),
+            self.chat_files.available_width(),
             self.settings(cx).chat_panel_width,
             split_columns,
         );
@@ -114,15 +114,6 @@ impl NativeRoot {
         side_panel::split_columns_for_layout(layout, has_maximized)
     }
 
-    fn chat_panel_available_width(&self) -> f32 {
-        let measured = self.chat_files.measured_width();
-        if measured > 0. {
-            (measured - 6.).max(0.)
-        } else {
-            0.
-        }
-    }
-
     pub(crate) fn chat_panel_is_open(&self, cx: &App) -> bool {
         let explicit = if self.remote_client.is_active() {
             self.remote_client.chat_panel_explicit_open()
@@ -137,7 +128,7 @@ impl NativeRoot {
         side_panel::resolved_open(
             surface,
             explicit,
-            self.chat_panel_available_width(),
+            self.chat_files.available_width(),
             self.settings(cx).chat_panel_width,
             self.active_chat_split_columns(),
         )
@@ -582,7 +573,6 @@ impl NativeRoot {
             &selection,
             subject.as_ref(),
             settings.chat_panel_width,
-            6.,
             split_columns,
             self.chat_panel_maximized && self.remote_client.is_local(),
             cx,
@@ -851,6 +841,7 @@ impl NativeRoot {
         let req_max_root = cx.entity();
         let surface_root = cx.entity();
         let settings = self.settings(cx).clone();
+        let zoom = settings.app_zoom;
         let selection = self.active_chat_panel_selection();
         let shown = side_panel::shown(surface, &settings, &selection);
         let handler: side_panel::SurfaceHandler = Rc::new(move |action, _window, cx| {
@@ -1005,10 +996,23 @@ impl NativeRoot {
             },
             cx,
         );
+        let border = if chat_card || sheet {
+            2.
+        } else if border_on {
+            1.
+        } else {
+            0.
+        };
         let panel = div()
             .relative()
             .when(maximized, |p| p.w_full().flex_1().min_w(px(0.)))
-            .when(!maximized, |p| p.w(rems(width / 16.)).flex_none())
+            .when(!maximized, |p| {
+                if sheet || visibility >= 1. {
+                    p.w_full()
+                } else {
+                    p.w(px(width * zoom - border)).flex_none()
+                }
+            })
             .h_full()
             .flex()
             .flex_col()
