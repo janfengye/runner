@@ -101,7 +101,7 @@ fn work_card_insets_every_route_and_contains_chat_and_mission_columns() {
             if path.starts_with("/chats/") {
                 assert!(!root.chat_panel_is_open(cx));
                 root.set_chat_panel_open(true, cx);
-                root.chat_panel_visibility = SidebarVisibilityTransition::new(true);
+                root.side_panel.visibility = SidebarVisibilityTransition::new(true);
             }
             root
         });
@@ -735,7 +735,7 @@ fn capped_banner_stays_in_each_windows_main_content() {
         root.route = AppRoute::Chat;
         root.sync_active_chat_detail(cx);
         root.set_chat_panel_open(true, cx);
-        root.chat_panel_visibility = SidebarVisibilityTransition::new(true);
+        root.side_panel.visibility = SidebarVisibilityTransition::new(true);
         root
     });
     let other = cx.add_window(|window, cx| {
@@ -947,7 +947,7 @@ fn sidebar_footer_fits_weekly_values_and_settings_in_one_row() {
                         window,
                         cx,
                     );
-                    root.usage_installed = vec![Runtime::Codex, Runtime::ClaudeCode];
+                    root.usage.installed = vec![Runtime::Codex, Runtime::ClaudeCode];
                     root
                 });
                 let mut visual = VisualTestContext::from_window(host.into(), &cx);
@@ -965,10 +965,10 @@ fn sidebar_footer_fits_weekly_values_and_settings_in_one_row() {
                 );
                 let gear = visual.debug_bounds("SIDEBAR_SETTINGS").unwrap();
                 let host_button = visual.debug_bounds("SIDEBAR_HOST_BUTTON").unwrap();
-                assert!((gear.left() - host_button.right() - px(8. * zoom)).abs() < px(1.));
+                assert!((gear.left() - host_button.right() - px(4. * zoom)).abs() < px(1.));
                 let row = visual.debug_bounds("SIDEBAR_FOOTER_ROW").unwrap();
-                assert!((usage.size.height - px(32. * zoom)).abs() <= px(1.));
-                assert!((gear.size.width - px(32. * zoom)).abs() <= px(1.));
+                assert!((usage.size.height - px(28. * zoom)).abs() <= px(1.));
+                assert!((gear.size.width - px(28. * zoom)).abs() <= px(1.));
                 assert_eq!(usage.size.height, gear.size.height);
                 assert_eq!(usage.top(), gear.top());
                 assert!(usage.top() >= row.top() && usage.bottom() <= row.bottom());
@@ -1058,7 +1058,7 @@ fn sidebar_footer_opens_usage_and_settings_and_hides_usage_in_collapsed_preview(
             window,
             cx,
         );
-        root.usage_installed = vec![Runtime::Codex];
+        root.usage.installed = vec![Runtime::Codex];
         root
     });
     let mut visual = VisualTestContext::from_window(host.into(), &cx);
@@ -1067,7 +1067,7 @@ fn sidebar_footer_opens_usage_and_settings_and_hides_usage_in_collapsed_preview(
     let usage = visual.debug_bounds("SIDEBAR_USAGE").unwrap();
     visual.simulate_click(usage.center(), Modifiers::default());
     visual.run_until_parked();
-    assert!(host.read_with(&visual, |root, _| root.usage_open).unwrap());
+    assert!(host.read_with(&visual, |root, _| root.usage.open).unwrap());
     assert!(visual.debug_bounds("USAGE_POPOVER_PANEL").is_some());
     visual.simulate_click(usage.center(), Modifiers::default());
     visual.run_until_parked();
@@ -1083,7 +1083,7 @@ fn sidebar_footer_opens_usage_and_settings_and_hides_usage_in_collapsed_preview(
     host.update(&mut visual, |root, _, cx| {
         root.route = AppRoute::Roles;
         root.sidebar_collapsed = true;
-        root.sidebar_preview_open = true;
+        root.sidebar_preview.open = true;
         cx.notify();
     })
     .unwrap();
@@ -1092,8 +1092,8 @@ fn sidebar_footer_opens_usage_and_settings_and_hides_usage_in_collapsed_preview(
     assert!(visual.debug_bounds("SIDEBAR_SETTINGS").is_some());
     host.update(&mut visual, |root, _, cx| {
         root.sidebar_collapsed = false;
-        root.sidebar_preview_open = false;
-        root.usage_installed.clear();
+        root.sidebar_preview.open = false;
+        root.usage.installed.clear();
         cx.notify();
     })
     .unwrap();
@@ -1983,7 +1983,7 @@ fn sidebar_footer_overflow_collapses_lowest_usage_badges_across_three_runtimes()
                 window,
                 cx,
             );
-            root.usage_installed = vec![Runtime::Codex, Runtime::ClaudeCode, Runtime::Antigravity];
+            root.usage.installed = vec![Runtime::Codex, Runtime::ClaudeCode, Runtime::Antigravity];
             root
         });
         let mut visual = VisualTestContext::from_window(host.into(), &cx);
@@ -2019,7 +2019,7 @@ fn sidebar_footer_overflow_collapses_lowest_usage_badges_across_three_runtimes()
         let usage = visual.debug_bounds("SIDEBAR_USAGE").unwrap();
         let host_btn = visual.debug_bounds("SIDEBAR_HOST_BUTTON").unwrap();
         let gear = visual.debug_bounds("SIDEBAR_SETTINGS").unwrap();
-        assert!((gear.left() - host_btn.right() - px(8. * zoom)).abs() <= px(0.5));
+        assert!((gear.left() - host_btn.right() - px(4. * zoom)).abs() <= px(0.5));
         assert!(usage.right() <= host_btn.left() - px(8. * zoom - 1.));
 
         // Narrow 200 px sidebar collapses lowest usage percentages first and preserves highest.

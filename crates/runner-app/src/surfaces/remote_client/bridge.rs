@@ -2,12 +2,12 @@ use super::*;
 
 impl NativeRoot {
     fn clear_remote_transients(&mut self) {
-        self.usage_open = false;
+        self.usage.close();
         self.remote_client.usage_popover = None;
         self.start_chat_modal = None;
         self.pane_rename = None;
         self.maximized_panes.clear();
-        self.fork_confirm = None;
+        self.chat_lifecycle.clear_fork_confirm();
         self.terminal_close_confirm = None;
     }
 

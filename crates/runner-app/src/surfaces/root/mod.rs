@@ -88,25 +88,10 @@ impl Render for SplitResizeDrag {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum ChatPanelTarget {
-    Local(String),
-    Archived(String),
-    Remote { computer_id: String, tab_id: String },
-}
-
 pub(crate) struct SidebarVisibilityTransition {
     pub(crate) start: f32,
     pub(crate) target: f32,
     pub(crate) started_at: Option<Instant>,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct ChatTransition {
-    pub(crate) kind: surfaces::chat_lifecycle::TransitionKind,
-    pub(crate) started_at: Instant,
-    pub(crate) baseline_seq: u64,
-    pub(crate) generation: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -217,12 +202,6 @@ pub(crate) struct PendingTabClose {
     pub(crate) tab_id: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ForkConfirm {
-    pub(crate) session_id: String,
-    pub(crate) pending: bool,
-}
-
 #[derive(Clone, Copy)]
 pub(crate) enum ArchiveAllSource {
     Chat,
@@ -316,10 +295,7 @@ pub(crate) struct NativeRoot {
     pub(crate) project_modal: Option<ProjectModal>,
     pub(crate) project_delete_confirm: Option<String>,
     pub(crate) project_delete_busy: bool,
-    pub(crate) stopping_sessions: HashSet<String>,
-    pub(crate) chat_transitions: HashMap<String, ChatTransition>,
-    pub(crate) next_chat_transition_generation: u64,
-    pub(crate) session_exit_codes: HashMap<String, Option<i32>>,
+    pub(crate) chat_lifecycle: surfaces::chat::ChatLifecycleState,
     pub(crate) chat_error: Option<crate::i18n::Text>,
     pub(crate) chat_restore_fallback: Option<ChatRestoreFallback>,
     pub(crate) daemon_retrying: bool,
@@ -352,13 +328,10 @@ pub(crate) struct NativeRoot {
     pub(crate) agent_tasks: surfaces::background_tasks::BackgroundTasks,
     pub(crate) agent_update: Option<Entity<surfaces::agent_update::AgentUpdateDialog>>,
     pub(crate) setup: surfaces::start_chat::setup::SetupState,
-    pub(crate) fork_confirm: Option<ForkConfirm>,
-    pub(crate) forking_sessions: HashMap<String, String>,
     pub(crate) last_focused_role_id: Option<String>,
     pub(crate) split_sizes_dirty: bool,
     pub(crate) drawer_resizing: bool,
     pub(crate) sidebar_resizing: bool,
-    pub(crate) chat_panel_resizing: bool,
     pub(crate) resizing_split: Option<String>,
     pub(crate) chat_secondaries: HashMap<String, String>,
     pub(crate) dismissed_duplicate_chats: HashSet<String>,
@@ -367,40 +340,16 @@ pub(crate) struct NativeRoot {
     pub(crate) route: AppRoute,
     pub(crate) settings_return_route: AppRoute,
     pub(crate) settings_return_remote_drawer_shell: Option<String>,
-    pub(crate) usage_open: bool,
-    pub(crate) usage_refresh_task: Option<gpui::Task<()>>,
-    pub(crate) claude_account_picker: Option<Entity<runner_app::ui::select::StyledSelect>>,
-    pub(crate) usage_anchor: Option<Bounds<Pixels>>,
-    pub(crate) usage_installed: Vec<runner_core::protocol::model::Runtime>,
-    pub(crate) usage_checked: Option<Vec<runner_core::Runtime>>,
-    pub(crate) usage_enabled: Option<Vec<runner_core::Runtime>>,
+    pub(crate) usage: surfaces::app_shell::UsageState,
     /// Enabled agents with an update dot the sidebar Settings gear.
     pub(crate) agent_updates: Vec<runner_core::protocol::model::Runtime>,
     pub(crate) runtime_navigation_history: Vec<RuntimeLocation>,
     pub(crate) runtime_navigation_index: Option<usize>,
     pub(crate) sidebar_collapsed: bool,
     pub(crate) sidebar_visibility: SidebarVisibilityTransition,
-    pub(crate) chat_panel_visibility: SidebarVisibilityTransition,
-    pub(crate) chat_panel_width_anim: SidebarVisibilityTransition,
-    pub(crate) chat_panel_width_mode: Option<(bool, bool)>,
-    pub(crate) chat_sheet_anim: SidebarVisibilityTransition,
-    pub(crate) chat_panel_width_snap: bool,
-    pub(crate) chat_info_prompt_expanded: HashSet<String>,
-    pub(crate) chat_surfaces: crate::surfaces::side_panel::PanelSurfaces,
-    pub(crate) chat_panel_tab: Option<String>,
-    pub(crate) chat_panel_visible_target: Option<ChatPanelTarget>,
-    pub(crate) chat_panel_open: Option<bool>,
-    pub(crate) chat_panel_maximized: bool,
-    pub(crate) chat_panel_focus: FocusHandle,
-    pub(crate) chat_panels_by_tab: HashMap<String, crate::surfaces::side_panel::SavedPanel>,
-    pub(crate) chat_files: crate::surfaces::files::FilesPanel,
-    pub(crate) panel_chat_by_tab: HashMap<String, String>,
+    pub(crate) side_panel: surfaces::side_panel::SidePanelState,
     pub(crate) command_palette: Entity<CommandPaletteState>,
-    pub(crate) sidebar_preview_open: bool,
-    pub(crate) sidebar_preview_peeking: bool,
-    pub(crate) sidebar_preview_trigger_hovered: bool,
-    pub(crate) sidebar_preview_dwell: u64,
-    pub(crate) sidebar_preview_dwell_generation: u64,
+    pub(crate) sidebar_preview: surfaces::app_shell::SidebarPreviewState,
     pub(crate) titlebar_drag_armed: bool,
     pub(crate) window_state: window_state::WindowState,
     pub(crate) window_state_save_generation: u64,
@@ -490,10 +439,8 @@ impl NativeRoot {
         let landing =
             closed.is_some_and(|close| self.tabs.active_tab_id() == Some(close.tab_id.as_str()));
         self.tabs.replace_rows(rows);
-        self.chat_panels_by_tab
-            .retain(|id, _| rows.iter().any(|row| &row.id == id));
-        self.panel_chat_by_tab
-            .retain(|id, _| rows.iter().any(|row| &row.id == id));
+        self.side_panel
+            .retain_tabs(|id| rows.iter().any(|row| row.id == id));
         if landing {
             self.land_on_recent_tab(cx);
         }

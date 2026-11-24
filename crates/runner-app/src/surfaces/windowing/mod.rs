@@ -239,10 +239,10 @@ impl NativeRoot {
             || self.project_delete_confirm.is_some()
             || self.pane_rename.is_some()
             || self.terminal_close_confirm.is_some()
-            || self.fork_confirm.is_some()
+            || self.chat_lifecycle.is_fork_confirm_open()
             || self.quit_dialog.is_some()
             || self.agent_update.is_some()
-            || self.usage_open)
+            || self.usage.open)
     }
 
     pub(crate) fn can_auto_focus_remote_terminal(&self, window: &Window, cx: &App) -> bool {
@@ -435,7 +435,7 @@ impl NativeRoot {
         self.save_settings(cx);
         self.attached.clear();
         self.remote_client.disconnect();
-        self.chat_files.release(cx);
+        self.side_panel.files.release(cx);
         self.mission_workspace
             .update(cx, |workspace, workspace_cx| {
                 workspace.release_window(workspace_cx)

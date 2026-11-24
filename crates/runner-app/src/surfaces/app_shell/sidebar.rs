@@ -1,12 +1,78 @@
 use super::*;
 
+#[derive(Default)]
+pub(crate) struct SidebarPreviewState {
+    pub(crate) open: bool,
+    pub(crate) peeking: bool,
+    pub(crate) trigger_hovered: bool,
+    pub(crate) dwell: u64,
+    pub(crate) dwell_generation: u64,
+}
+
+impl SidebarPreviewState {
+    pub(crate) fn is_peeking(&self) -> bool {
+        self.open || self.peeking
+    }
+
+    pub(crate) fn close(&mut self) {
+        self.open = false;
+    }
+
+    pub(crate) fn dismiss(&mut self) {
+        self.open = false;
+        self.peeking = false;
+    }
+
+    pub(crate) fn on_sidebar_toggled(&mut self, collapsed: bool) {
+        self.peeking = false;
+        if !collapsed {
+            self.open = false;
+        }
+    }
+
+    pub(crate) fn set_trigger_hovered(&mut self, hovered: bool) {
+        self.trigger_hovered = hovered;
+        if !hovered {
+            self.cancel_dwell();
+        }
+    }
+
+    pub(crate) fn cancel_dwell(&mut self) {
+        self.dwell = 0;
+    }
+
+    pub(crate) fn begin_dwell(&mut self) -> Option<u64> {
+        if self.dwell != 0 || self.open {
+            return None;
+        }
+        let generation = self.dwell_generation.wrapping_add(1).max(1);
+        self.dwell_generation = generation;
+        self.dwell = generation;
+        Some(generation)
+    }
+
+    pub(crate) fn complete_dwell(&mut self, generation: u64, sidebar_collapsed: bool) -> bool {
+        if self.dwell != generation {
+            return false;
+        }
+        self.dwell = 0;
+        if self.trigger_hovered && sidebar_collapsed {
+            self.open = true;
+            self.peeking = true;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 impl NativeRoot {
     pub(super) fn render_app_sidebar(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> (Option<AnyElement>, Option<f32>) {
-        let visible = !self.front_page_sidebar_collapsed() || self.sidebar_preview_open;
+        let visible = !self.front_page_sidebar_collapsed() || self.sidebar_preview.open;
         let visibility_target = if visible { 1. } else { 0. };
         let (visibility, animating) = self.sidebar_visibility.animate_to(
             visibility_target,
@@ -34,8 +100,7 @@ impl NativeRoot {
                 None,
             );
         }
-        let preview = self.front_page_sidebar_collapsed()
-            && (self.sidebar_preview_open || self.sidebar_preview_peeking);
+        let preview = self.front_page_sidebar_collapsed() && self.sidebar_preview.is_peeking();
         let content = self.cached_region(
             "sidebar",
             gpui::StyleRefinement::default()
@@ -83,7 +148,7 @@ impl NativeRoot {
                 .shadow_2xl()
                 .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                     if !*hovered && this.front_page_sidebar_collapsed() {
-                        this.sidebar_preview_open = false;
+                        this.sidebar_preview.close();
                         cx.notify();
                     }
                 }));
@@ -265,9 +330,9 @@ impl NativeRoot {
         let show_usage = (older_host || !visible_usage_runtimes.is_empty())
             && !self.front_page_sidebar_collapsed();
         if !show_usage {
-            self.usage_open = false;
+            self.usage.close();
         }
-        self.remote_client.sync_usage_popover(self.usage_open, cx);
+        self.remote_client.sync_usage_popover(self.usage.open, cx);
         let anchor_owner = cx.entity();
         let usage = show_usage.then(|| {
             let available = (self.front_page_sidebar_width(cx) - 96.) * zoom;
@@ -282,14 +347,14 @@ impl NativeRoot {
                 .when(dimmed, |usage| usage.opacity(0.45))
                 .occlude()
                 .cursor_pointer()
-                .when(self.usage_open && !older_host, |button| {
+                .when(self.usage.open && !older_host, |button| {
                     button.border_color(theme::muted())
                 })
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.usage_open = !this.usage_open;
-                    this.remote_client.sync_usage_popover(this.usage_open, cx);
-                    if this.usage_open && this.remote_client.is_local() {
+                    let open = this.usage.toggle();
+                    this.remote_client.sync_usage_popover(open, cx);
+                    if open && this.remote_client.is_local() {
                         this.start_usage_refresh_timer(cx);
                         let core = this.core(cx).clone();
                         let _ = core.usage_refresh(RefreshReason::Open);
@@ -301,7 +366,7 @@ impl NativeRoot {
                 canvas(
                     |_, _, _| {},
                     move |bounds, _, _, cx| {
-                        anchor_owner.update(cx, |this, _| this.usage_anchor = Some(bounds));
+                        anchor_owner.update(cx, |this, _| this.usage.anchor = Some(bounds));
                     },
                 )
                 .absolute()
@@ -351,9 +416,9 @@ impl NativeRoot {
             .child(self.front_page_sidebar())
             .child(footer)
             .children(
-                (self.usage_open && show_usage)
+                (self.usage.open && show_usage)
                     .then(|| {
-                        self.usage_anchor.map(|anchor| {
+                        self.usage.anchor.map(|anchor| {
                             let owner = cx.entity();
                             popup_layer(
                                 anchor,
@@ -362,7 +427,7 @@ impl NativeRoot {
                                 self.render_usage_popover(window, cx),
                                 Rc::new(move |_, cx| {
                                     owner.update(cx, |this, cx| {
-                                        this.usage_open = false;
+                                        this.usage.close();
                                         cx.notify();
                                     });
                                 }),
@@ -437,16 +502,13 @@ impl NativeRoot {
                 .w(px(16. * self.settings(cx).app_zoom))
                 .h_full()
                 .on_hover(cx.listener(|this, hovered: &bool, _, _| {
-                    this.sidebar_preview_trigger_hovered = *hovered;
-                    if !*hovered {
-                        this.cancel_sidebar_preview_dwell();
-                    }
+                    this.sidebar_preview.set_trigger_hovered(*hovered);
                 }))
                 .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
                     // A drag that reaches the edge, such as a text selection,
                     // must not open the preview.
                     if event.pressed_button.is_some() {
-                        this.cancel_sidebar_preview_dwell();
+                        this.sidebar_preview.cancel_dwell();
                     } else {
                         this.arm_sidebar_preview_dwell(cx);
                     }
@@ -455,29 +517,17 @@ impl NativeRoot {
         })
     }
 
-    pub(super) fn cancel_sidebar_preview_dwell(&mut self) {
-        self.sidebar_preview_dwell = 0;
-    }
-
     pub(super) fn arm_sidebar_preview_dwell(&mut self, cx: &mut Context<Self>) {
-        if self.sidebar_preview_dwell != 0 || self.sidebar_preview_open {
+        let Some(generation) = self.sidebar_preview.begin_dwell() else {
             return;
-        }
-        let generation = self.sidebar_preview_dwell_generation.wrapping_add(1).max(1);
-        self.sidebar_preview_dwell_generation = generation;
-        self.sidebar_preview_dwell = generation;
+        };
         cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(SIDEBAR_PREVIEW_DWELL_MS))
                 .await;
             let _ = this.update(cx, |this, cx| {
-                if this.sidebar_preview_dwell != generation {
-                    return;
-                }
-                this.sidebar_preview_dwell = 0;
-                if this.sidebar_preview_trigger_hovered && this.front_page_sidebar_collapsed() {
-                    this.sidebar_preview_open = true;
-                    this.sidebar_preview_peeking = true;
+                let collapsed = this.front_page_sidebar_collapsed();
+                if this.sidebar_preview.complete_dwell(generation, collapsed) {
                     cx.notify();
                 }
             });
@@ -500,7 +550,7 @@ impl SidebarFooterControl {
         };
         div()
             .flex_none()
-            .size(px(32. * zoom))
+            .size(px(28. * zoom))
             .flex()
             .items_center()
             .justify_center()
@@ -530,7 +580,7 @@ pub(crate) fn sidebar_footer_contents(
                 .flex_none()
                 .flex()
                 .items_center()
-                .gap(px(8. * zoom))
+                .gap(px(4. * zoom))
                 .child(host)
                 .child(settings),
         )

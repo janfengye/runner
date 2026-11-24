@@ -296,11 +296,7 @@ impl NativeRoot {
         } else {
             HeaderForkState::Enabled
         };
-        let pending = self
-            .fork_confirm
-            .as_ref()
-            .is_some_and(|confirm| confirm.pending && confirm.session_id == *session_id)
-            || super::super::chat::fork_in_progress(&self.forking_sessions, session_id);
+        let pending = self.chat_lifecycle.is_fork_pending(session_id);
         let items = pane_menu_items(
             &actions,
             pinned.unwrap_or(false),
@@ -413,7 +409,7 @@ impl NativeRoot {
         }) else {
             return;
         };
-        self.chat_panel_maximized = false;
+        self.side_panel.maximized = false;
         self.focus_terminal(&pane_id, session_id, window, cx);
     }
 

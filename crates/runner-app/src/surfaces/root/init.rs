@@ -124,7 +124,7 @@ impl NativeRoot {
                             this.refresh_slot_override_runtimes(cx);
                             this.refresh_agents_pane(cx);
                             this.refresh_setup_data(cx);
-                            this.usage_installed =
+                            this.usage.installed =
                                 crate::surfaces::app_shell::usage_installed(this.core(cx));
                             let runtimes = this
                                 .core(cx)
@@ -267,7 +267,6 @@ impl NativeRoot {
         });
         let sidebar_collapsed = settings.sidebar_collapsed;
         let sidebar_visibility = SidebarVisibilityTransition::new(!sidebar_collapsed);
-        let chat_panel_visibility = SidebarVisibilityTransition::new(false);
         let role_surfaces = RoleSurfaces::new(cx.entity(), settings.roles_page_size, cx);
         let crew_surfaces = CrewSurfaces::new(cx.entity(), settings.crews_page_size, cx);
         let sidebar_shell = cx.entity().downgrade();
@@ -338,10 +337,7 @@ impl NativeRoot {
             project_modal: None,
             project_delete_confirm: None,
             project_delete_busy: false,
-            stopping_sessions: HashSet::new(),
-            chat_transitions: HashMap::new(),
-            next_chat_transition_generation: 0,
-            session_exit_codes: HashMap::new(),
+            chat_lifecycle: surfaces::chat::ChatLifecycleState::default(),
             chat_error: None,
             chat_restore_fallback: None,
             daemon_retrying: false,
@@ -392,13 +388,10 @@ impl NativeRoot {
             },
             setup: Default::default(),
             agent_update: None,
-            fork_confirm: None,
-            forking_sessions: HashMap::new(),
             last_focused_role_id,
             split_sizes_dirty: false,
             drawer_resizing: false,
             sidebar_resizing: false,
-            chat_panel_resizing: false,
             resizing_split: None,
             chat_secondaries: HashMap::new(),
             dismissed_duplicate_chats: HashSet::new(),
@@ -407,41 +400,20 @@ impl NativeRoot {
             route: initial_route.clone(),
             settings_return_route: initial_route,
             settings_return_remote_drawer_shell: None,
-            usage_open: false,
-            usage_refresh_task: None,
-            usage_checked: None,
-            usage_enabled: None,
-            claude_account_picker: None,
-            usage_anchor: None,
-            usage_installed: crate::surfaces::app_shell::usage_installed(&core),
+            usage: surfaces::app_shell::UsageState::new(
+                crate::surfaces::app_shell::usage_installed(&core),
+            ),
             agent_updates: crate::surfaces::app_shell::agents_with_updates(&core),
             runtime_navigation_history,
             runtime_navigation_index,
             sidebar_collapsed,
             sidebar_visibility,
-            chat_panel_visibility,
-            chat_panel_width_anim: SidebarVisibilityTransition::at(
+            side_panel: surfaces::side_panel::SidePanelState::new(
                 app_store.read(cx).settings.chat_panel_width,
+                cx,
             ),
-            chat_panel_width_mode: None,
-            chat_sheet_anim: SidebarVisibilityTransition::new(false),
-            chat_panel_width_snap: true,
-            chat_info_prompt_expanded: HashSet::new(),
-            chat_surfaces: crate::surfaces::side_panel::PanelSurfaces::new(Default::default()),
-            chat_panel_tab: None,
-            chat_panel_visible_target: None,
-            chat_panel_open: None,
-            chat_panel_maximized: false,
-            chat_panel_focus: cx.focus_handle(),
-            chat_panels_by_tab: HashMap::new(),
-            chat_files: Default::default(),
-            panel_chat_by_tab: HashMap::new(),
             command_palette,
-            sidebar_preview_open: false,
-            sidebar_preview_peeking: false,
-            sidebar_preview_trigger_hovered: false,
-            sidebar_preview_dwell: 0,
-            sidebar_preview_dwell_generation: 0,
+            sidebar_preview: surfaces::app_shell::SidebarPreviewState::default(),
             titlebar_drag_armed: false,
             window_state: initial_window_state
                 .unwrap_or_else(|| window_state::snapshot(window, None)),
