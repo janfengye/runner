@@ -78,8 +78,7 @@ impl NativeRoot {
             return 1;
         }
         let layout = self.front_page_layout();
-        let has_maximized =
-            layout.is_some_and(|l| maximized_leaf(&self.maximized_panes, l).is_some());
+        let has_maximized = layout.is_some_and(|l| self.panes.is_maximized(l));
         side_panel::split_columns_for_layout(layout, has_maximized)
     }
 
@@ -215,7 +214,9 @@ impl NativeRoot {
         if start_surface_visible(Some(layout))
             || self.chat_panel_is_open(cx)
             || !self.active_chat_panel_surface(cx).1
-            || maximized_leaf(&self.maximized_panes, layout)
+            || self
+                .panes
+                .maximized_leaf(layout)
                 .unwrap_or_else(|| top_right_pane(&layout.root))
                 .id
                 != pane_id
@@ -440,16 +441,29 @@ impl NativeRoot {
             .iter()
             .find(|tab| tab.contains_session(session))
             .map(|tab| tab.id.clone());
+        let existing_session = session.to_owned();
         let session = session.to_owned();
         FileLinkRoute::new(
             cx.weak_entity(),
             move |this: &mut Self, cx| this.link_files_view(&session, cx),
+            move |this: &Self, cx| this.existing_link_files_view(&existing_session, cx),
             move |this, cx| {
                 if let Some(tab) = tab.as_deref() {
                     this.show_link_preview_in_tab(tab, cx);
                 }
             },
         )
+    }
+
+    /// The already-created Files view while its preview can take a link, read
+    /// synchronously without creating a view or fetching its root.
+    fn existing_link_files_view(&self, session: &str, cx: &App) -> Option<Entity<FilesView>> {
+        let settings = self.settings(cx);
+        if !settings.show_side_panel || !settings.files_view || !self.remote_client.is_local() {
+            return None;
+        }
+        let (followed, _) = self.panel_session_for(Some(session), cx)?;
+        self.side_panel.files.view(&PanelSubject::Session(followed))
     }
 
     /// The panel's Files view while its preview can take a link: the panel
@@ -541,7 +555,8 @@ impl NativeRoot {
         cx: &mut Context<Self>,
     ) -> Entity<CopyValueButton> {
         let copy = self
-            .pane_session_key_copies
+            .panes
+            .session_key_copies
             .entry(session_id.to_owned())
             .or_insert_with(|| {
                 let value = value.clone();
@@ -566,7 +581,8 @@ impl NativeRoot {
     ) -> Option<Entity<CopyValueButton>> {
         let path = path?;
         let copy = self
-            .pane_worktree_copies
+            .panes
+            .worktree_copies
             .entry(session_id.to_owned())
             .or_insert_with(|| {
                 let path = path.clone();
@@ -727,7 +743,7 @@ impl NativeRoot {
             cx.propagate();
             return;
         }
-        let Some(menu) = self.pane_action_menus.get(&session_id).cloned() else {
+        let Some(menu) = self.panes.action_menus.get(&session_id).cloned() else {
             cx.propagate();
             return;
         };

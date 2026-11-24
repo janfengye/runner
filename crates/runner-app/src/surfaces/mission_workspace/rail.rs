@@ -147,16 +147,32 @@ impl MissionWorkspace {
     /// opens: the rail's preview.
     pub(super) fn file_link_route(&self, cx: &Context<Self>) -> FileLinkRoute {
         let mission = self.mission_id.clone();
-        FileLinkRoute::new(cx.weak_entity(), Self::link_files_view, move |this, cx| {
-            if mission == this.mission_id {
-                this.show_link_preview(cx);
-            } else if let Some(id) = mission.as_ref() {
-                let panel = this.rails_by_mission.entry(id.clone()).or_default();
-                panel.selection.select(PanelViewId::Files);
-                panel.open = Some(true);
-                cx.notify();
-            }
-        })
+        FileLinkRoute::new(
+            cx.weak_entity(),
+            Self::link_files_view,
+            Self::existing_link_files_view,
+            move |this, cx| {
+                if mission == this.mission_id {
+                    this.show_link_preview(cx);
+                } else if let Some(id) = mission.as_ref() {
+                    let panel = this.rails_by_mission.entry(id.clone()).or_default();
+                    panel.selection.select(PanelViewId::Files);
+                    panel.open = Some(true);
+                    cx.notify();
+                }
+            },
+        )
+    }
+
+    /// The already-created Files view while its preview can take a link, read
+    /// synchronously without creating a view or fetching its root.
+    fn existing_link_files_view(&self, cx: &App) -> Option<Entity<FilesView>> {
+        let settings = self.settings(cx);
+        if !settings.show_side_panel || !settings.files_view || self.presentation.is_remote() {
+            return None;
+        }
+        let mission = self.mission_view()?;
+        self.rail_files.view(&PanelSubject::Mission(mission.id))
     }
 
     /// The rail's Files view while its preview can take a link: the panel
@@ -504,7 +520,8 @@ impl MissionWorkspace {
                     }])
                 })
                 .collect::<Vec<_>>();
-            let controls = (!available_controls.is_empty()
+            let can_remove = self.remote_supports(&["removeMissionRole"]);
+            let controls = ((!available_controls.is_empty() || can_remove)
                 && mission_slot_actions_available(
                     self.mission_view().as_ref().map(|mission| mission.status),
                     self.archived(),
@@ -513,6 +530,7 @@ impl MissionWorkspace {
             .then(|| {
                 let remove_root = root.clone();
                 let remove_id = session_id.clone();
+                let remove_selector_id = session_id.clone();
                 div()
                     .debug_selector(|| format!("MISSION_CARD_CONTROLS {session_id}"))
                     .flex_none()
@@ -543,21 +561,31 @@ impl MissionWorkspace {
                             })
                         })
                     }))
-                    .when(!self.presentation.is_remote(), |controls| {
+                    .when(can_remove, |controls| {
                         controls.child(
-                            IconButton::new(
-                                SharedString::from(format!("remove-role-{session_id}")),
-                                "log-out.svg",
-                            )
-                            .size(runner_app::ui::IconButtonSize::Sm)
-                            .tooltip(crate::i18n::text("ui.remove_from_mission"))
-                            .stop_click_propagation(true)
-                            .disabled(disabled)
-                            .on_press(move |window, cx| {
-                                remove_root.update(cx, |this, cx| {
-                                    this.request_remove_role(&remove_id, window, cx)
+                            div()
+                                .when(cfg!(test), move |el| {
+                                    el.debug_selector(move || {
+                                        format!("MISSION_CARD_REMOVE {remove_selector_id}")
+                                    })
                                 })
-                            }),
+                                .child(
+                                    IconButton::new(
+                                        SharedString::from(format!("remove-role-{session_id}")),
+                                        "log-out.svg",
+                                    )
+                                    .size(runner_app::ui::IconButtonSize::Sm)
+                                    .tooltip(crate::i18n::text("ui.remove_from_mission"))
+                                    .stop_click_propagation(true)
+                                    .disabled(disabled)
+                                    .on_press(
+                                        move |window, cx| {
+                                            remove_root.update(cx, |this, cx| {
+                                                this.request_remove_role(&remove_id, window, cx)
+                                            })
+                                        },
+                                    ),
+                                ),
                         )
                     })
             });
@@ -833,7 +861,7 @@ impl MissionWorkspace {
                     .child(crate::i18n::text("ui.mission_roster_empty")),
             );
         }
-        if !self.presentation.is_remote()
+        if self.remote_supports(&["catalog", "addMissionRole"])
             && mission_slot_actions_available(
                 self.mission_view().as_ref().map(|mission| mission.status),
                 self.archived(),
@@ -841,9 +869,7 @@ impl MissionWorkspace {
             )
         {
             let shell = self.shell.clone();
-            let mission = self.mission.clone();
-            let roster = self.roster.clone();
-            let events = self.events.clone();
+            let workspace = cx.entity();
             list = list.child(
                 div()
                     .debug_selector(|| "MISSION_RAIL_ADD_ROLE".into())
@@ -853,15 +879,11 @@ impl MissionWorkspace {
                             .variant(ButtonVariant::Outline)
                             .icon("plus.svg")
                             .on_press(move |window, cx| {
-                                if let Some(mission) = mission.clone() {
+                                if let Some(context) =
+                                    workspace.read(cx).add_role_context(window, cx)
+                                {
                                     let _ = shell.update(cx, |this, cx| {
-                                        this.open_add_role_modal(
-                                            mission,
-                                            roster.clone(),
-                                            events.clone(),
-                                            window,
-                                            cx,
-                                        )
+                                        this.open_add_role_modal(context, window, cx)
                                     });
                                 }
                             }),
