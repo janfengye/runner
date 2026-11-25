@@ -235,14 +235,41 @@ fn local_mission_resumes_terminals_selection_and_missed_state_after_a_remote_vis
 
 #[cfg(unix)]
 #[test]
-fn same_mission_notification_resumes_a_suspended_local_mission() {
+fn same_mission_notification_opens_local_window_and_leaves_remote_host_connected() {
+    fn wait_app(
+        cx: &mut gpui::TestAppContext,
+        label: &str,
+        mut pred: impl FnMut(&mut gpui::TestAppContext) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            cx.run_until_parked();
+            if pred(cx) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {label}"
+            );
+            std::thread::yield_now();
+        }
+    }
+
     let _theme = crate::theme_snapshot::ThemeGuard::new();
     let (_temp, mut cx, host, fake) = suspended_mission_test();
     host.update(&mut cx, |root, window, cx| {
         root.open_mission("test-mission".into(), window, cx)
     })
     .unwrap();
-    cx.run_until_parked();
+    wait_app(&mut cx, "initial local mission load", |cx| {
+        host.read_with(cx, |root, cx| {
+            let workspace = root.mission_workspace.read(cx);
+            !workspace.loading
+                && workspace.mission.is_some()
+                && workspace.attached.contains_key("mission-agent")
+        })
+        .unwrap()
+    });
     host.update(&mut cx, |root, window, cx| {
         root.mission_workspace.update(cx, |workspace, _| {
             workspace.active_tab = MissionTab::Session("mission-shell".into());
@@ -250,29 +277,73 @@ fn same_mission_notification_resumes_a_suspended_local_mission() {
         root.visit_computer(other_computer(), window, cx)
     })
     .unwrap();
-    cx.run_until_parked();
+    wait_app(&mut cx, "local mission suspended while remote", |cx| {
+        host.read_with(cx, |root, cx| {
+            let workspace = root.mission_workspace.read(cx);
+            root.remote_client.is_active() && !workspace.active && workspace.attached.is_empty()
+        })
+        .unwrap()
+    });
     fake.viewed.lock().unwrap().clear();
-    cx.update(|cx| crate::notifications::open("mission-agent", cx));
-    cx.run_until_parked();
+    cx.simulate_system_notification_response(gpui::SystemNotificationResponse {
+        tag: "mission-agent".into(),
+        action_id: None,
+    });
+    wait_app(
+        &mut cx,
+        "new local window attached mission-agent and marked it viewed",
+        |cx| {
+            let local = cx.update(|cx| {
+                cx.windows()
+                    .into_iter()
+                    .filter_map(|handle| handle.downcast::<NativeRoot>())
+                    .find(|handle| handle.window_id() != host.window_id())
+            });
+            local.is_some_and(|local| {
+                local
+                    .read_with(cx, |root, cx| {
+                        let workspace = root.mission_workspace.read(cx);
+                        root.remote_client.is_local()
+                            && root.route == AppRoute::Mission("test-mission".into())
+                            && workspace.active
+                            && !workspace.loading
+                            && workspace.active_tab == MissionTab::Session("mission-agent".into())
+                            && workspace.attached.contains_key("mission-agent")
+                            && workspace.mission_terminal_interactive("mission-agent", cx)
+                    })
+                    .unwrap()
+            }) && fake
+                .viewed
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|id| id == "mission-agent")
+        },
+    );
     host.read_with(&cx, |root, cx| {
-        assert!(root.remote_client.is_local());
-        assert_eq!(root.route, AppRoute::Mission("test-mission".into()));
-        let workspace = root.mission_workspace.read(cx);
-        assert!(workspace.active);
-        assert_eq!(
-            workspace.active_tab,
-            MissionTab::Session("mission-agent".into())
-        );
-        assert!(workspace.attached.contains_key("mission-agent"));
-        assert!(workspace.mission_terminal_interactive("mission-agent", cx));
+        assert!(root.remote_client.is_active());
+        assert!(!root.mission_workspace.read(cx).active);
     })
     .unwrap();
-    assert!(fake
-        .viewed
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|id| id == "mission-agent"));
+    let local_window = cx.update(|cx| {
+        let windows = cx
+            .windows()
+            .into_iter()
+            .filter_map(|handle| handle.downcast::<NativeRoot>())
+            .collect::<Vec<_>>();
+        assert_eq!(windows.len(), 2);
+        windows
+            .into_iter()
+            .find(|handle| handle.window_id() != host.window_id())
+            .unwrap()
+    });
+    assert_ne!(
+        local_window
+            .read_with(&cx, |root, _| root.window_label.clone())
+            .unwrap(),
+        host.read_with(&cx, |root, _| root.window_label.clone())
+            .unwrap()
+    );
     assert!(!fake
         .viewed
         .lock()
@@ -1445,7 +1516,7 @@ struct MissionRailLayoutTest {
 #[test]
 fn mission_rail_scrolls_long_roster_and_goal_above_corner_padding() {
     use crate::theme_snapshot::ThemeGuard;
-    use gpui::{ScrollDelta, ScrollWheelEvent, TestAppContext, VisualTestContext};
+    use gpui::{ScrollDelta, ScrollEvent, TestAppContext, VisualTestContext};
     let _theme = ThemeGuard::new();
     let temp = tempfile::tempdir().unwrap();
     let mut cx = TestAppContext::single();
@@ -1521,7 +1592,7 @@ fn mission_rail_scrolls_long_roster_and_goal_above_corner_padding() {
         last.bottom() > viewport.bottom(),
         "{view:?}: {last:?} {viewport:?}"
     );
-    visual.simulate_event(ScrollWheelEvent {
+    visual.simulate_event(ScrollEvent {
         position: viewport.center(),
         delta: ScrollDelta::Lines(point(0., -1000.)),
         ..Default::default()
@@ -3211,7 +3282,7 @@ fn long_feed_builds_visible_blocks_caches_markdown_and_preserves_scroll_and_sele
     visual.run_until_parked();
     let viewport = workspace.read_with(&visual, |this, _| this.feed_list.viewport_bounds());
     for _ in 0..8 {
-        visual.simulate_event(gpui::ScrollWheelEvent {
+        visual.simulate_event(gpui::ScrollEvent {
             position: viewport.center(),
             delta: gpui::ScrollDelta::Lines(point(0., -100000.)),
             ..Default::default()
@@ -3431,7 +3502,7 @@ fn feed_wheel_reaches_unmeasured_history_and_preserves_horizontal_padding() {
     assert_eq!(group.left(), viewport.left());
     assert_eq!(group.size.width, viewport.size.width);
     for _ in 0..60 {
-        visual.simulate_event(gpui::ScrollWheelEvent {
+        visual.simulate_event(gpui::ScrollEvent {
             position: viewport.center(),
             delta: gpui::ScrollDelta::Pixels(point(px(0.), px(100.))),
             ..Default::default()
@@ -4299,7 +4370,7 @@ fn feed_scrollbar_track_drag_and_wheel_reach_unmeasured_history() {
         assert!(!this.feed_list.is_scrollbar_dragging());
         top
     });
-    visual.simulate_event(gpui::ScrollWheelEvent {
+    visual.simulate_event(gpui::ScrollEvent {
         position: gutter.center(),
         delta: gpui::ScrollDelta::Pixels(point(px(0.), px(100.))),
         ..Default::default()

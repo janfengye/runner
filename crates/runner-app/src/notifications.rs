@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use futures::StreamExt;
+use futures::future::Shared;
+use futures::{FutureExt, StreamExt};
 
 use gpui::{App, AppContext, Context, Entity, Global, Subscription, SystemNotification, Task};
 use runner_app::ui::agent_status::{StatusKind, StatusPresentation};
@@ -462,6 +463,8 @@ struct NotificationController {
     previous: Option<BTreeMap<String, AgentStatus>>,
     previous_missions: BTreeMap<String, Option<MissionActivityState>>,
     posted: BTreeMap<String, Posted>,
+    next_dismissal: u64,
+    pending_dismissals: BTreeMap<u64, Shared<Task<()>>>,
     askers: BTreeMap<String, String>,
     ask_order: VecDeque<String>,
     pending_questions: BTreeMap<String, Event>,
@@ -485,6 +488,25 @@ fn pairing_content(pairing: &crate::app_store::RemotePairing) -> SystemNotificat
 }
 
 impl NotificationController {
+    fn track_dismissal(&mut self, task: Task<()>, cx: &mut Context<Self>) {
+        let task = task.shared();
+        let seq = self.next_dismissal;
+        self.next_dismissal = self.next_dismissal.wrapping_add(1);
+        self.pending_dismissals.insert(seq, task.clone());
+        cx.spawn(async move |this, cx| {
+            task.await;
+            let _ = this.update(cx, |this, _| {
+                this.pending_dismissals.remove(&seq);
+            });
+        })
+        .detach();
+    }
+
+    fn dismiss(&mut self, tag: &str, cx: &mut Context<Self>) {
+        let task = cx.dismiss_system_notification(tag);
+        self.track_dismissal(task, cx);
+    }
+
     fn paired(&mut self, pairing: &crate::app_store::RemotePairing, cx: &mut Context<Self>) {
         let notification = pairing_content(pairing);
         #[cfg(target_os = "linux")]
@@ -685,25 +707,10 @@ impl NotificationController {
             &mission_snapshot(store),
             &store.settings.notifications,
             visible,
-            |target| match target {
-                Target::Chat(id) => store
-                    .session_details
-                    .get(id)
-                    .is_some_and(|entry| entry.archived_at.is_none()),
-                Target::Slot { mission, session } => store.missions.iter().any(|summary| {
-                    &summary.mission.id == mission
-                        && summary.mission.archived_at.is_none()
-                        && summary.session_statuses.iter().any(|(id, _)| id == session)
-                }),
-                Target::Question { mission } | Target::MissionIdle { mission } => {
-                    store.missions.iter().any(|summary| {
-                        &summary.mission.id == mission && summary.mission.archived_at.is_none()
-                    })
-                }
-            },
+            |target| target_exists(store, target),
         );
         for tag in stale {
-            cx.dismiss_system_notification(&tag);
+            self.dismiss(&tag, cx);
             self.posted.remove(&tag);
         }
     }
@@ -726,7 +733,7 @@ impl NotificationController {
                     self.pending_questions.remove(id);
                     let tag = format!("question:{id}");
                     if self.posted.remove(&tag).is_some() {
-                        cx.dismiss_system_notification(&tag);
+                        self.dismiss(&tag, cx);
                     }
                 }
             }
@@ -820,6 +827,8 @@ pub(crate) fn install(cx: &mut App) {
             previous: Some(statuses),
             previous_missions: mission_snapshot(snapshot),
             posted: BTreeMap::new(),
+            next_dismissal: 0,
+            pending_dismissals: BTreeMap::new(),
             askers: BTreeMap::new(),
             ask_order: VecDeque::new(),
             pending_questions: BTreeMap::new(),
@@ -895,152 +904,206 @@ pub(crate) fn view_changed(cx: &mut App) {
     });
 }
 
-pub(crate) fn dismiss_all(cx: &mut App) {
-    let Some(controller) = cx
+/// Enqueues dismissal for every posted notification synchronously and returns
+/// a future that resolves once those dismissals and any earlier in-flight
+/// withdrawals have completed.
+pub(crate) fn dismiss_all(cx: &mut App) -> impl std::future::Future<Output = ()> + 'static + use<> {
+    let mut tasks = Vec::new();
+    if let Some(controller) = cx
         .try_global::<GlobalNotifications>()
         .map(|global| global.0.clone())
-    else {
-        return;
-    };
-    controller.update(cx, |this, cx| {
-        for (tag, _) in std::mem::take(&mut this.posted) {
-            cx.dismiss_system_notification(&tag);
+    {
+        controller.update(cx, |this, cx| {
+            tasks.extend(std::mem::take(&mut this.pending_dismissals).into_values());
+            for (tag, _) in std::mem::take(&mut this.posted) {
+                tasks.push(cx.dismiss_system_notification(&tag).shared());
+            }
+        });
+    }
+    async move {
+        futures::future::join_all(tasks).await;
+    }
+}
+
+fn target_exists(store: &AppStore, target: &Target) -> bool {
+    match target {
+        Target::Chat(id) => store
+            .session_details
+            .get(id)
+            .is_some_and(|entry| entry.archived_at.is_none()),
+        Target::Slot { mission, session } => store.missions.iter().any(|summary| {
+            &summary.mission.id == mission
+                && summary.mission.archived_at.is_none()
+                && summary.session_statuses.iter().any(|(id, _)| id == session)
+        }),
+        Target::Question { mission } | Target::MissionIdle { mission } => store
+            .missions
+            .iter()
+            .any(|summary| &summary.mission.id == mission && summary.mission.archived_at.is_none()),
+    }
+}
+
+fn local_windows(cx: &App) -> Vec<gpui::WindowHandle<NativeRoot>> {
+    cx.windows()
+        .into_iter()
+        .filter_map(|window| window.downcast::<NativeRoot>())
+        .filter(|window| {
+            window
+                .read(cx)
+                .is_ok_and(|root| root.remote_client.is_local())
+        })
+        .collect()
+}
+
+fn most_recently_focused(
+    windows: impl IntoIterator<Item = gpui::WindowHandle<NativeRoot>>,
+    entries: &[runner_core::protocol::WindowEntry],
+    active: Option<gpui::WindowHandle<NativeRoot>>,
+    cx: &App,
+) -> Option<gpui::WindowHandle<NativeRoot>> {
+    windows
+        .into_iter()
+        .enumerate()
+        .max_by_key(|(index, window)| {
+            let focused_at = window
+                .read(cx)
+                .ok()
+                .and_then(|root| {
+                    entries
+                        .iter()
+                        .find(|entry| entry.label == root.window_label)
+                })
+                .map(|entry| entry.focused_at);
+            (
+                active == Some(*window),
+                focused_at,
+                std::cmp::Reverse(*index),
+            )
+        })
+        .map(|(_, window)| window)
+}
+
+fn open_local_window(cx: &mut App) -> Option<gpui::WindowHandle<NativeRoot>> {
+    let label = match crate::open_new_runner_window(None, cx) {
+        Ok(label) => label,
+        Err(error) => {
+            eprintln!("Runner notification window open failed: {error:#}");
+            return None;
         }
-    });
+    };
+    cx.windows()
+        .into_iter()
+        .filter_map(|window| window.downcast::<NativeRoot>())
+        .find(|window| window.read(cx).is_ok_and(|root| root.window_label == label))
 }
 
 pub(crate) fn open(tag: &str, cx: &mut App) {
-    if tag.starts_with("remote-paired:") {
-        if !cx
-            .windows()
-            .iter()
-            .any(|window| window.downcast::<NativeRoot>().is_some())
-        {
-            crate::handle_reopen(cx);
-        }
-        let window = cx
-            .active_window()
-            .and_then(|window| window.downcast::<NativeRoot>())
+    let is_remote_paired = tag.starts_with("remote-paired:");
+    let is_usage = tag.starts_with("usage:");
+    let target = if is_remote_paired || is_usage {
+        None
+    } else {
+        let store = global_app_store(cx).read(cx);
+        cx.try_global::<GlobalNotifications>()
+            .and_then(|global| global.0.read(cx).posted.get(tag))
+            .map(|posted| posted.target.clone())
+            .filter(|target| target_exists(store, target))
+            .or_else(|| session_target(store, tag))
             .or_else(|| {
-                cx.windows()
-                    .into_iter()
-                    .find_map(|window| window.downcast::<NativeRoot>())
-            });
-        if let Some(window) = window {
-            let _ = window.update(cx, |root, window, cx| {
-                window.activate_window();
-                root.enter_settings_route(Some("remote"), window, cx);
-            });
-        }
-        cx.activate(true);
-        return;
-    }
-    let target = cx
-        .try_global::<GlobalNotifications>()
-        .and_then(|global| global.0.read(cx).posted.get(tag))
-        .map(|posted| posted.target.clone())
-        .or_else(|| session_target(global_app_store(cx).read(cx), tag))
-        .or_else(|| {
-            tag.strip_prefix("mission:")
-                .and_then(|tag| tag.strip_suffix(":idle"))
-                .filter(|id| {
-                    global_app_store(cx)
-                        .read(cx)
-                        .missions
-                        .iter()
-                        .any(|summary| {
+                tag.strip_prefix("mission:")
+                    .and_then(|tag| tag.strip_suffix(":idle"))
+                    .filter(|id| {
+                        store.missions.iter().any(|summary| {
                             summary.mission.id == *id && summary.mission.archived_at.is_none()
                         })
-                })
-                .map(|id| Target::MissionIdle { mission: id.into() })
-        });
-    let mut windows = cx
-        .windows()
-        .into_iter()
-        .filter_map(|window| window.downcast::<NativeRoot>())
-        .collect::<Vec<_>>();
-    if windows.is_empty() {
-        crate::handle_reopen(cx);
-        windows = cx
-            .windows()
-            .into_iter()
-            .filter_map(|window| window.downcast::<NativeRoot>())
-            .collect();
-    }
-    let entries = global_app_store(cx).read(cx).window_entries.clone();
-    let displaying = target.as_ref().and_then(|target| {
-        windows
-            .iter()
-            .copied()
-            .filter(|window| {
-                window.read(cx).is_ok_and(|root| {
-                    root.remote_client.is_local()
-                        && match target {
-                            Target::Chat(id) => {
-                                root.route == AppRoute::Chat
-                                    && root
-                                        .tabs
-                                        .active()
-                                        .is_some_and(|tab| tab.session_ids().contains(id))
-                            }
-                            Target::Slot { mission, .. }
-                            | Target::Question { mission }
-                            | Target::MissionIdle { mission } => {
-                                root.route == AppRoute::Mission(mission.clone())
-                            }
-                        }
-                })
-            })
-            .max_by_key(|window| {
-                window
-                    .read(cx)
-                    .ok()
-                    .and_then(|root| {
-                        entries
-                            .iter()
-                            .find(|entry| entry.label == root.window_label)
                     })
-                    .map(|entry| entry.focused_at)
+                    .map(|id| Target::MissionIdle { mission: id.into() })
             })
+    };
+
+    if !is_remote_paired && !is_usage && target.is_none() {
+        view_changed(cx);
+        return;
+    }
+
+    let entries = global_app_store(cx).read(cx).window_entries.clone();
+    let windows = local_windows(cx);
+    let active_local = cx
+        .active_window()
+        .and_then(|window| window.downcast::<NativeRoot>())
+        .filter(|window| {
+            window
+                .read(cx)
+                .is_ok_and(|root| root.remote_client.is_local())
+        });
+    let displaying = target.as_ref().and_then(|target| {
+        most_recently_focused(
+            windows.iter().copied().filter(|window| {
+                window.read(cx).is_ok_and(|root| match target {
+                    Target::Chat(id) => {
+                        root.route == AppRoute::Chat
+                            && root
+                                .tabs
+                                .active()
+                                .is_some_and(|tab| tab.session_ids().contains(id))
+                    }
+                    Target::Slot { mission, .. }
+                    | Target::Question { mission }
+                    | Target::MissionIdle { mission } => {
+                        root.route == AppRoute::Mission(mission.clone())
+                    }
+                })
+            }),
+            &entries,
+            active_local,
+            cx,
+        )
     });
     let holding = target.as_ref().and_then(|target| {
-        windows.iter().copied().find(|window| {
-            window.read(cx).is_ok_and(|root| match target {
-                Target::Chat(id) => root
-                    .tabs
-                    .tabs()
-                    .iter()
-                    .any(|tab| tab.session_ids().contains(id)),
-                _ => false,
-            })
-        })
+        most_recently_focused(
+            windows.iter().copied().filter(|window| {
+                window.read(cx).is_ok_and(|root| match target {
+                    Target::Chat(id) => root
+                        .tabs
+                        .tabs()
+                        .iter()
+                        .any(|tab| tab.session_ids().contains(id)),
+                    _ => false,
+                })
+            }),
+            &entries,
+            active_local,
+            cx,
+        )
     });
     let window = displaying
         .or(holding)
         .or_else(|| {
-            if matches!(target, Some(Target::Chat(_))) {
-                windows.iter().copied().find(|window| {
-                    window
-                        .read(cx)
-                        .is_ok_and(|root| root.window_label == "main")
+            matches!(target, Some(Target::Chat(_)))
+                .then(|| {
+                    windows.iter().copied().find(|window| {
+                        window
+                            .read(cx)
+                            .is_ok_and(|root| root.window_label == "main")
+                    })
                 })
-            } else {
-                cx.active_window()
-                    .and_then(|window| window.downcast::<NativeRoot>())
-            }
+                .flatten()
         })
-        .or_else(|| windows.first().copied());
+        .or(active_local)
+        .or_else(|| most_recently_focused(windows, &entries, active_local, cx))
+        .or_else(|| open_local_window(cx));
     if let Some(window) = window {
         let _ = window.update(cx, |root, window, cx| {
             window.activate_window();
-            if tag.starts_with("usage:") {
+            if is_remote_paired {
+                root.open_this_computer_settings(Some("remote"), window, cx);
+                return;
+            }
+            if is_usage {
                 root.open_this_computer_settings(Some("usage"), window, cx);
                 return;
             }
 
-            if target.is_some() && root.remote_client.is_active() {
-                root.return_to_this_computer(window, cx);
-            }
             match target {
                 Some(Target::Chat(id)) => {
                     if !root.open_chat_session(&id, window, cx) {
