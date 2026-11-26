@@ -313,10 +313,10 @@ fn current_source_and_env(
     let mut env = shell_env.read().ok()?.clone();
     let mut source = source_with_env(runtime, &command.command, &env);
     if runtime == Runtime::ClaudeCode {
-        if let Some(main) = crate::claude_accounts::sharing::main_account(pool) {
+        if let Some(main) = crate::runtimes::claude_code::accounts::sharing::main_account(pool) {
             source.config_home = Some(main.folder.clone().into());
             env.vars.insert(
-                crate::claude_accounts::sharing::MAIN_NATIVE.into(),
+                crate::runtimes::claude_code::accounts::sharing::MAIN_NATIVE.into(),
                 main.native.to_string(),
             );
             if main.native {
@@ -337,7 +337,9 @@ pub(crate) fn source_with_main(
 ) -> ModelSource {
     let mut source = source_with_env(runtime, command, env);
     if runtime == Runtime::ClaudeCode {
-        if let Some(main) = pool.and_then(crate::claude_accounts::sharing::main_account) {
+        if let Some(main) =
+            pool.and_then(crate::runtimes::claude_code::accounts::sharing::main_account)
+        {
             source.config_home = Some(main.folder.into());
         }
     }
@@ -454,12 +456,29 @@ pub(crate) fn run(query: Query<'_>) -> Result<Vec<u8>, Reason> {
 }
 
 fn run_process(query: Query<'_>, merge_stderr: bool) -> std::io::Result<Vec<u8>> {
+    let path = direct_chat_path(query.env);
+    #[cfg(test)]
+    if query
+        .env
+        .vars
+        .get(super::TEST_ISOLATE_PATH_ENV)
+        .is_some_and(|value| value == "1")
+        && std::path::Path::new(query.executable)
+            .parent()
+            .is_none_or(|parent| parent.as_os_str().is_empty())
+        && super::find_executable(query.executable, &path).is_none()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "isolated test PATH does not contain executable",
+        ));
+    }
     let mut output = tempfile::tempfile()?;
     let mut command = Command::new(query.executable);
     if query
         .env
         .vars
-        .get(crate::claude_accounts::sharing::MAIN_NATIVE)
+        .get(crate::runtimes::claude_code::accounts::sharing::MAIN_NATIVE)
         .is_some_and(|value| value == "true")
     {
         command.env_remove("CLAUDE_CONFIG_DIR");
@@ -467,7 +486,7 @@ fn run_process(query: Query<'_>, merge_stderr: bool) -> std::io::Result<Vec<u8>>
     command
         .args(query.args)
         .envs(&query.env.vars)
-        .env("PATH", direct_chat_path(query.env))
+        .env("PATH", path)
         .stdin(if query.stdin.is_some() {
             Stdio::piped()
         } else {

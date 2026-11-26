@@ -712,6 +712,10 @@ pub(crate) fn request_latest(
     events: &EventChannel,
     force: bool,
 ) {
+    #[cfg(test)]
+    if super::is_path_isolated(shell_env) {
+        return;
+    }
     request_latest_with(pool, shell_env, discovery, events, force, fetch_latest);
 }
 
@@ -751,7 +755,8 @@ fn latest_source(runtime: Runtime, pool: &DbPool) -> Option<LatestSource> {
     }
     if let Some(package) = definition.npm_package {
         let tag = if runtime == Runtime::ClaudeCode {
-            crate::claude_accounts::sharing::main_channel(pool).unwrap_or_else(|| dist_tag(runtime))
+            crate::runtimes::claude_code::accounts::sharing::main_channel(pool)
+                .unwrap_or_else(|| dist_tag(runtime))
         } else {
             dist_tag(runtime)
         };
@@ -1514,10 +1519,9 @@ mod tests {
         for runtime in crate::runtimes::catalogs() {
             crate::db::set_runtime_override(&pool, runtime.name.key(), Some(command)).unwrap();
         }
-        let shell_env = Arc::new(RwLock::new(LoginShellEnv {
-            path: Some(bin.path().display().to_string()),
-            vars: Default::default(),
-        }));
+        let shell_env = Arc::new(RwLock::new(crate::test_support::isolated_shell_env(Some(
+            bin.path(),
+        ))));
         let discovery = discovery();
         let events = EventChannel::new();
         {
@@ -1583,7 +1587,7 @@ mod tests {
             std::fs::write(&command, script).unwrap();
             std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
         };
-        let shell_env = Arc::new(RwLock::new(LoginShellEnv::default()));
+        let shell_env = Arc::new(RwLock::new(crate::test_support::isolated_shell_env(None)));
         let discovery = discovery();
         let events = EventChannel::new();
         let command_path = command.display().to_string();

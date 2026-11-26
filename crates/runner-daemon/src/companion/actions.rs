@@ -1059,7 +1059,7 @@ fn usage(core: &AppCore) -> Result<runner_core::companion::Usage> {
         .iter()
         .any(|agent| agent.name == "claude-code")
         .then(|| {
-            let accounts = crate::claude_accounts::load(&core.db).ok()?;
+            let accounts = crate::runtimes::claude_code::accounts::load(&core.db).ok()?;
             if accounts.accounts.len() <= 1 {
                 return None;
             }
@@ -1089,6 +1089,7 @@ fn folders(path: Option<String>) -> Result<FolderPage> {
             None,
         )
     })?;
+    let shown = ordinary(&path);
     let entries = std::fs::read_dir(&path).map_err(|_| {
         Failure(
             ErrorCode::BadRequest,
@@ -1101,16 +1102,69 @@ fn folders(path: Option<String>) -> Result<FolderPage> {
         let entry = entry.map_err(failed)?;
         if entry.path().is_dir() {
             if let Some(name) = entry.file_name().to_str() {
-                folders.push(name.to_owned());
+                if exact(&shown.join(name)) {
+                    folders.push(name.to_owned());
+                }
             }
         }
     }
     folders.sort();
     Ok(FolderPage {
-        path: path.to_string_lossy().into_owned(),
-        parent: path.parent().map(|p| p.to_string_lossy().into_owned()),
+        path: shown.to_string_lossy().into_owned(),
+        parent: shown.parent().map(|p| p.to_string_lossy().into_owned()),
         folders,
+        drives: drives(),
     })
+}
+
+/// A Windows path as clients are shown it: without the `\\?\` prefix when
+/// the ordinary spelling names the same folder.
+#[cfg(windows)]
+fn ordinary(path: &std::path::Path) -> std::path::PathBuf {
+    let ordinary = crate::runtimes::ordinary_windows_path(path);
+    if exact(&ordinary) {
+        ordinary
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// Whether Windows leaves `path` as written instead of normalizing it to
+/// another folder, as it does by dropping a name's trailing dot or space.
+#[cfg(windows)]
+fn exact(path: &std::path::Path) -> bool {
+    std::path::absolute(path).is_ok_and(|absolute| absolute == path)
+}
+
+#[cfg(not(windows))]
+fn ordinary(path: &std::path::Path) -> std::path::PathBuf {
+    path.to_path_buf()
+}
+
+#[cfg(not(windows))]
+fn exact(_: &std::path::Path) -> bool {
+    true
+}
+
+fn shown_path(path: String) -> String {
+    ordinary(std::path::Path::new(&path))
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(windows)]
+fn drives() -> Vec<String> {
+    // SAFETY: GetLogicalDrives takes no arguments and returns a bitmask.
+    let mask = unsafe { windows_sys::Win32::Storage::FileSystem::GetLogicalDrives() };
+    (b'A'..=b'Z')
+        .filter(|letter| mask & (1 << (letter - b'A')) != 0)
+        .map(|letter| format!(r"{}:\", char::from(letter)))
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn drives() -> Vec<String> {
+    Vec::new()
 }
 fn option(value: p::RuntimeCatalogOption) -> CatalogOption {
     CatalogOption {
@@ -1162,7 +1216,7 @@ fn catalog(core: &AppCore) -> Result<Catalog> {
             },
         })
         .collect();
-    let accounts = crate::claude_accounts::load(&core.db).map_err(failed)?;
+    let accounts = crate::runtimes::claude_code::accounts::load(&core.db).map_err(failed)?;
     let crews = {
         let conn = core.db.get().map_err(failed)?;
         ops::crew::list(&conn).map_err(failed)?
@@ -1192,12 +1246,12 @@ fn catalog(core: &AppCore) -> Result<Catalog> {
         .map(|p| CatalogProject {
             id: p.id,
             name: p.name,
-            path: p.cwd,
+            path: shown_path(p.cwd),
         })
         .collect();
     let mut recent_folders = vec![];
     for session in ops::session::session_list_recent_direct(core).map_err(failed)? {
-        if let Some(cwd) = session.cwd {
+        if let Some(cwd) = session.cwd.map(shown_path) {
             if !recent_folders.contains(&cwd) {
                 recent_folders.push(cwd);
             }
@@ -1225,6 +1279,68 @@ fn catalog(core: &AppCore) -> Result<Catalog> {
 mod tests {
     use super::*;
     #[test]
+    fn folder_pages_use_ordinary_paths_and_list_drives_on_windows() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("child")).unwrap();
+        let page = folders(Some(temp.path().to_string_lossy().into_owned())).unwrap();
+        assert_eq!(page.folders, ["child"]);
+        let root = temp.path().ancestors().last().unwrap();
+        let root = folders(Some(root.to_string_lossy().into_owned())).unwrap();
+        assert_eq!(root.parent, None);
+        #[cfg(windows)]
+        {
+            for path in [&page.path, page.parent.as_ref().unwrap(), &root.path] {
+                assert!(!path.starts_with(r"\\"), "{path}");
+            }
+            assert!(root.drives.contains(&root.path), "{root:?}");
+            assert_eq!(page.drives, root.drives);
+        }
+        #[cfg(not(windows))]
+        assert!(page.drives.is_empty() && root.drives.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn folder_pages_hide_folders_an_ordinary_path_cannot_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let verbatim = temp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(verbatim.join("work").join("plain")).unwrap();
+        std::fs::create_dir_all(verbatim.join("work.").join("dotted")).unwrap();
+        let page = folders(Some(temp.path().to_string_lossy().into_owned())).unwrap();
+        assert_eq!(page.folders, ["work"]);
+        let work = folders(Some(format!(r"{}\work", page.path))).unwrap();
+        assert_eq!(work.folders, ["plain"]);
+        let dotted = verbatim.join("work.").to_string_lossy().into_owned();
+        let dotted = folders(Some(dotted)).unwrap();
+        assert!(dotted.path.starts_with(r"\\?\"), "{}", dotted.path);
+        assert_eq!(dotted.folders, ["dotted"]);
+    }
+
+    #[test]
+    fn catalog_shows_saved_verbatim_project_paths_in_their_ordinary_spelling() {
+        let core = crate::test_support::test_core();
+        crate::test_support::isolate_runtime_path(&core, None);
+        let saved = [r"\\?\C:\Work", r"\\?\UNC\nas\share\repo", r"C:\Plain"];
+        {
+            let conn = core.db.get().unwrap();
+            for cwd in saved {
+                crate::repo::project::create(&conn, "project", cwd).unwrap();
+            }
+        }
+        let paths: Vec<_> = catalog(&core)
+            .unwrap()
+            .projects
+            .into_iter()
+            .map(|project| project.path)
+            .collect();
+        if cfg!(windows) {
+            assert_eq!(paths, [r"C:\Work", r"\\nas\share\repo", r"C:\Plain"]);
+        } else {
+            assert_eq!(paths, saved);
+        }
+    }
+
+    #[test]
     fn usage_projects_only_enabled_installed_agents_and_the_active_account_name() {
         use crate::model::Runtime;
         use crate::usage::{AgentUsage, UsageWindow};
@@ -1234,7 +1350,7 @@ mod tests {
         let executable = std::env::current_exe().unwrap();
         crate::db::set_runtime_override(&core.db, "codex", executable.to_str()).unwrap();
         crate::db::set_runtime_override(&core.db, "claude-code", executable.to_str()).unwrap();
-        core.runtime_shell_env.write().unwrap().path = Some(String::new());
+        crate::test_support::isolate_runtime_path(&core, None);
         core.usage.set_enabled(vec![Runtime::Codex, Runtime::Pi]);
         let value = AgentUsage {
             credits: Some(p::UsageCredits {
@@ -1324,6 +1440,7 @@ mod tests {
         std::fs::write(&executable, "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'codex-cli 0.166.0'; exit; fi\nread answer\necho done\n").unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut core = crate::test_support::test_core_in(dir.path().into());
+        crate::test_support::isolate_runtime_path(&core, None);
         core.sessions = crate::session::SessionManager::new(
             core.runtime_shell_env.clone(),
             core.runtime_discovery.clone(),
@@ -1400,6 +1517,7 @@ mod tests {
         fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
             let core = std::sync::Arc::new(crate::test_support::test_core_in(dir.path().into()));
+            crate::test_support::isolate_runtime_path(&core, None);
             let executable = std::env::current_exe().unwrap();
             crate::db::set_runtime_override(&core.db, "codex", executable.to_str()).unwrap();
             crate::db::set_runtime_override(&core.db, "claude-code", executable.to_str()).unwrap();

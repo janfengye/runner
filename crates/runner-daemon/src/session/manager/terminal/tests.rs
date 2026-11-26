@@ -288,7 +288,7 @@ fn test_core_with_runtime(root: &std::path::Path, runtime: Arc<dyn SessionRuntim
     let windows = Arc::new(crate::windows::WindowRegistry::new());
     windows.register("main");
     let runtime_shell_env = Arc::new(std::sync::RwLock::new(
-        crate::shell_path::LoginShellEnv::default(),
+        crate::test_support::isolated_shell_env(None),
     ));
     let runtime_discovery = Arc::new(std::sync::RwLock::new(
         crate::shell_path::DiscoveryState::startup(None, None),
@@ -305,7 +305,9 @@ fn test_core_with_runtime(root: &std::path::Path, runtime: Arc<dyn SessionRuntim
         runtime_shell_env,
         runtime_discovery,
         usage: Arc::new(crate::usage::UsageService::default()),
-        claude_accounts: Arc::new(crate::claude_accounts::AccountService::without_authentication()),
+        claude_accounts: Arc::new(
+            crate::runtimes::claude_code::accounts::AccountService::without_authentication(),
+        ),
         buses: crate::event_bus::BusRegistry::new(),
         routers: crate::router::RouterRegistry::new(),
         mission_roster_locks: Default::default(),
