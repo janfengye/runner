@@ -336,6 +336,10 @@ impl NativeRoot {
             sidebar,
             launchers: surfaces::start_chat::launcher::LauncherState::default(),
             start_chat_modal: None,
+            template_import_modal: None,
+            template_import_generation: 0,
+            #[cfg(test)]
+            template_import_in_flight: 0,
             project_modal: None,
             project_delete_confirm: None,
             project_delete_busy: false,
@@ -412,6 +416,7 @@ impl NativeRoot {
             mission_workspace,
             _appearance_subscription: None,
             _activation_subscription: None,
+            _visibility_subscription: None,
             _bounds_subscription: None,
             _project_cwd_subscription: None,
             _updater_subscription: cx.observe_in(&updater, window, |root, _, window, cx| {
@@ -468,6 +473,12 @@ impl NativeRoot {
                     this.app_store.update(cx, |store, cx| store.sync_locale(cx));
                 }
                 this.sync_sidebar_window_activation(window, cx)
+            }));
+        root._visibility_subscription =
+            Some(window.observe_window_visibility(|visibility, _, cx| {
+                if visibility == gpui::WindowVisibility::Visible {
+                    crate::notifications::view_changed(cx);
+                }
             }));
         platform_ui::sync_traffic_lights(window, root.settings(cx).app_zoom);
         root.sync_theme(window, cx);
